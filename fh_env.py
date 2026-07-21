@@ -8,6 +8,7 @@ indiscriminate sweep/comb jammers. The environment exposes a 10-offset
 sequential decision interface for RL agents.
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from commpy.filters import rrcosfilter
@@ -148,6 +149,28 @@ def compute_psd_waterfall(signal, fs, f_start, f_end,
         plt.show()
 
     return waterfall_db
+
+
+def save_waterfall_figure(waterfall_db, path, title=""):
+    """
+    Save a PSD waterfall array as a PNG figure.
+
+    Uses the same imshow style as the debug plots in this module
+    (jet colormap, lower origin, colorbar), but writes to *path*
+    instead of opening an interactive window.
+    """
+    waterfall_db = np.asarray(waterfall_db)
+    fig = plt.figure(figsize=(8, 4))
+    plt.imshow(waterfall_db.T, origin="lower", aspect="auto", cmap="jet")
+    plt.colorbar(label='PSD (dB)')
+    plt.xlabel('Time bin')
+    plt.ylabel('Freq bin')
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
 
 # -----------------------------
 # M序列（LFSR）生成
@@ -616,6 +639,7 @@ class FHSSQPSKEnv(gym.Env):
                                        
         if self.enable_sweep:
             s_mode = j_conf.get('mode', 'sweep')
+            self._validate_comb_channels(j_conf.get('comb', {}))
             self.sweep = IndiscriminateJammer(Fs=self.Fs,
                                               sweep_config=j_conf['sweep'],
                                               comb_config=j_conf['comb'],
@@ -674,7 +698,56 @@ class FHSSQPSKEnv(gym.Env):
         self.debug_log_hops = bool(debug_log_hops)
         self.current_step = 0
 
+        # Step-triggered figure capture (see enable_step_figure_capture).
+        self._fig_save_steps = set()
+        self._fig_save_dir = None
+
         self._apply_hoprate(self.base_hoprate)
+
+    def _validate_comb_channels(self, comb_config):
+        """
+        Strictly validate the configurable comb channel index groups.
+
+        Every entry of ``channels_phase0`` / ``channels_phase1`` must be an
+        integer in ``[0, num_channels - 1]``; anything else raises ValueError.
+        Group lengths may differ and groups may overlap. Missing keys fall
+        back to the jammer's built-in defaults and are not checked here.
+        """
+        for key in ("channels_phase0", "channels_phase1"):
+            channels = comb_config.get(key)
+            if channels is None:
+                continue
+            if not isinstance(channels, (list, tuple)):
+                raise ValueError(
+                    f"JAMMER_CONFIG['comb']['{key}'] must be a list of "
+                    f"channel indices, got {type(channels).__name__}."
+                )
+            for idx in channels:
+                if isinstance(idx, bool) or not isinstance(idx, (int, np.integer)):
+                    raise ValueError(
+                        f"JAMMER_CONFIG['comb']['{key}'] entries must be "
+                        f"integers, got {idx!r}."
+                    )
+                if idx < 0 or idx >= self.num_channels:
+                    raise ValueError(
+                        f"JAMMER_CONFIG['comb']['{key}'] entry {idx} is out "
+                        f"of range [0, {self.num_channels - 1}]."
+                    )
+
+    def enable_step_figure_capture(self, save_steps, save_dir):
+        """
+        Enable per-block PSD figure saving at selected training steps.
+
+        Args:
+            save_steps: iterable of 1-based training step indices (matching
+                the ``Step i/N`` training log index, i.e. the value of
+                ``self.current_step + 1`` during ``step()``).
+            save_dir: directory where ``step_XXX_block_YY.png`` files are
+                written; created if missing.
+        """
+        self._fig_save_steps = set(int(s) for s in save_steps)
+        self._fig_save_dir = str(save_dir)
+        os.makedirs(self._fig_save_dir, exist_ok=True)
 
     def seed(self, seed=None):
         np.random.seed(seed)
@@ -861,6 +934,11 @@ class FHSSQPSKEnv(gym.Env):
 
         ber_blocks = []
         reactive_active_blocks = []
+        hop_sequences = []
+        capture_figures = (
+            (self.current_step + 1) in self._fig_save_steps
+            and self._fig_save_dir is not None
+        )
 
         for b in range(self.num_blocks):
             # ----------------------------------------------------------------
@@ -868,6 +946,7 @@ class FHSSQPSKEnv(gym.Env):
             # ----------------------------------------------------------------
             hop_seq_block = self._get_block_hopseq(hops_per_block, offsets_action[b])
             self._mseq_ptr = (self._mseq_ptr + len(hop_seq_block)) % len(self.mseq_channels)
+            hop_sequences.append(hop_seq_block.astype(int).tolist())
             
             # ----------------------------------------------------------------
             # 1. Obtain Baseband / Noise / Interference
@@ -948,6 +1027,25 @@ class FHSSQPSKEnv(gym.Env):
             # Final RX mixing
             rx_real += reactive_jam
 
+            # Step-triggered per-block PSD figure capture
+            if capture_figures:
+                wf_db = compute_psd_waterfall(
+                    rx_real,
+                    fs=self.Fs,
+                    f_start=self.Startfre,
+                    f_end=self.Endfre,
+                    dt=self.dt,
+                    df=self.df,
+                    max_duration=0.1,
+                    plot=False,
+                )
+                fig_name = f"step_{self.current_step + 1:03d}_block_{b + 1:02d}.png"
+                save_waterfall_figure(
+                    wf_db,
+                    os.path.join(self._fig_save_dir, fig_name),
+                    title=f"Step {self.current_step + 1} - Block {b + 1} PSD (100 ms)",
+                )
+
             # ----------------------------------------------------------------
             # 5. Receive
             # ----------------------------------------------------------------
@@ -1000,6 +1098,7 @@ class FHSSQPSKEnv(gym.Env):
             "hoprate_used": ainfo["hoprate_used"],
             "hops_per_block": hops_per_block,
             "reactive_active_blocks": reactive_active_blocks,
+            "hop_sequences": hop_sequences,
         }
 
         terminated = False

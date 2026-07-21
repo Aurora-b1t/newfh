@@ -8,7 +8,7 @@ import torch
 import logging
 import matplotlib.pyplot as plt
 
-from fh_env import FHSSQPSKEnv
+from fh_env import FHSSQPSKEnv, save_waterfall_figure
 from SAC import SAC, ReplayBuffer
 from offline_replay import (
     environment_metadata,
@@ -17,16 +17,30 @@ from offline_replay import (
 import settings
 
 def setup_logger(log_file):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, mode='w', encoding='utf-8'),
-            logging.StreamHandler()
-        ],
-        force=True,
-    )
-    return logging.getLogger()
+    """
+    Configure the root logger (console + file) and a file-only logger for
+    verbose per-step records. Both share a single FileHandler so the full
+    hop sequences land in the same training_log.txt without console spam.
+    """
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    hop_logger = logging.getLogger("fh.hop_sequences")
+    hop_logger.setLevel(logging.INFO)
+    hop_logger.propagate = False
+    hop_logger.handlers.clear()
+    hop_logger.addHandler(file_handler)
+
+    return logger, hop_logger
 
 def build_agent_and_env(args):
     # -------------------------------------------------------------------------
@@ -94,12 +108,34 @@ def replay_ready(buffer, batch_size):
 def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = os.path.join(args.output_dir, args.log_file)
-    logger = setup_logger(log_path)
+    logger, hop_logger = setup_logger(log_path)
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Log file: {log_path}")
 
     # Build components
     env, agent, buffer, device, n_actions = build_agent_and_env(args)
+
+    # -------------------------------------------------------------------------
+    # Step-triggered figure saving (obs + per-block PSD)
+    # -------------------------------------------------------------------------
+    figures_dir = os.path.join(args.output_dir, "figures")
+    save_steps = set()
+    for s in settings.PLOT_CONFIG.get("figure_save_steps", []):
+        if isinstance(s, bool) or not isinstance(s, (int, np.integer)):
+            logger.warning("figure_save_steps entry %r is not an integer; ignored.", s)
+        elif not 1 <= int(s) <= args.steps_per_episode:
+            logger.warning(
+                "figure_save_steps entry %d is outside [1, %d]; ignored.",
+                int(s), args.steps_per_episode,
+            )
+        else:
+            save_steps.add(int(s))
+    if save_steps:
+        env.enable_step_figure_capture(sorted(save_steps), figures_dir)
+        logger.info(
+            "Figure saving enabled for steps %s -> %s",
+            sorted(save_steps), figures_dir,
+        )
 
     state_img, info = env.reset()
     if args.offline_replay_path is None:
@@ -157,6 +193,15 @@ def train(args):
         
         # One policy pass samples all ten categorical offset heads.
         offsets = agent.take_action(state_img, fixed_hoprate)
+
+        # Save the pre-action observation (the agent's input state) at
+        # configured steps, before state_img is replaced by env.step().
+        if step_idx in save_steps:
+            save_waterfall_figure(
+                np.asarray(state_img),
+                os.path.join(figures_dir, f"step_{step_idx:03d}_obs.png"),
+                title=f"Step {step_idx} - Pre-action Observation (100 ms)",
+            )
 
         # -------------------------------------------------------
         # 2. Environment Step
@@ -216,8 +261,15 @@ def train(args):
         plot_losses_actor.append(train_stats.get('actor_loss', 0) if train_stats else 0)
         plot_losses_critic.append(train_stats.get('critic1_loss', 0) if train_stats else 0)
 
+        # Actual channels used per block: (base m-sequence + offset) % num_channels
+        hop_sequences = info.get("hop_sequences", [])
+        first_channels = [seq[0] for seq in hop_sequences if len(seq) > 0]
+        # Full hop sequences go to the log file only (10 blocks x 10 hops).
+        hop_logger.info("Step %d HopSequences: %s", step_idx, hop_sequences)
+
         log_msg = (f"Step {step_idx}/{args.steps_per_episode} | "
                    f"Offsets: {offsets.astype(int).tolist()} | "
+                   f"FirstCh: {first_channels} | "
                    f"Rew: {mean_step_reward:.4f} | "
                    f"BER: {mean_step_ber:.4f} | "
                    f"Replay: {buffer.size()}")

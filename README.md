@@ -281,13 +281,14 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 
 每个脚本还支持 `--log_file`（默认 `training_log.txt`，位于对应 `--output_dir` 内）。常见输出文件包括：
 
-- `training_log.txt`：训练或搜索日志。
+- `training_log.txt`：训练或搜索日志。offset 训练中每个 step 的日志行包含 offsets 和每个 block 实际使用的首 hop 信道（`FirstCh`），完整的 10 block × 10 hop 真实信道序列也以 `HopSequences` 行写入同一文件（仅写文件，不在终端显示）。
 - `reward.png`：平均 step reward 曲线（offset/MBPO 训练）。
 - `ber.png`：平均 step BER 曲线。
 - `loss.png`：actor/critic loss 曲线（offset/MBPO 训练）。
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
 - `hoprate.png`、`ber_vs_hoprate.png`、`nbs_weights.png`：NBS 搜索诊断图。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。
+- `figures/`：由 `PLOT_CONFIG["figure_save_steps"]` 指定的 step 保存的动作前 observation 图与 10 个 block PSD 图（offset 训练）。
 - PSD capture 图：指定 step 的观测与 10 个 block PSD（special hopping 测试）。
 
 `outputs/` 已加入 [.gitignore](.gitignore)，训练产物默认不进入版本控制。
@@ -315,6 +316,11 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `enable_rayleigh`：是否启用 Rayleigh 衰落。
 - `use_pregen`、`pregen_steps`：是否使用预生成加速路径以及预生成 observation 周期长度。
 - `noise_std`、`signal_power`：接收端噪声和反应式干扰检测所需信号功率参数。
+- `mseq_seed`、`mseq_taps`、`mseq_nbits`、`mseq_length`：驱动基础跳频图案的 m 序列（LFSR）参数。换一份 m 序列的方法：
+  - 改 `mseq_seed`（初始状态）：同一 m 序列的不同相位（循环移位），最简单；
+  - 改 `mseq_taps`（反馈抽头）：得到真正不同的 m 序列，抽头必须对应本原多项式（如 10 级的 `(10, 7)`、`(10, 3)`），否则周期骤减；
+  - 改 `mseq_nbits`（寄存器级数）：改变周期（2ⁿ−1），同时 `mseq_taps` 必须换成对应级数的本原抽头。
+  - 注意：更换 m 序列后需重新生成离线 replay 数据（或用 `--offline_replay_path none`），加载旧数据时 metadata 校验会报配置不一致警告。
 
 ### `JAMMER_CONFIG`
 
@@ -322,7 +328,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 
 - `mode`：`sweep`、`comb` 或 `both`。
 - `sweep`：扫频干扰的步进、功率、驻留时间、噪声带宽。
-- `comb`：梳状干扰的功率和单 tone 带宽。当前 comb 频点选择在 [jammers.py](jammers.py) 中实现为两组交替的 8 个 50 kHz 对齐信道。
+- `comb`：梳状干扰的功率、单 tone 带宽，以及两组交替的干扰信道序号 `channels_phase0` / `channels_phase1`（默认为偶数/奇数各 8 个 50 kHz 对齐信道）。序号必须是 `[0, num_channels-1]` 范围内的整数，否则环境启动时直接报 `ValueError`；两组长度可以不同、允许重叠。修改后同样需重新生成离线 replay 数据。
 - `reactive`：反应式干扰机的功率、带宽、虚警概率、检测时长等。检测逻辑基于能量检测理论，按 1 ms slot 扫描/检测/压制。
 
 ### `SAC_CONFIG`
@@ -353,6 +359,15 @@ Noisy Binary Search 配置：
 - `update_iters_per_step`：每个环境 step 后的梯度更新次数。
 - `fixed_hoprate`：offset 训练时使用的固定 hoprate。
 - 离线 replay 在首次梯度更新前加载，文件路径由 `OFFLINE_REPLAY_CONFIG` 或 `--offline_replay_path` 配置。
+
+### `PLOT_CONFIG`
+
+指定 step 图片保存配置（仅 `train_offsets.py` 使用）：
+
+- `figure_save_steps`：需要保存图片的训练 step 序号列表（1-based，与日志中 `Step i/N` 一致），可填多个。在命中的 step 保存：
+  - `figures/step_XXX_obs.png`：该 step 动作前的 observation（即 agent 决策所见的 100 ms PSD waterfall）；
+  - `figures/step_XXX_block_01.png` ~ `step_XXX_block_10.png`：该 step 内 10 个 block 各自的接收信号 PSD 图。
+  - 图片保存在对应 `--output_dir` 的 `figures/` 子目录下；超出 `[1, steps_per_episode]` 的值会被忽略并告警，空列表则完全关闭该功能。
 
 ### `REWARD_CONFIG`
 

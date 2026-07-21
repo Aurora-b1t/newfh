@@ -291,6 +291,16 @@ class IndiscriminateJammer:
         self.c_step = float(self.comb_config.get('step', 100000.0))
         self.c_power = float(self.comb_config.get('power', 0.5))
         self.c_bw = float(self.comb_config.get('bandwidth', 30000.0))
+
+        # Jammed channel indices for the two alternating comb groups.
+        # Configurable via JAMMER_CONFIG["comb"]["channels_phase0/1"];
+        # defaults preserve the legacy even/odd 8-channel groups.
+        self.comb_channels = (
+            list(self.comb_config.get('channels_phase0',
+                                      [0, 2, 4, 6, 8, 10, 12, 14])),
+            list(self.comb_config.get('channels_phase1',
+                                      [1, 3, 5, 7, 9, 11, 13, 15])),
+        )
         
         self._sweep_idx = 0
         
@@ -434,16 +444,11 @@ class IndiscriminateJammer:
             raw_noise_c = self.ns_comb.get_noise(N)
             baseband_noise_c = raw_noise_c * self.c_power
             
-            # --- Optimized for 8 fixed points aligned to 50kHz channels ---
+            # --- Comb tones aligned to 50kHz channel centres ---
             sub_interval = 50000.0
-            
-            # Hardcoded selection for two alternating 8-channel comb groups.
-            if self.comb_phase == 0:
-                # Group 0: even channel indices
-                target_indices = np.array([0, 2, 4, 6, 8, 10, 12, 14])
-            else:
-                # Group 1: odd channel indices
-                target_indices = np.array([1, 3, 5, 7, 9, 11, 13, 15])
+
+            # Two alternating comb groups, configurable via comb_config.
+            target_indices = np.asarray(self.comb_channels[self.comb_phase])
             
             # Map to frequencies: Start + k*sub + 0.5*sub
             freqs = Startfre + target_indices * sub_interval + 0.5 * sub_interval

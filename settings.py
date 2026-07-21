@@ -64,6 +64,19 @@ ENV_CONFIG = {
     "use_pregen": True,
     "pregen_steps": 44,         # Align with 4.4s cycle (0.1s step)
     "noise_std": 0.1,           # Thermal noise std at receiver (also used by reactive jammer)
+    # M-sequence (LFSR) driving the base hopping pattern.
+    # To switch to a different m-sequence:
+    #   - change mseq_seed  -> same m-sequence, different phase (cyclic shift);
+    #   - change mseq_taps  -> a genuinely different m-sequence; taps MUST form a
+    #                          primitive polynomial (e.g. 10-stage: (10, 7), (10, 3)),
+    #                          otherwise the period collapses below 2^n - 1;
+    #   - change mseq_nbits -> changes the period (2^n - 1); taps must be replaced
+    #                          with a primitive set of that degree accordingly.
+    # NOTE: after changing these, regenerate the offline replay dataset.
+    "mseq_seed": 1,
+    "mseq_taps": (10, 7),
+    "mseq_nbits": 10,
+    "mseq_length": 1000,
     # Real RF signal power per sample (before fading).
     # Theoretical: Baud / Fs = 25000 / 1e7 = 0.0025.
     # The reactive jammer uses this together with noise_std to derive its
@@ -86,10 +99,16 @@ JAMMER_CONFIG = {
     
     # Comb Jamming Configuration
     "comb": {
-        # Note: Frequency selection is HARDCODED in jammers.py to 8 fixed points (centers of 50kHz channels).
         "power": 0.8,        # Total power or per-tone power factor
         "bandwidth": 50000.0,# Noise bandwidth per tone
-        # "frequencies": [] # Removed as it is now hardcoded in logic
+        # Jammed channel indices for the two alternating comb groups.
+        # Each index k maps to the centre of 50kHz channel k
+        # (Startfre + k*50kHz + 25kHz); indices must be integers in
+        # [0, num_channels - 1] or the environment raises ValueError at startup.
+        # Group lengths may differ and groups may overlap.
+        # NOTE: after changing these, regenerate the offline replay dataset.
+        "channels_phase0": [0, 2, 4, 6, 8, 10, 12, 14],   # Group 0 (even channels)
+        "channels_phase1": [1, 3, 5, 7, 9, 11, 13, 15],  # Group 1 (odd channels)
     },
     
     # Reactive Jamming Configuration
@@ -158,6 +177,16 @@ TRAIN_CONFIG = {
     "steps_per_episode": 150,       # Total environment steps per episode
     "update_iters_per_step": 10,      # Gradient updates per environment step
     "fixed_hoprate": 100.0,          # Fixed hopping rate for training
+}
+
+# Figure Saving Configuration (train_offsets.py only)
+# At each listed training step (1-based, matching the "Step i/N" log index),
+# save the pre-action observation (agent's input state) as step_XXX_obs.png and
+# one PSD figure per block as step_XXX_block_YY.png under output_dir/figures/.
+# Multiple steps may be listed; values outside [1, steps_per_episode] are
+# ignored with a warning. Empty list disables figure saving.
+PLOT_CONFIG = {
+    "figure_save_steps": [50, 100],
 }
 
 # Reward Calculation Configuration
