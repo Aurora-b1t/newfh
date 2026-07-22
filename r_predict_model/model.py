@@ -1,446 +1,547 @@
-"""
-Reward-only ensemble model used by the MBPO training entry point.
+"""Step-level probabilistic reward ensemble for FHSS MBPO.
 
-The original MBPO template predicts reward plus state deltas for continuous
-control tasks.  In this project the SAC observation is a PSD image plus FHSS
-metadata, and synthetic rollouts are intentionally limited to one step.  The
-model therefore learns only:
+Each ensemble member owns an independent convolutional state encoder.  The
+model consumes one complete SAC decision and predicts one reward per offset
+head:
 
-    flattened(state_img, hoprate, block_idx, action) -> reward
+    (PSD image, hoprate, offsets[num_heads]) -> block_rewards[num_heads]
 
-The ensemble predicts both reward mean and reward variance.  During rollout,
-only elite networks selected by holdout loss are sampled, which follows the
-standard MBPO practice of using an ensemble to reduce model bias.
+Only rewards are modelled.  The MBPO adapter is responsible for pairing these
+predictions with the exogenous next observation stored in real replay.
 """
 
-import itertools
+import copy
+import os
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
+
+from SAC import StateEncoder
 
 
-class StandardScaler:
-    """
-    Feature-wise standardization helper for model inputs.
-
-    Neural dynamics models are sensitive to input scale.  The scaler stores the
-    mean and standard deviation computed from the training split, then reuses
-    them for holdout evaluation and inference so all data enters the ensemble in
-    the same normalized coordinate system.
-    """
-
-    def __init__(self):
-        self.mu = None
-        self.std = None
-
-    def fit(self, data):
-        """Estimate feature mean and standard deviation from a 2-D array."""
-        data = np.asarray(data, dtype=np.float32)
-        self.mu = np.mean(data, axis=0, keepdims=True)
-        self.std = np.std(data, axis=0, keepdims=True)
-        # Constant features would divide by zero; keeping their scale at one
-        # leaves those dimensions centered without amplifying numerical noise.
-        self.std[self.std < 1e-12] = 1.0
-
-    def transform(self, data):
-        """Apply the fitted normalization to input features."""
-        if self.mu is None or self.std is None:
-            raise RuntimeError("StandardScaler must be fitted before transform().")
-        return (np.asarray(data, dtype=np.float32) - self.mu) / self.std
-
-    def inverse_transform(self, data):
-        """Map normalized data back to the original feature scale."""
-        if self.mu is None or self.std is None:
-            raise RuntimeError("StandardScaler must be fitted before inverse_transform().")
-        return self.std * data + self.mu
+CHECKPOINT_FORMAT_VERSION = 1
 
 
-def _truncated_normal_(tensor, mean=0.0, std=0.01):
-    """
-    Fill ``tensor`` with samples from a normal distribution truncated to 2 std.
-
-    PyTorch has native truncation utilities in newer versions, but this local
-    implementation keeps the project independent of a specific torch release.
-    """
-    with torch.no_grad():
-        torch.nn.init.normal_(tensor, mean=mean, std=std)
-        while True:
-            cond = torch.logical_or(tensor < mean - 2 * std, tensor > mean + 2 * std)
-            if not torch.sum(cond):
-                break
-            tensor[cond] = torch.normal(
-                mean=mean,
-                std=std,
-                size=(int(cond.sum().item()),),
-                device=tensor.device,
-            )
-
-
-def init_weights(module):
-    """Initialize linear and ensemble-linear layers with MBPO-style weights."""
-    if isinstance(module, (nn.Linear, EnsembleFC)):
-        input_dim = module.in_features
-        _truncated_normal_(module.weight, std=1 / (2 * np.sqrt(input_dim)))
+def _init_linear(module):
+    if isinstance(module, nn.Linear):
+        std = 1.0 / (2.0 * np.sqrt(max(1, module.in_features)))
+        nn.init.trunc_normal_(
+            module.weight,
+            std=std,
+            a=-2.0 * std,
+            b=2.0 * std,
+        )
         if module.bias is not None:
-            module.bias.data.fill_(0.0)
+            nn.init.zeros_(module.bias)
 
 
-class EnsembleFC(nn.Module):
-    """
-    Fully connected layer evaluated for all ensemble members in parallel.
-
-    Shapes:
-        input_tensor: [ensemble_size, batch_size, in_features]
-        weight:       [ensemble_size, in_features, out_features]
-        output:       [ensemble_size, batch_size, out_features]
-
-    Each ensemble member owns a separate weight matrix and bias vector.  Batched
-    matrix multiplication lets all members process the same minibatch without a
-    Python loop.
-    """
+class StepRewardMember(nn.Module):
+    """One independent CNN member of the probabilistic reward ensemble."""
 
     def __init__(
         self,
-        in_features,
-        out_features,
-        ensemble_size=5,
-        weight_decay=0.0,
-        bias=True,
-    ):
-        super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
-        self.ensemble_size = int(ensemble_size)
-        self.weight_decay = float(weight_decay)
-        self.weight = nn.Parameter(torch.empty(ensemble_size, in_features, out_features))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(ensemble_size, out_features))
-        else:
-            self.register_parameter("bias", None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """Reset weights and bias for every ensemble member."""
-        _truncated_normal_(self.weight, std=1 / (2 * np.sqrt(self.in_features)))
-        if self.bias is not None:
-            self.bias.data.fill_(0.0)
-
-    def forward(self, input_tensor):
-        """Apply the ensemble-specific affine transform."""
-        output = torch.bmm(input_tensor, self.weight)
-        if self.bias is not None:
-            output = output + self.bias[:, None, :]
-        return output
-
-
-class Swish(nn.Module):
-    """Swish activation: x * sigmoid(x)."""
-
-    def forward(self, x):
-        return x * torch.sigmoid(x)
-
-
-class EnsembleModel(nn.Module):
-    """
-    Probabilistic neural ensemble that predicts reward mean and variance.
-
-    The network has five ensemble-aware linear layers.  The final layer emits
-    ``2 * output_dim`` values for each model member: the first half is the mean,
-    and the second half is a bounded log-variance.  The bounded variance prevents
-    unstable confidence estimates from dominating the loss during early
-    training.
-    """
-
-    def __init__(
-        self,
-        input_size,
-        output_size,
-        ensemble_size,
+        num_heads,
+        n_actions,
+        hoprate_min,
+        hoprate_max,
         hidden_size=200,
-        learning_rate=1e-3,
-        use_decay=False,
-        device=None,
     ):
         super().__init__()
-        self.output_dim = int(output_size)
-        self.use_decay = bool(use_decay)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-
-        self.nn1 = EnsembleFC(input_size, hidden_size, ensemble_size, weight_decay=0.000025)
-        self.nn2 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.00005)
-        self.nn3 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.000075)
-        self.nn4 = EnsembleFC(hidden_size, hidden_size, ensemble_size, weight_decay=0.000075)
-        self.nn5 = EnsembleFC(hidden_size, self.output_dim * 2, ensemble_size, weight_decay=0.0001)
-
-        # Non-trainable variance bounds used by the probabilistic MBPO loss.
-        self.max_logvar = nn.Parameter(
-            torch.ones((1, self.output_dim), device=self.device) / 2,
-            requires_grad=False,
+        self.num_heads = int(num_heads)
+        self.n_actions = int(n_actions)
+        self.state_encoder = StateEncoder(hoprate_min, hoprate_max)
+        self.action_encoder = nn.Sequential(
+            nn.Linear(self.num_heads * self.n_actions, hidden_size),
+            nn.ReLU(),
         )
-        self.min_logvar = nn.Parameter(
-            -torch.ones((1, self.output_dim), device=self.device) * 10,
-            requires_grad=False,
+        self.fusion = nn.Sequential(
+            nn.Linear(256 + hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
         )
-        self.swish = Swish()
-        self.apply(init_weights)
-        self.to(self.device)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        self.output = nn.Linear(hidden_size, 2 * self.num_heads)
+        self.register_buffer("max_logvar", torch.full((1, self.num_heads), 0.5))
+        self.register_buffer("min_logvar", torch.full((1, self.num_heads), -10.0))
+        self.action_encoder.apply(_init_linear)
+        self.fusion.apply(_init_linear)
+        self.output.apply(_init_linear)
 
-    def forward(self, x, ret_log_var=False):
-        """
-        Run a forward pass through every ensemble member.
+    def forward(self, images, hoprates, actions, return_logvar=False):
+        if actions.ndim != 2 or actions.shape[1] != self.num_heads:
+            raise ValueError(
+                "actions must have shape [batch_size, "
+                f"{self.num_heads}], got {tuple(actions.shape)}."
+            )
+        if torch.any(actions < 0) or torch.any(actions >= self.n_actions):
+            raise ValueError("actions are outside the configured action range.")
 
-        Args:
-            x: Tensor with shape [network_size, batch_size, input_size].
-            ret_log_var: When true, return log-variance instead of variance.
-
-        Returns:
-            mean and either log-variance or variance, each with shape
-            [network_size, batch_size, output_dim].
-        """
-        x = self.swish(self.nn1(x))
-        x = self.swish(self.nn2(x))
-        x = self.swish(self.nn3(x))
-        x = self.swish(self.nn4(x))
-        output = self.nn5(x)
-        mean = output[:, :, :self.output_dim]
-        logvar = self.max_logvar - F.softplus(self.max_logvar - output[:, :, self.output_dim:])
+        state_features = self.state_encoder(images, hoprates)
+        one_hot_actions = F.one_hot(
+            actions.long(), num_classes=self.n_actions
+        ).to(dtype=images.dtype)
+        action_features = self.action_encoder(one_hot_actions.flatten(start_dim=1))
+        fused = self.fusion(torch.cat([state_features, action_features], dim=1))
+        output = self.output(fused)
+        mean, raw_logvar = torch.chunk(output, 2, dim=-1)
+        logvar = self.max_logvar - F.softplus(self.max_logvar - raw_logvar)
         logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
-        if ret_log_var:
+        if return_logvar:
             return mean, logvar
         return mean, torch.exp(logvar)
 
-    def get_decay_loss(self):
-        """Compute ensemble layer weight decay using each layer's configured scale."""
-        decay_loss = 0.0
-        for module in self.children():
-            if isinstance(module, EnsembleFC):
-                decay_loss += module.weight_decay * torch.sum(torch.square(module.weight)) / 2.0
-        return decay_loss
 
-    def loss(self, mean, logvar, labels, inc_var_loss=True):
-        """
-        Compute probabilistic ensemble loss.
+class _RewardDataset:
+    """Reference-based dataset that avoids copying a full image replay."""
 
-        With ``inc_var_loss=True``, errors are weighted by inverse variance and
-        a log-variance penalty is added, so the model must explain both mean
-        prediction error and predictive uncertainty.  With ``False``, the method
-        returns plain per-network MSE, which is used for holdout ranking.
-        """
-        assert len(mean.shape) == len(logvar.shape) == len(labels.shape) == 3
-        if inc_var_loss:
-            inv_var = torch.exp(-logvar)
-            mse_loss = torch.mean(torch.mean(torch.square(mean - labels) * inv_var, dim=-1), dim=-1)
-            var_loss = torch.mean(torch.mean(logvar, dim=-1), dim=-1)
-            total_loss = torch.sum(mse_loss) + torch.sum(var_loss)
-        else:
-            mse_loss = torch.mean(torch.square(mean - labels), dim=(1, 2))
-            total_loss = torch.sum(mse_loss)
-        return total_loss, mse_loss
+    def __init__(self, state_imgs, hoprates, actions, block_rewards):
+        lengths = {
+            len(state_imgs),
+            len(hoprates),
+            len(actions),
+            len(block_rewards),
+        }
+        if len(lengths) != 1:
+            raise ValueError("Reward-model fields have inconsistent lengths.")
+        self.size = lengths.pop()
+        if self.size < 2:
+            raise ValueError("Need at least two real transitions to fit the ensemble.")
+        self.state_imgs = state_imgs
+        self.hoprates = hoprates
+        self.actions = actions
+        self.block_rewards = block_rewards
 
-    def update(self, loss):
-        """Backpropagate one optimizer step for the ensemble model."""
-        self.optimizer.zero_grad()
-        loss = loss + 0.01 * torch.sum(self.max_logvar) - 0.01 * torch.sum(self.min_logvar)
-        if self.use_decay:
-            loss = loss + self.get_decay_loss()
-        loss.backward()
-        self.optimizer.step()
+    def batch(self, indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        return (
+            np.stack([self.state_imgs[i] for i in indices]).astype(
+                np.float32, copy=False
+            ),
+            np.asarray([self.hoprates[i] for i in indices], dtype=np.float32),
+            np.stack([self.actions[i] for i in indices]).astype(
+                np.int64, copy=False
+            ),
+            np.stack([self.block_rewards[i] for i in indices]).astype(
+                np.float32, copy=False
+            ),
+        )
 
 
-class EnsembleDynamicsModel:
-    """
-    User-facing wrapper around ``EnsembleModel`` for MBPO reward prediction.
-
-    Responsibilities:
-        - normalize input features;
-        - split data into training and holdout sets;
-        - train every ensemble member with independent minibatch order;
-        - select elite models by holdout MSE;
-        - expose deterministic or stochastic reward predictions.
-    """
+class StepRewardEnsemble(nn.Module):
+    """Independent CNN ensemble for complete FHSS step reward prediction."""
 
     def __init__(
         self,
         network_size,
         elite_size,
-        state_size,
-        action_size,
-        reward_size=1,
+        num_heads,
+        n_actions,
+        hoprate_min=10.0,
+        hoprate_max=1000.0,
         hidden_size=200,
         learning_rate=1e-3,
-        use_decay=False,
+        weight_decay=1e-5,
         device=None,
     ):
+        super().__init__()
+        if network_size <= 0:
+            raise ValueError("network_size must be positive.")
+        if elite_size <= 0 or elite_size > network_size:
+            raise ValueError("elite_size must be in [1, network_size].")
+        if num_heads <= 0 or n_actions <= 0:
+            raise ValueError("num_heads and n_actions must be positive.")
+        if hidden_size <= 0 or learning_rate <= 0.0 or weight_decay < 0.0:
+            raise ValueError("Invalid reward-model optimizer or hidden-size settings.")
+        if hoprate_max <= hoprate_min:
+            raise ValueError("hoprate_max must be greater than hoprate_min.")
+
         self.network_size = int(network_size)
         self.elite_size = int(elite_size)
-        self.state_size = int(state_size)
-        self.action_size = int(action_size)
-        self.reward_size = int(reward_size)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.elite_model_idxes = list(range(min(self.elite_size, self.network_size)))
-        self.scaler = StandardScaler()
-        self.ensemble_model = EnsembleModel(
-            input_size=self.state_size + self.action_size,
-            output_size=self.reward_size,
-            ensemble_size=self.network_size,
-            hidden_size=hidden_size,
-            learning_rate=learning_rate,
-            use_decay=use_decay,
-            device=self.device,
+        self.num_heads = int(num_heads)
+        self.n_actions = int(n_actions)
+        self.hoprate_min = float(hoprate_min)
+        self.hoprate_max = float(hoprate_max)
+        self.hidden_size = int(hidden_size)
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        self.members = nn.ModuleList(
+            StepRewardMember(
+                self.num_heads,
+                self.n_actions,
+                self.hoprate_min,
+                self.hoprate_max,
+                self.hidden_size,
+            )
+            for _ in range(self.network_size)
+        )
+        self.to(self.device)
+        self.optimizers = [
+            torch.optim.Adam(
+                member.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+            for member in self.members
+        ]
+        self.elite_model_idxes = list(range(self.elite_size))
+        self.observation_shape = None
+        self.is_fitted = False
         self.last_train_stats = {}
 
-    def train(self, inputs, labels, batch_size=256, holdout_ratio=0.2, max_epochs_since_update=5):
-        """
-        Train the ensemble on supervised reward targets.
+    def _images_tensor(self, images):
+        tensor = torch.as_tensor(images, dtype=torch.float32, device=self.device)
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(1)
+        if tensor.ndim != 4:
+            raise ValueError(
+                "state images must have shape [B,H,W] or [B,C,H,W], got "
+                f"{tuple(tensor.shape)}."
+            )
+        return tensor
 
-        Args:
-            inputs: Array [num_samples, state_size + action_size].
-            labels: Array [num_samples] or [num_samples, reward_size].
-            batch_size: Minibatch size per ensemble member.
-            holdout_ratio: Fraction of samples reserved for validation and
-                elite model selection.
-            max_epochs_since_update: Early-stop patience measured in epochs
-                without meaningful holdout improvement.
+    def _batch_tensors(self, batch, include_rewards=True):
+        images, hoprates, actions, *remaining = batch
+        images_t = self._images_tensor(images)
+        hoprates_t = torch.as_tensor(
+            hoprates, dtype=torch.float32, device=self.device
+        ).view(-1, 1)
+        raw_actions = np.asarray(actions)
+        if raw_actions.shape != (len(images), self.num_heads):
+            raise ValueError(
+                "actions must have shape "
+                f"({len(images)}, {self.num_heads}), got {raw_actions.shape}."
+            )
+        rounded_actions = np.rint(raw_actions)
+        if not np.allclose(raw_actions, rounded_actions):
+            raise ValueError("actions must be integer-valued.")
+        actions_t = torch.as_tensor(
+            rounded_actions, dtype=torch.long, device=self.device
+        )
+        if torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions):
+            raise ValueError("actions are outside the configured action range.")
+        if not include_rewards:
+            return images_t, hoprates_t, actions_t
 
-        Returns:
-            Dictionary containing epoch count, per-model holdout losses, elite
-            model indices, and mean holdout loss.
-        """
-        inputs = np.asarray(inputs, dtype=np.float32)
-        labels = np.asarray(labels, dtype=np.float32)
-        if labels.ndim == 1:
-            labels = labels.reshape(-1, 1)
-        if inputs.shape[0] < 2:
-            raise ValueError("Need at least two samples to train the ensemble reward model.")
+        rewards = np.asarray(remaining[0], dtype=np.float32)
+        expected_shape = (len(images), self.num_heads)
+        if rewards.shape != expected_shape:
+            raise ValueError(
+                f"block_rewards must have shape {expected_shape}, got {rewards.shape}."
+            )
+        rewards_t = torch.as_tensor(
+            rewards, dtype=torch.float32, device=self.device
+        )
+        return images_t, hoprates_t, actions_t, rewards_t
 
-        num_holdout = int(inputs.shape[0] * holdout_ratio)
-        num_holdout = min(max(1, num_holdout), inputs.shape[0] - 1)
-        # Shuffle before splitting so the holdout set is not biased by replay
-        # insertion order.
-        permutation = np.random.permutation(inputs.shape[0])
-        inputs, labels = inputs[permutation], labels[permutation]
+    @staticmethod
+    def _probabilistic_loss(mean, logvar, targets):
+        return torch.mean(torch.square(mean - targets) * torch.exp(-logvar) + logvar)
 
-        train_inputs, train_labels = inputs[num_holdout:], labels[num_holdout:]
-        holdout_inputs, holdout_labels = inputs[:num_holdout], labels[:num_holdout]
-        self.scaler.fit(train_inputs)
-        train_inputs = self.scaler.transform(train_inputs)
-        holdout_inputs = self.scaler.transform(holdout_inputs)
+    def _evaluate_member(self, member, dataset, indices, batch_size):
+        member.eval()
+        squared_error = 0.0
+        value_count = 0
+        with torch.no_grad():
+            for start in range(0, len(indices), batch_size):
+                batch_indices = indices[start : start + batch_size]
+                tensors = self._batch_tensors(dataset.batch(batch_indices))
+                mean, _variance = member(*tensors[:3])
+                squared_error += torch.sum(torch.square(mean - tensors[3])).item()
+                value_count += tensors[3].numel()
+        return squared_error / max(1, value_count)
 
-        holdout_inputs_t = torch.from_numpy(holdout_inputs).float().to(self.device)
-        holdout_labels_t = torch.from_numpy(holdout_labels).float().to(self.device)
-        holdout_inputs_t = holdout_inputs_t[None, :, :].repeat([self.network_size, 1, 1])
-        holdout_labels_t = holdout_labels_t[None, :, :].repeat([self.network_size, 1, 1])
+    def fit(
+        self,
+        state_imgs,
+        hoprates,
+        actions,
+        block_rewards,
+        batch_size=256,
+        holdout_ratio=0.2,
+        patience=5,
+        max_epochs=100,
+        min_improvement=0.01,
+    ):
+        """Fit every member on the full current real-replay training split."""
+        if batch_size <= 0 or patience < 0 or max_epochs <= 0:
+            raise ValueError("Invalid ensemble training limits.")
+        if not 0.0 < holdout_ratio < 1.0:
+            raise ValueError("holdout_ratio must be between zero and one.")
+        if min_improvement < 0.0:
+            raise ValueError("min_improvement must be non-negative.")
 
-        snapshots = {i: (None, 1e10) for i in range(self.network_size)}
-        epochs_since_update = 0
-        last_holdout_losses = None
-        final_epoch = 0
+        dataset = _RewardDataset(state_imgs, hoprates, actions, block_rewards)
+        first_state = np.asarray(state_imgs[0], dtype=np.float32)
+        if first_state.ndim not in (2, 3):
+            raise ValueError("Each state image must have shape [H,W] or [C,H,W].")
+        observation_shape = tuple(first_state.shape)
+        if self.observation_shape is None:
+            self.observation_shape = observation_shape
+        elif observation_shape != self.observation_shape:
+            raise ValueError(
+                "Observation shape differs from the fitted reward model: "
+                f"expected {self.observation_shape}, got {observation_shape}."
+            )
 
-        for epoch in itertools.count():
-            # Each ensemble member receives a different permutation.  This
-            # cheap bootstrapping encourages model diversity.
-            train_idx = np.vstack([
-                np.random.permutation(train_inputs.shape[0])
-                for _ in range(self.network_size)
-            ])
-            for start_pos in range(0, train_inputs.shape[0], batch_size):
-                idx = train_idx[:, start_pos:start_pos + batch_size]
-                train_input = torch.from_numpy(train_inputs[idx]).float().to(self.device)
-                train_label = torch.from_numpy(train_labels[idx]).float().to(self.device)
-                mean, logvar = self.ensemble_model(train_input, ret_log_var=True)
-                loss, _ = self.ensemble_model.loss(mean, logvar, train_label)
-                self.ensemble_model.update(loss)
+        permutation = np.random.permutation(dataset.size)
+        holdout_size = min(
+            max(1, int(dataset.size * holdout_ratio)), dataset.size - 1
+        )
+        holdout_indices = permutation[:holdout_size]
+        train_indices = permutation[holdout_size:]
+        epoch_counts = []
 
-            with torch.no_grad():
-                holdout_mean, holdout_logvar = self.ensemble_model(holdout_inputs_t, ret_log_var=True)
-                _, holdout_mse_losses = self.ensemble_model.loss(
-                    holdout_mean,
-                    holdout_logvar,
-                    holdout_labels_t,
-                    inc_var_loss=False,
+        for member, optimizer in zip(self.members, self.optimizers):
+            best_loss = float("inf")
+            best_state = None
+            stale_epochs = 0
+            epochs_run = 0
+
+            for epoch in range(max_epochs):
+                member.train()
+                shuffled_indices = np.random.permutation(train_indices)
+                for start in range(0, len(shuffled_indices), batch_size):
+                    batch_indices = shuffled_indices[start : start + batch_size]
+                    images_t, hoprates_t, actions_t, rewards_t = self._batch_tensors(
+                        dataset.batch(batch_indices)
+                    )
+                    mean, logvar = member(
+                        images_t, hoprates_t, actions_t, return_logvar=True
+                    )
+                    loss = self._probabilistic_loss(mean, logvar, rewards_t)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                holdout_loss = self._evaluate_member(
+                    member, dataset, holdout_indices, batch_size
                 )
-                holdout_mse_losses = holdout_mse_losses.detach().cpu().numpy()
-                last_holdout_losses = holdout_mse_losses
-                # Elite networks are the lowest-loss members on held-out real
-                # replay data.  Rollouts sample only from this subset.
-                self.elite_model_idxes = np.argsort(holdout_mse_losses)[:self.elite_size].tolist()
+                if not np.isfinite(holdout_loss):
+                    raise RuntimeError("Reward-model holdout loss became non-finite.")
+                relative_improvement = (
+                    float("inf")
+                    if not np.isfinite(best_loss)
+                    else (best_loss - holdout_loss) / max(abs(best_loss), 1e-12)
+                )
+                if relative_improvement > min_improvement:
+                    best_loss = holdout_loss
+                    best_state = copy.deepcopy(member.state_dict())
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
+                epochs_run = epoch + 1
+                if stale_epochs >= patience:
+                    break
 
-            updated = False
-            for i, current_loss in enumerate(holdout_mse_losses):
-                _, best_loss = snapshots[i]
-                improvement = (best_loss - current_loss) / best_loss
-                # Match the common MBPO early-stop rule: a model has improved
-                # only if holdout loss drops by more than one percent.
-                if improvement > 0.01:
-                    snapshots[i] = (epoch, current_loss)
-                    updated = True
-            epochs_since_update = 0 if updated else epochs_since_update + 1
-            final_epoch = epoch
-            if epochs_since_update > max_epochs_since_update:
-                break
+            if best_state is None:
+                raise RuntimeError("Reward-model member did not produce a valid checkpoint.")
+            member.load_state_dict(best_state)
+            member.eval()
+            epoch_counts.append(epochs_run)
 
+        holdout_losses = np.asarray(
+            [
+                self._evaluate_member(member, dataset, holdout_indices, batch_size)
+                for member in self.members
+            ],
+            dtype=np.float64,
+        )
+        self.elite_model_idxes = np.argsort(holdout_losses)[
+            : self.elite_size
+        ].tolist()
+        self.is_fitted = True
         self.last_train_stats = {
-            "epochs": final_epoch + 1,
-            "holdout_losses": last_holdout_losses,
+            "epochs": epoch_counts,
+            "holdout_losses": holdout_losses,
+            "holdout_loss_mean": float(np.mean(holdout_losses)),
             "elite_model_idxes": list(self.elite_model_idxes),
-            "holdout_loss_mean": float(np.mean(last_holdout_losses)),
+            "train_size": int(len(train_indices)),
+            "holdout_size": int(len(holdout_indices)),
         }
         return self.last_train_stats
 
-    def predict(self, inputs, batch_size=1024, factored=True):
-        """
-        Predict reward distribution for a batch of encoded transitions.
+    def _validate_prediction_inputs(self, state_imgs, hoprates, actions):
+        state_imgs = np.asarray(state_imgs, dtype=np.float32)
+        hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1)
+        actions = np.asarray(actions)
+        if state_imgs.ndim not in (3, 4):
+            raise ValueError("state_imgs must have shape [B,H,W] or [B,C,H,W].")
+        batch_size = len(state_imgs)
+        if batch_size == 0:
+            raise ValueError("Prediction inputs cannot be empty.")
+        if hoprates.shape != (batch_size,):
+            raise ValueError(f"hoprates must have shape ({batch_size},).")
+        if actions.shape != (batch_size, self.num_heads):
+            raise ValueError(
+                "actions must have shape "
+                f"({batch_size}, {self.num_heads}), got {actions.shape}."
+            )
+        if not np.all(np.isfinite(state_imgs)) or not np.all(np.isfinite(hoprates)):
+            raise ValueError("Prediction inputs must contain only finite values.")
+        return state_imgs, hoprates, actions
 
-        Args:
-            inputs: Raw, unnormalized model inputs.
-            batch_size: Inference minibatch size.
-            factored: If true, keep the ensemble dimension.  If false, return
-                the mixture mean and total variance after marginalizing over
-                ensemble members.
-        """
-        inputs = self.scaler.transform(inputs)
-        ensemble_mean, ensemble_var = [], []
-        for i in range(0, inputs.shape[0], batch_size):
-            batch = inputs[i:min(i + batch_size, inputs.shape[0])]
-            batch_t = torch.from_numpy(batch).float().to(self.device)
-            batch_t = batch_t[None, :, :].repeat([self.network_size, 1, 1])
+    def predict(self, state_imgs, hoprates, actions, batch_size=1024):
+        """Return means and variances with shape [models, batch, heads]."""
+        if not self.is_fitted:
+            raise RuntimeError("StepRewardEnsemble must be fitted before prediction.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        state_imgs, hoprates, actions = self._validate_prediction_inputs(
+            state_imgs, hoprates, actions
+        )
+        ensemble_means = []
+        ensemble_variances = []
+        for member in self.members:
+            member.eval()
+            member_means = []
+            member_variances = []
             with torch.no_grad():
-                batch_mean, batch_var = self.ensemble_model(batch_t, ret_log_var=False)
-            ensemble_mean.append(batch_mean.detach().cpu().numpy())
-            ensemble_var.append(batch_var.detach().cpu().numpy())
+                for start in range(0, len(state_imgs), batch_size):
+                    stop = min(start + batch_size, len(state_imgs))
+                    tensors = self._batch_tensors(
+                        (
+                            state_imgs[start:stop],
+                            hoprates[start:stop],
+                            actions[start:stop],
+                        ),
+                        include_rewards=False,
+                    )
+                    means, variances = member(*tensors)
+                    member_means.append(means.cpu().numpy())
+                    member_variances.append(variances.cpu().numpy())
+            ensemble_means.append(np.concatenate(member_means, axis=0))
+            ensemble_variances.append(np.concatenate(member_variances, axis=0))
+        return (
+            np.stack(ensemble_means).astype(np.float32, copy=False),
+            np.stack(ensemble_variances).astype(np.float32, copy=False),
+        )
 
-        ensemble_mean = np.concatenate(ensemble_mean, axis=1)
-        ensemble_var = np.concatenate(ensemble_var, axis=1)
-        if factored:
-            return ensemble_mean, ensemble_var
+    def sample_rewards(
+        self,
+        state_imgs,
+        hoprates,
+        actions,
+        deterministic=False,
+        batch_size=1024,
+    ):
+        """Sample a complete reward vector from one elite per transition."""
+        means, variances = self.predict(
+            state_imgs, hoprates, actions, batch_size=batch_size
+        )
+        elite_indices = np.asarray(self.elite_model_idxes, dtype=np.int64)
+        elite_means = means[elite_indices]
+        disagreement = np.mean(np.std(elite_means, axis=0), axis=1)
+        item_indices = np.arange(means.shape[1])
 
-        mean = np.mean(ensemble_mean, axis=0)
-        # Law of total variance: expected model variance plus disagreement
-        # among ensemble means.
-        var = np.mean(ensemble_var, axis=0) + np.mean(np.square(ensemble_mean - mean[None, :, :]), axis=0)
-        return mean, var
-
-    def predict_reward(self, inputs, deterministic=False):
-        """
-        Return scalar reward predictions from elite ensemble members.
-
-        Stochastic mode samples from each selected model's Gaussian output and
-        randomly chooses an elite model per item.  Deterministic mode cycles
-        through elite model means, which is useful for reproducible evaluation.
-        """
-        means, variances = self.predict(inputs, factored=True)
-        batch_size = means.shape[1]
         if deterministic:
-            model_idxes = np.asarray(self.elite_model_idxes)[
-                np.arange(batch_size) % len(self.elite_model_idxes)
-            ]
-            return means[model_idxes, np.arange(batch_size), 0]
+            rewards = np.mean(elite_means, axis=0)
+            selected_indices = np.full(means.shape[1], -1, dtype=np.int64)
+        else:
+            selected_indices = np.random.choice(
+                elite_indices, size=means.shape[1]
+            )
+            selected_means = means[selected_indices, item_indices]
+            selected_variances = variances[selected_indices, item_indices]
+            rewards = selected_means + np.random.normal(
+                size=selected_means.shape
+            ) * np.sqrt(np.maximum(selected_variances, 1e-12))
 
-        stds = np.sqrt(np.maximum(variances, 1e-12))
-        samples = means + np.random.normal(size=means.shape) * stds
-        model_idxes = np.random.choice(self.elite_model_idxes, size=batch_size)
-        return samples[model_idxes, np.arange(batch_size), 0]
+        return rewards.astype(np.float32, copy=False), {
+            "selected_model_idxes": selected_indices,
+            "disagreement": disagreement.astype(np.float32, copy=False),
+        }
+
+    def _config(self):
+        return {
+            "network_size": self.network_size,
+            "elite_size": self.elite_size,
+            "num_heads": self.num_heads,
+            "n_actions": self.n_actions,
+            "hoprate_min": self.hoprate_min,
+            "hoprate_max": self.hoprate_max,
+            "hidden_size": self.hidden_size,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+        }
+
+    def save_checkpoint(self, path, metadata=None):
+        if not self.is_fitted or self.observation_shape is None:
+            raise RuntimeError("Cannot save an unfitted reward model.")
+        output_dir = os.path.dirname(os.path.abspath(path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        torch.save(
+            {
+                "format_version": CHECKPOINT_FORMAT_VERSION,
+                "model_type": "StepRewardEnsemble",
+                "config": self._config(),
+                "observation_shape": list(self.observation_shape),
+                "elite_model_idxes": list(self.elite_model_idxes),
+                "model_state_dict": self.state_dict(),
+                "metadata": dict(metadata or {}),
+            },
+            path,
+        )
+
+    def _materialize(self, observation_shape):
+        shape = tuple(int(value) for value in observation_shape)
+        if len(shape) == 2:
+            images = torch.zeros((1, 1, *shape), device=self.device)
+        elif len(shape) == 3:
+            images = torch.zeros((1, *shape), device=self.device)
+        else:
+            raise ValueError("Checkpoint observation_shape must have two or three axes.")
+        hoprates = torch.full(
+            (1, 1), (self.hoprate_min + self.hoprate_max) / 2.0, device=self.device
+        )
+        actions = torch.zeros((1, self.num_heads), dtype=torch.long, device=self.device)
+        for member in self.members:
+            member.eval()
+            with torch.no_grad():
+                member(images, hoprates, actions)
+        self.observation_shape = shape
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        path,
+        device="cpu",
+        expected_num_heads=None,
+        expected_n_actions=None,
+        expected_observation_shape=None,
+    ):
+        payload = torch.load(path, map_location=device, weights_only=True)
+        if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+            raise ValueError("Unsupported reward-model checkpoint format.")
+        if payload.get("model_type") != "StepRewardEnsemble":
+            raise ValueError("Checkpoint does not contain a StepRewardEnsemble.")
+        config = dict(payload["config"])
+        if expected_num_heads is not None and int(expected_num_heads) != int(
+            config["num_heads"]
+        ):
+            raise ValueError("Reward-model checkpoint block count does not match.")
+        if expected_n_actions is not None and int(expected_n_actions) != int(
+            config["n_actions"]
+        ):
+            raise ValueError("Reward-model checkpoint action count does not match.")
+        observation_shape = tuple(payload["observation_shape"])
+        if (
+            expected_observation_shape is not None
+            and tuple(expected_observation_shape) != observation_shape
+        ):
+            raise ValueError("Reward-model checkpoint observation shape does not match.")
+
+        model = cls(**config, device=device)
+        model._materialize(observation_shape)
+        model.load_state_dict(payload["model_state_dict"])
+        model.elite_model_idxes = [
+            int(index) for index in payload["elite_model_idxes"]
+        ]
+        model.is_fitted = True
+        model.eval()
+        return model, dict(payload.get("metadata", {}))

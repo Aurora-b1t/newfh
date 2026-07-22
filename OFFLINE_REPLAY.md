@@ -36,7 +36,9 @@ dones            [N]
 
 `step_rewards[n]` must equal `mean(block_rewards[n])`. The loader also validates
 observation shape, action range, block count, finite values, metadata count and
-buffer capacity. Environment configuration differences produce a warning.
+buffer capacity. Baseline training warns about environment metadata differences;
+MBPO rejects them by default and requires `--allow_replay_config_mismatch` to
+override that check.
 
 Select a dataset for baseline training:
 
@@ -57,5 +59,5 @@ rejected rather than converted. Regenerate those datasets with the v3 generator.
 
 The default now means 50,000 real environment steps, not 50,000 block rows.
 Current measurements are roughly 15 seconds for initial pre-generation and
-0.5 seconds per step, so full generation can take several hours. MBPO is not a
-consumer of v3 replay until its legacy reward model is migrated.
+0.5 seconds per step, so full generation can take several hours. Both baseline
+offset SAC and the step-level MBPO reward ensemble consume this v3 format.

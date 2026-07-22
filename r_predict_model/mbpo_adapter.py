@@ -1,77 +1,111 @@
-"""
-Adapters between the FHSS discrete SAC replay format and MBPO reward model.
-
-The SAC replay buffer stores structured transition fields such as PSD images,
-hop rates, block indices, and offset actions.  The reward ensemble expects a
-flat supervised-learning matrix.  This module owns that conversion so the
-training script and the model implementation stay independent of replay-buffer
-layout details.
-"""
+"""Adapters between step-level SAC replay and the MBPO reward ensemble."""
 
 import numpy as np
 
 
-def encode_transition_inputs(state_imgs, hoprates, block_idxs, actions):
-    """
-    Flatten SAC transition fields into reward-model inputs.
-
-    Output shape is [batch_size, flattened_state_size + 3], where the last
-    three columns are hop rate, block index, and action.  Keeping these metadata
-    columns explicit lets the reward model learn block- and action-dependent
-    reward structure even when the PSD image is shared across block transitions.
-    """
-    state_flat = np.asarray(state_imgs, dtype=np.float32).reshape(len(state_imgs), -1)
-    hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1, 1)
-    block_idxs = np.asarray(block_idxs, dtype=np.float32).reshape(-1, 1)
-    actions = np.asarray(actions, dtype=np.float32).reshape(-1, 1)
-    return np.concatenate([state_flat, hoprates, block_idxs, actions], axis=1)
-
-
-def replay_sample_to_model_data(sample):
-    """
-    Convert a SAC replay sample dictionary into supervised model data.
-
-    Returns:
-        inputs: Encoded transition matrix.
-        labels: Reward column vector with shape [batch_size, 1].
-    """
-    inputs = encode_transition_inputs(
-        sample["state_imgs"],
-        sample["hoprates"],
-        sample["block_idxs"],
-        sample["actions"],
-    )
-    labels = np.asarray(sample["rewards"], dtype=np.float32).reshape(-1, 1)
-    return inputs, labels
-
-
-def concat_transition_batches(batches):
-    """
-    Concatenate non-empty SAC replay sample dictionaries.
-
-    SAC update code expects a single replay sample dictionary.  This helper is
-    used after separately sampling from real and synthetic buffers.
-    """
-    valid_batches = [batch for batch in batches if batch is not None]
-    if not valid_batches:
-        raise ValueError("Need at least one batch to concatenate.")
-    keys = valid_batches[0].keys()
+def replay_fields_for_reward_model(replay_buffer):
+    """Return reward-model fields without copying every replay image."""
+    transitions = tuple(replay_buffer.buffer)
+    if not transitions:
+        raise ValueError("Cannot train the reward model from an empty replay buffer.")
     return {
-        key: np.concatenate([batch[key] for batch in valid_batches], axis=0)
-        for key in keys
+        "state_imgs": [transition[0] for transition in transitions],
+        "hoprates": [transition[1] for transition in transitions],
+        "actions": [transition[2] for transition in transitions],
+        "block_rewards": [transition[3] for transition in transitions],
     }
 
 
-def train_reward_model_from_replay(reward_model, replay_buffer, batch_size):
-    """
-    Train the reward model from all currently available real replay samples.
+def concat_transition_batches(batches, shuffle=True):
+    """Concatenate complete SAC samples and optionally shuffle the result."""
+    valid_batches = [batch for batch in batches if batch is not None]
+    if not valid_batches:
+        raise ValueError("Need at least one batch to concatenate.")
+    keys = tuple(valid_batches[0].keys())
+    if any(tuple(batch.keys()) != keys for batch in valid_batches[1:]):
+        raise ValueError("Transition batches do not have the same schema.")
+    combined = {
+        key: np.concatenate([batch[key] for batch in valid_batches], axis=0)
+        for key in keys
+    }
+    if shuffle and len(next(iter(combined.values()))) > 1:
+        permutation = np.random.permutation(len(next(iter(combined.values()))))
+        combined = {key: value[permutation] for key, value in combined.items()}
+    return combined
 
-    Synthetic model-buffer samples are intentionally excluded so the supervised
-    target distribution remains grounded in true environment feedback.
-    """
-    sample = replay_buffer.sample(replay_buffer.size())
-    inputs, labels = replay_sample_to_model_data(sample)
-    return reward_model.train(inputs, labels, batch_size=batch_size)
+
+def _target_real_count(batch_size, real_ratio):
+    if not 0.0 <= real_ratio <= 1.0:
+        raise ValueError("real_ratio must be in [0, 1].")
+    real_count = int(round(batch_size * real_ratio))
+    if batch_size >= 2 and 0.0 < real_ratio < 1.0:
+        real_count = min(max(1, real_count), batch_size - 1)
+    return real_count
+
+
+def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
+    """Sample exactly ``batch_size`` step transitions from real/model replay."""
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    real_ratio = float(real_ratio)
+    total_available = real_buffer.size() + model_buffer.size()
+    if total_available < batch_size:
+        raise ValueError(
+            f"Need {batch_size} total transitions, only {total_available} available."
+        )
+
+    if model_buffer.size() == 0:
+        if real_buffer.size() < batch_size:
+            raise ValueError("Real replay is too small for a fallback SAC batch.")
+        return real_buffer.sample(batch_size)
+
+    real_count = min(
+        _target_real_count(batch_size, real_ratio), real_buffer.size()
+    )
+    model_count = min(batch_size - real_count, model_buffer.size())
+    deficit = batch_size - real_count - model_count
+    if deficit:
+        additional_real = min(deficit, real_buffer.size() - real_count)
+        real_count += additional_real
+        deficit -= additional_real
+    if deficit:
+        additional_model = min(deficit, model_buffer.size() - model_count)
+        model_count += additional_model
+        deficit -= additional_model
+    if deficit:
+        raise ValueError("Replay buffers cannot supply a complete mixed batch.")
+
+    batches = []
+    if real_count:
+        batches.append(real_buffer.sample(real_count))
+    if model_count:
+        batches.append(model_buffer.sample(model_count))
+    return concat_transition_batches(batches, shuffle=True)
+
+
+def train_reward_model_from_replay(reward_model, replay_buffer, **fit_kwargs):
+    """Continue fitting the ensemble on the full current real replay."""
+    fields = replay_fields_for_reward_model(replay_buffer)
+    return reward_model.fit(**fields, **fit_kwargs)
+
+
+def reward_bounds(hoprates, reward_config):
+    """Return per-transition reward bounds implied by BER in [0, 1]."""
+    hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1, 1)
+    base_reward = float(reward_config["base_reward"])
+    ber_penalty = float(reward_config["ber_penalty"])
+    hoprate_penalty = float(reward_config["hoprate_penalty"])
+    if not np.all(
+        np.isfinite([base_reward, ber_penalty, hoprate_penalty])
+    ) or not np.all(np.isfinite(hoprates)):
+        raise ValueError("Reward bounds require finite configuration and hoprates.")
+    reward_at_ber_zero = base_reward - hoprate_penalty * hoprates
+    reward_at_ber_one = reward_at_ber_zero - ber_penalty
+    return (
+        np.minimum(reward_at_ber_zero, reward_at_ber_one),
+        np.maximum(reward_at_ber_zero, reward_at_ber_one),
+    )
 
 
 def rollout_reward_model(
@@ -80,60 +114,71 @@ def rollout_reward_model(
     real_buffer,
     model_buffer,
     batch_size,
-    fixed_hoprate,
-    n_actions,
+    reward_config,
     deterministic_model=False,
 ):
-    """
-    Generate one-step synthetic transitions with the learned reward model.
+    """Generate one-step synthetic transitions in the v3 SAC schema."""
+    if real_buffer.size() == 0:
+        raise ValueError("Cannot roll out from an empty real replay buffer.")
+    rollout_size = min(int(batch_size), real_buffer.size())
+    if rollout_size <= 0:
+        raise ValueError("rollout batch_size must be positive.")
 
-    The rollout does not predict the next PSD image. It reuses the sampled real
-    transition's ``next_state_img``: internal blocks keep the current PSD, while
-    block 9 advances to the next environment PSD. This keeps model usage limited
-    to reward augmentation, matching the assumptions in ``train_mbpo.py``.
-    """
-    starts = real_buffer.sample(batch_size)
+    starts = real_buffer.sample(rollout_size)
     state_imgs = starts["state_imgs"]
-    next_state_imgs = starts["next_state_imgs"]
-    hoprates = np.asarray(
-        starts.get("hoprates", np.full(len(state_imgs), float(fixed_hoprate))),
-        dtype=np.float32,
+    hoprates = np.asarray(starts["hoprates"], dtype=np.float32)
+    actions = np.stack(
+        [
+            np.asarray(
+                agent.take_action(state_imgs[index], float(hoprates[index])),
+                dtype=np.int64,
+            )
+            for index in range(rollout_size)
+        ]
     )
-    next_hoprates = np.asarray(
-        starts.get("next_hoprates", np.full(len(state_imgs), float(fixed_hoprate))),
-        dtype=np.float32,
+    expected_shape = (rollout_size, reward_model.num_heads)
+    if actions.shape != expected_shape:
+        raise ValueError(
+            f"SAC policy returned actions with shape {actions.shape}, "
+            f"expected {expected_shape}."
+        )
+    if np.any(actions < 0) or np.any(actions >= reward_model.n_actions):
+        raise ValueError("SAC policy returned an action outside the environment range.")
+
+    raw_rewards, prediction_stats = reward_model.sample_rewards(
+        state_imgs,
+        hoprates,
+        actions,
+        deterministic=deterministic_model,
     )
-    block_idxs = starts["block_idxs"]
+    if raw_rewards.shape != expected_shape or not np.all(np.isfinite(raw_rewards)):
+        raise RuntimeError("Reward ensemble returned invalid block rewards.")
+    lower_bounds, upper_bounds = reward_bounds(hoprates, reward_config)
+    clipped_rewards = np.clip(raw_rewards, lower_bounds, upper_bounds).astype(
+        np.float32, copy=False
+    )
+    clipped_fraction = float(np.mean(~np.isclose(raw_rewards, clipped_rewards)))
 
-    actions = np.zeros(len(state_imgs), dtype=np.int64)
-    for i in range(len(state_imgs)):
-        # Query the current SAC policy on real replay states, then clip to the
-        # discrete offset-action range accepted by the environment.
-        action = agent.take_action(state_imgs[i], float(hoprates[i]), block_idxs[i])
-        actions[i] = int(np.clip(action, 0, n_actions - 1))
-
-    model_inputs = encode_transition_inputs(state_imgs, hoprates, block_idxs, actions)
-    rewards = reward_model.predict_reward(model_inputs, deterministic=deterministic_model)
-
-    for i in range(len(state_imgs)):
-        block_idx = int(np.clip(round(float(block_idxs[i])), 0, 9))
-        next_block_idx = (block_idx + 1) % 10
-        # Only the reward is synthetic here. The sequential next state is copied
-        # from the sampled real transition because this model learns no dynamics.
+    for index in range(rollout_size):
         model_buffer.add(
-            state_imgs[i],
-            float(hoprates[i]),
-            block_idx,
-            int(actions[i]),
-            float(rewards[i]),
-            next_state_imgs[i].copy(),
-            float(next_hoprates[i]),
-            next_block_idx,
-            False,
+            state_imgs[index],
+            float(hoprates[index]),
+            actions[index],
+            clipped_rewards[index],
+            starts["next_state_imgs"][index],
+            float(starts["next_hoprates"][index]),
+            bool(starts["dones"][index]),
         )
 
+    disagreement = np.asarray(
+        prediction_stats["disagreement"], dtype=np.float32
+    )
     return {
-        "generated": int(len(state_imgs)),
-        "reward_mean": float(np.mean(rewards)) if len(rewards) else 0.0,
-        "reward_std": float(np.std(rewards)) if len(rewards) else 0.0,
+        "generated": rollout_size,
+        "reward_mean": float(np.mean(clipped_rewards)),
+        "reward_std": float(np.std(clipped_rewards)),
+        "raw_reward_mean": float(np.mean(raw_rewards)),
+        "disagreement_mean": float(np.mean(disagreement)),
+        "disagreement_p95": float(np.percentile(disagreement, 95)),
+        "clipped_fraction": clipped_fraction,
     }

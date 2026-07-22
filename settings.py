@@ -1,7 +1,7 @@
 """
 Central configuration for the FHSS RL anti-jamming training project.
 
-Defines environment parameters, jammer settings, SAC and legacy MBPO
+Defines environment parameters, jammer settings, SAC and step-level MBPO
 hyperparameters, replay buffer sizes, noisy binary search settings, training
 loop options, and reward coefficients. Output directories are configured
 per-script via each training entry point's ``--output_dir`` argument.
@@ -153,8 +153,14 @@ MBPO_CONFIG = {
     "num_networks": 5,
     "num_elites": 3,
     "hidden_size": 200,
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-5,
     "model_train_freq": 1,
     "model_train_batch_size": 256,
+    "holdout_ratio": 0.2,
+    "early_stop_patience": 5,
+    "max_epochs": 100,
+    "min_improvement": 0.01,
     "rollout_batch_size": 2000,
     "rollout_length": 1,
     "real_ratio": 0.2,
@@ -179,7 +185,7 @@ TRAIN_CONFIG = {
     "fixed_hoprate": 100.0,          # Fixed hopping rate for training
 }
 
-# Figure Saving Configuration (train_offsets.py only)
+# Figure Saving Configuration (train_offsets.py and train_mbpo.py)
 # At each listed training step (1-based, matching the "Step i/N" log index),
 # save the pre-action observation (agent's input state) as step_XXX_obs.png and
 # one PSD figure per block as step_XXX_block_YY.png under output_dir/figures/.

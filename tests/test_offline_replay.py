@@ -5,7 +5,11 @@ import unittest
 
 import numpy as np
 
-from offline_replay import load_replay_into_buffer, save_replay_buffer
+from offline_replay import (
+    environment_metadata,
+    load_replay_into_buffer,
+    save_replay_buffer,
+)
 from SAC import ReplayBuffer
 
 
@@ -155,6 +159,64 @@ class OfflineReplayTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must have shape"):
             load_replay_into_buffer(self.path, ReplayBuffer(8, 10, 20))
+
+    def test_strict_environment_metadata_rejects_before_buffer_write(self):
+        save_replay_buffer(self.path, make_buffer(), {"num_actions": 20})
+        destination = ReplayBuffer(8, 10, 20)
+        current = environment_metadata(
+            {"mode": "current"},
+            {"jammer": "comb"},
+            {"base_reward": 1.0},
+        )
+
+        with self.assertRaisesRegex(ValueError, "metadata does not match"):
+            load_replay_into_buffer(
+                self.path,
+                destination,
+                expected_num_actions=20,
+                current_environment_metadata=current,
+                strict_environment_metadata=True,
+            )
+        self.assertEqual(0, destination.size())
+
+    def test_strict_environment_metadata_accepts_matching_snapshot(self):
+        current = environment_metadata(
+            {"mode": "current"},
+            {"jammer": "comb"},
+            {"base_reward": 1.0},
+        )
+        metadata = {"num_actions": 20, **current}
+        save_replay_buffer(self.path, make_buffer(), metadata)
+        destination = ReplayBuffer(8, 10, 20)
+
+        count, _metadata = load_replay_into_buffer(
+            self.path,
+            destination,
+            expected_num_actions=20,
+            current_environment_metadata=current,
+            strict_environment_metadata=True,
+        )
+        self.assertEqual(2, count)
+        self.assertEqual(2, destination.size())
+
+    def test_non_strict_environment_metadata_allows_explicit_override(self):
+        save_replay_buffer(self.path, make_buffer(), {"num_actions": 20})
+        destination = ReplayBuffer(8, 10, 20)
+        current = environment_metadata(
+            {"mode": "current"},
+            {"jammer": "comb"},
+            {"base_reward": 1.0},
+        )
+
+        count, _metadata = load_replay_into_buffer(
+            self.path,
+            destination,
+            expected_num_actions=20,
+            current_environment_metadata=current,
+            strict_environment_metadata=False,
+        )
+        self.assertEqual(2, count)
+        self.assertEqual(2, destination.size())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 import os
+import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 from gymnasium import spaces
@@ -7,7 +9,7 @@ from gymnasium import spaces
 import settings
 from fh_env import FHSSQPSKEnv, compute_block_rewards
 from SAC import ReplayBuffer
-from train_mbpo import MBPO_DISABLED_MESSAGE, train as train_mbpo
+from train_mbpo import _validate_args, parse_args as parse_mbpo_args
 from train_offsets import parse_optional_replay_path, replay_ready
 
 
@@ -23,10 +25,15 @@ class TrainingHelperTests(unittest.TestCase):
         buffer.add(state, 100, np.zeros(10), np.zeros(10), state, 100, False)
         self.assertTrue(replay_ready(buffer, 1))
 
-    def test_mbpo_fails_before_using_arguments(self):
-        with self.assertRaisesRegex(RuntimeError, "temporarily disabled"):
-            train_mbpo(None)
-        self.assertIn("step-level", MBPO_DISABLED_MESSAGE)
+    def test_mbpo_entry_point_accepts_online_only_mode(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["train_mbpo.py", "--offline_replay_path", "none"],
+        ):
+            args = parse_mbpo_args()
+        self.assertIsNone(args.offline_replay_path)
+        _validate_args(args)
 
 
 class EnvironmentInterfaceTests(unittest.TestCase):

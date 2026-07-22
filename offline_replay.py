@@ -161,8 +161,13 @@ def load_replay_into_buffer(
     expected_num_blocks=10,
     current_environment_metadata=None,
     logger=None,
+    strict_environment_metadata=False,
 ):
-    """Validate a v3 offline replay file and append it to a ReplayBuffer."""
+    """Validate a v3 offline replay file and append it to a ReplayBuffer.
+
+    ``strict_environment_metadata`` is opt-in so existing baseline callers keep
+    their warning-only behavior. MBPO enables it explicitly.
+    """
     arrays, metadata = _load_arrays(path)
     expected_num_blocks = int(expected_num_blocks)
     count = _validate_array_shapes(arrays, expected_num_blocks)
@@ -242,6 +247,35 @@ def load_replay_into_buffer(
     if getattr(buffer, "num_heads", expected_num_blocks) != expected_num_blocks:
         raise ValueError("Replay buffer and offline file use different block counts.")
 
+    if current_environment_metadata is not None:
+        stored_config = {
+            key: metadata.get(key)
+            for key in ("env_config", "jammer_config", "reward_config")
+        }
+        current_config = _as_jsonable(current_environment_metadata)
+        if strict_environment_metadata:
+            mismatched_keys = [
+                key
+                for key in current_config
+                if key not in stored_config
+                or stored_config.get(key) is None
+                or current_config.get(key) != stored_config.get(key)
+            ]
+            if mismatched_keys:
+                raise ValueError(
+                    "Offline replay environment metadata does not match the "
+                    f"current settings for: {mismatched_keys}."
+                )
+        elif any(
+            stored_config.get(key) is not None
+            and current_config.get(key) != stored_config.get(key)
+            for key in current_config
+        ):
+            (logger or logging.getLogger(__name__)).warning(
+                "Offline replay environment configuration differs from the current "
+                "settings; use a dataset generated for the intended environment."
+            )
+
     for idx in range(count):
         buffer.add(
             arrays["state_imgs"][idx],
@@ -252,21 +286,5 @@ def load_replay_into_buffer(
             arrays["next_hoprates"][idx],
             bool(arrays["dones"][idx]),
         )
-
-    if current_environment_metadata is not None:
-        stored_config = {
-            key: metadata.get(key)
-            for key in ("env_config", "jammer_config", "reward_config")
-        }
-        current_config = _as_jsonable(current_environment_metadata)
-        if any(
-            stored_config.get(key) is not None
-            and current_config.get(key) != stored_config.get(key)
-            for key in current_config
-        ):
-            (logger or logging.getLogger(__name__)).warning(
-                "Offline replay environment configuration differs from the current "
-                "settings; use a dataset generated for the intended environment."
-            )
 
     return count, metadata

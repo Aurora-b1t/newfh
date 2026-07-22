@@ -6,7 +6,7 @@
 
 - **FHSS/QPSK 通信仿真环境**：QPSK 收发链路、跳频信道、PSD waterfall 观测、Rayleigh 衰落、扫频/梳状/反应式干扰机，支持预生成加速。
 - **baseline 十头离散 SAC 训练**：一次前向并行生成 10 个 categorical offset，一次环境 step 对应一条完整 replay transition。
-- **MBPO 参考实现**：旧 reward-model 代码仍保留，但尚未迁移到 step-level replay，训练入口会明确拒绝运行（详见 [MBPO_MODULE.md](MBPO_MODULE.md)）。
+- **step-level MBPO 奖励增强**：独立 CNN ensemble 联合预测完整十维 block reward，生成与 v3 replay 同构的一步合成样本辅助 SAC（详见 [MBPO_MODULE.md](MBPO_MODULE.md)）。
 - **Noisy Binary Search 跳速阈值搜索**：MWU-based noisy binary search 寻找反应式干扰机的跳速跟踪/失效边界，含 derivative 变体。
 - **hoprate sweep 评估**：确定性网格遍历所有候选 hoprate，作为 NBS 搜索的对照基线。
 - **离线 replay 生成与加载**：生成/复用 v3 step-level 真实环境 replay，供 baseline offset SAC 冷启动（详见 [OFFLINE_REPLAY.md](OFFLINE_REPLAY.md)）。
@@ -25,7 +25,7 @@
 | [jammers.py](jammers.py) | 干扰机实现：快速带限噪声源、基于能量检测的反应式干扰机、扫频/梳状宽带干扰机。 |
 | [SAC.py](SAC.py) | 十头离散 SAC：step-level ReplayBuffer、共享编码器实现、独立 actor/Q 输出头、温度系数自适应和软更新。 |
 | [train_offsets.py](train_offsets.py) | baseline 训练入口：构建环境、SAC agent、replay buffer、训练循环、日志和曲线输出。 |
-| [train_mbpo.py](train_mbpo.py) | 暂停使用的 legacy MBPO 入口；保留旧实现用于后续迁移，当前启动会给出明确错误。 |
+| [train_mbpo.py](train_mbpo.py) | step-level SAC + MBPO 入口：真实交互、CNN 奖励 ensemble、合成 replay、混合更新、诊断与推理 checkpoint。 |
 | [train_speed.py](train_speed.py) | Noisy Binary Search 跳速阈值搜索入口（随机 offset + 反应式干扰机）。 |
 | [train_speed_derivative.py](train_speed_derivative.py) | derivative-based NBS 变体入口，用 BER-hoprate 导数指标做方向决策。 |
 | [train_speed_sweep.py](train_speed_sweep.py) | hoprate 网格扫描评估入口，NBS 搜索的确定性对照。 |
@@ -40,11 +40,9 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| [r_predict_model/model.py](r_predict_model/model.py) | ensemble 奖励预测模型：标准化器、ensemble 全连接层、概率训练、holdout 验证、elite 选择。 |
-| [r_predict_model/mbpo_adapter.py](r_predict_model/mbpo_adapter.py) | SAC replay 与奖励模型输入格式适配层：flatten 特征、提取标签、rollout 合成样本。 |
-| [r_predict_model/replay_memory.py](r_predict_model/replay_memory.py) | 通用 MBPO 模板中的环形 replay memory。 |
-| [r_predict_model/main.py](r_predict_model/main.py) | 通用 MBPO 训练模板，保留为参考实现，非当前主入口。 |
-| [r_predict_model/__init__.py](r_predict_model/__init__.py) | 暴露 `EnsembleDynamicsModel`。 |
+| [r_predict_model/model.py](r_predict_model/model.py) | `StepRewardEnsemble`：成员参数完全独立的 CNN 概率奖励模型、全量拟合、holdout/elite 选择与 checkpoint。 |
+| [r_predict_model/mbpo_adapter.py](r_predict_model/mbpo_adapter.py) | v3 replay 适配、完整动作 rollout、reward 裁界及真实/合成 batch 混合。 |
+| [r_predict_model/__init__.py](r_predict_model/__init__.py) | 暴露 `StepRewardEnsemble`。 |
 
 ### `special_hopping_test/` 子目录
 
@@ -144,9 +142,24 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --output_dir outputs/baseli
 D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 ```
 
-## MBPO 奖励模型（暂停）
+## MBPO 奖励模型
 
-[train_mbpo.py](train_mbpo.py) 与 `r_predict_model/` 仍采用旧 block-level replay 和 `block_idx` 奖励模型，当前与十头 SAC/v3 replay 不兼容。入口会在创建环境前抛出迁移提示，避免静默运行错误实验；旧源码仅供后续迁移参考，详见 [MBPO_MODULE.md](MBPO_MODULE.md)。
+[train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，联合输出每个 block 的 reward 均值与方差；它不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
+
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite 采样完整 reward 向量，再按当前 reward 公式的物理范围裁剪。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此 50,000 条离线数据下计算成本较高。
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help
+D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py
+```
+
+纯在线缩小 smoke：
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --offline_replay_path none --steps_per_episode 2 --batch_size 2 --model_train_batch_size 2 --num_networks 2 --num_elites 1 --pred_hidden_size 16 --model_max_epochs 1 --model_patience 0 --rollout_batch_size 2 --update_iters_per_step 1 --output_dir outputs/mbpo_smoke
+```
+
+MBPO 默认严格拒绝环境、干扰或 reward metadata 不匹配的离线 replay；跨配置实验必须显式使用 `--allow_replay_config_mismatch`。完整设计与参数见 [MBPO_MODULE.md](MBPO_MODULE.md)。
 
 ## 跳速阈值搜索（Noisy Binary Search）
 
@@ -286,9 +299,11 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `ber.png`：平均 step BER 曲线。
 - `loss.png`：actor/critic loss 曲线（offset/MBPO 训练）。
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
+- `model_holdout.png`、`model_disagreement.png`、`model_clipped_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和物理边界裁剪率。
+- `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态。
 - `hoprate.png`、`ber_vs_hoprate.png`、`nbs_weights.png`：NBS 搜索诊断图。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。
-- `figures/`：由 `PLOT_CONFIG["figure_save_steps"]` 指定的 step 保存的动作前 observation 图与 10 个 block PSD 图（offset 训练）。
+- `figures/`：由 `PLOT_CONFIG["figure_save_steps"]` 指定的 step 保存的动作前 observation 图与 10 个 block PSD 图（offset/MBPO 训练）。
 - PSD capture 图：指定 step 的观测与 10 个 block PSD（special hopping 测试）。
 
 `outputs/` 已加入 [.gitignore](.gitignore)，训练产物默认不进入版本控制。
@@ -320,7 +335,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
   - 改 `mseq_seed`（初始状态）：同一 m 序列的不同相位（循环移位），最简单；
   - 改 `mseq_taps`（反馈抽头）：得到真正不同的 m 序列，抽头必须对应本原多项式（如 10 级的 `(10, 7)`、`(10, 3)`），否则周期骤减；
   - 改 `mseq_nbits`（寄存器级数）：改变周期（2ⁿ−1），同时 `mseq_taps` 必须换成对应级数的本原抽头。
-  - 注意：更换 m 序列后需重新生成离线 replay 数据（或用 `--offline_replay_path none`），加载旧数据时 metadata 校验会报配置不一致警告。
+  - 注意：更换 m 序列后需重新生成离线 replay 数据（或用 `--offline_replay_path none`）；baseline 会警告 metadata 差异，MBPO 默认直接拒绝。
 
 ### `JAMMER_CONFIG`
 
@@ -337,7 +352,7 @@ baseline SAC 超参数：`actor_lr`、`critic_lr`、`alpha_lr`、`tau`、`gamma`
 
 ### `MBPO_CONFIG`
 
-MBPO 奖励模型配置，详见 [MBPO_MODULE.md](MBPO_MODULE.md)。
+MBPO 奖励模型配置包括 ensemble/elite 数量、CNN 后端 MLP 宽度、学习率、权重衰减、全量拟合频率、holdout/早停、rollout batch、真实样本比例和 model replay 容量，详见 [MBPO_MODULE.md](MBPO_MODULE.md)。
 
 ### `BUFFER_CONFIG`
 
@@ -362,7 +377,7 @@ Noisy Binary Search 配置：
 
 ### `PLOT_CONFIG`
 
-指定 step 图片保存配置（仅 `train_offsets.py` 使用）：
+指定 step 图片保存配置（`train_offsets.py` 与 `train_mbpo.py` 使用）：
 
 - `figure_save_steps`：需要保存图片的训练 step 序号列表（1-based，与日志中 `Step i/N` 一致），可填多个。在命中的 step 保存：
   - `figures/step_XXX_obs.png`：该 step 动作前的 observation（即 agent 决策所见的 100 ms PSD waterfall）；
@@ -421,7 +436,8 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - **项目尚未完成**：训练效果验证、算法稳定性、多模块联调仍在推进中。
 - 十个动作头采用条件独立的因子化策略，无法直接表达 offset 之间的联合动作相关性；需要这类能力时应另行设计联合 critic 或自回归策略。
 - 训练效果对 reward 权重、alpha 初值、target entropy、batch size 等参数敏感。
-- MBPO 奖励模型尚未迁移到十头 step-level schema，当前训练入口已停用。
+- MBPO 是 reward-only 一步增强，不是完整 dynamics MBPO；其 next-state 复用依赖环境 observation transition 与 offsets 无关。
+- MBPO 默认每个在线 step 都用完整真实 replay 继续训练 5 个独立 CNN，计算成本高；需要快速实验时应调大 `model_train_freq` 或降低 `model_max_epochs`。
 - NBS 跳速搜索依赖 BER-vs-hoprate 的可辨识趋势；若同时启用多种强干扰或随机 offset 方差很大，可能需要增加步数、调大 `p` 或做多次重复评估。
 - v1/v2 block-level replay 和旧 SAC checkpoint 与当前网络拓扑不兼容，必须重新生成数据并重新训练。
-- 若后续要进一步规范工程结构，可以再做第二阶段重构：拆分 `env/`、`algos/`、`train/` 子包并迁移 legacy MBPO。
+- 若后续要进一步规范工程结构，可以再做第二阶段重构：拆分 `env/`、`algos/`、`train/` 子包。
