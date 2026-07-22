@@ -185,7 +185,7 @@ def generate_mseq_states(n_bits=10, length=1000, taps=(10, 7), seed=1):
         seq.append(state)
         fb = 0
         for t in taps:
-            fb ^= (state >> (n_bits - t)) & 1
+            fb ^= (state >> (t - 1)) & 1
         state = ((state << 1) & mask) | fb
         if state == 0:
             state = 1
@@ -574,10 +574,10 @@ class FHSSQPSKEnv(gym.Env):
                  sweep_mode='comb',
                  enable_rayleigh=False,
                  rayleigh_coherence=800,
-                 mseq_length=1000,
+                 mseq_length=1023,
                  mseq_nbits=10,
                  mseq_taps=(10, 7),
-                 mseq_seed=1,
+                 mseq_seed=46,
                  debug_plot_psd=False,
                  debug_log_hops=False,
                  reset_mseq_each_step=True,

@@ -73,10 +73,10 @@ ENV_CONFIG = {
     #   - change mseq_nbits -> changes the period (2^n - 1); taps must be replaced
     #                          with a primitive set of that degree accordingly.
     # NOTE: after changing these, regenerate the offline replay dataset.
-    "mseq_seed": 1,
+    "mseq_seed": 46,
     "mseq_taps": (10, 7),
     "mseq_nbits": 10,
-    "mseq_length": 1000,
+    "mseq_length": 1023,
     # Real RF signal power per sample (before fading).
     # Theoretical: Baud / Fs = 25000 / 1e7 = 0.0025.
     # The reactive jammer uses this together with noise_std to derive its
