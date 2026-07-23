@@ -6,6 +6,8 @@ reactive jammer, and an indiscriminate sweep/comb jammer with optional
 pre-computed signal buffers.
 """
 
+import math
+
 import numpy as np
 from scipy.stats import chi2, ncx2
 from scipy.special import roots_laguerre
@@ -272,9 +274,13 @@ class ReactiveJammer:
 
 
 class IndiscriminateJammer:
+    COMB_TIME_QUANTUM = 0.1
+
     def __init__(self, Fs, sweep_config=None, comb_config=None, 
                  noise_source=None, mode='sweep'):
         self.Fs = float(Fs)
+        if mode not in {'sweep', 'comb', 'both'}:
+            raise ValueError("mode must be 'sweep', 'comb', or 'both'.")
         self.mode = mode
         
         # Default Configs
@@ -291,6 +297,12 @@ class IndiscriminateJammer:
         self.c_step = float(self.comb_config.get('step', 100000.0))
         self.c_power = float(self.comb_config.get('power', 0.5))
         self.c_bw = float(self.comb_config.get('bandwidth', 30000.0))
+        self.comb_switch_interval = float(
+            self.comb_config.get('switch_interval', 0.3)
+        )
+        self._validate_comb_switch_interval()
+        self.comb_switch_samples = int(round(self.comb_switch_interval * self.Fs))
+        self.comb_period_samples = 2 * self.comb_switch_samples
 
         # Jammed channel indices for the two alternating comb groups.
         # Configurable via JAMMER_CONFIG["comb"]["channels_phase0/1"];
@@ -301,8 +313,6 @@ class IndiscriminateJammer:
             list(self.comb_config.get('channels_phase1',
                                       [1, 3, 5, 7, 9, 11, 13, 15])),
         )
-        
-        self._sweep_idx = 0
         
         # --- Noise Sources ---
         if noise_source:
@@ -316,194 +326,300 @@ class IndiscriminateJammer:
              else:
                  self.ns_comb = FastNoiseSource(Fs, self.c_bw)
 
-        # State for changing Comb frequencies
-        self.comb_phase = 0  # 0 or 1
-        
         # Pre-computed buffers
         self.pre_buffer_sweep = None
         self.pre_buffer_comb0 = None
         self.pre_buffer_comb1 = None
-        self.pre_len = 0
-        self.pre_ptr = 0 # Not used internally, caller must manage or we use internal ptr?
-                         # Usually caller manages because reset() logic is in Env.
+        self.sweep_period_samples = 0
 
     def set_mode(self, mode):
-        if mode in ['sweep', 'comb', 'both']:
-            self.mode = mode
+        if mode not in {'sweep', 'comb', 'both'}:
+            raise ValueError("mode must be 'sweep', 'comb', or 'both'.")
+        self.mode = mode
 
-    def step_comb(self):
-        """Toggle the comb jamming frequency group."""
-        self.comb_phase = 1 - self.comb_phase
+    def _validate_comb_switch_interval(self):
+        interval = self.comb_switch_interval
+        interval_units = interval / self.COMB_TIME_QUANTUM
+        if (
+            not np.isfinite(interval)
+            or interval <= 0.0
+            or not np.isclose(
+                interval_units,
+                round(interval_units),
+                rtol=0.0,
+                atol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "JAMMER_CONFIG['comb']['switch_interval'] must be a finite "
+                "positive multiple of 0.1 seconds."
+            )
 
-    def reset_comb(self):
-        self.comb_phase = 0
+    def _sweep_layout(self, Startfre, Endfre):
+        if not np.isfinite(self.s_step) or self.s_step <= 0.0:
+            raise ValueError("Sweep step must be finite and positive.")
+        if not np.isfinite(self.s_dwell) or self.s_dwell <= 0.0:
+            raise ValueError("Sweep dwell_time must be finite and positive.")
 
-    def precompute(self, duration=4.4, Startfre=3e6, Endfre=4e6):
-        """
-        Pre-compute sweep and comb jamming signals for a fixed duration.
-        """
-        print(f"Pre-computing Jammers (Duration: {duration}s)...")
-        num_samples = int(duration * self.Fs)
-        self.pre_len = num_samples
-        t = np.arange(num_samples) / self.Fs # Absolute time for continuity?
-        # Actually generate() uses t just for length usually, BUT carrier phase
-        # continuity across calls requires care.
-        # Here we generate one long coherent block.
-        
-        # 1. Sweep Buffer
-        # Temporarily save mode/state
-        old_mode = self.mode
-        old_idx = self._sweep_idx
-        
-        self.mode = 'sweep'
-        self._sweep_idx = 0 # Start from beginning of sweep cycle
-        # Note: generate() expects t relative to 0 for carrier phase if we call it naively.
-        # But we want carrier phase continuous across the whole duration.
-        # My current generate() implementation uses t_seg_local = np.arange(length) inside the loop,
-        # resets phase at every dwell segment? No.
-        # `carrier = np.cos((phase_k * f) * t_seg_local)`
-        # Yes, it resets phase at every segment boundary in `generate`. 
-        # But since we call generate ONCE for the whole duration, it will be consistent within that duration.
-        
-        # However, generate() chunks by dwell time. 
-        # Inside generate loop: `t_seg_local` starts at 0 for each dwell segment.
-        # This implies phase discontinuity at frequency hops. This is physically acceptable for a jammer (oscillator retuning).
-        
-        jam_s, _ = self.generate(t, Startfre, Endfre)
-        self.pre_buffer_sweep = jam_s.astype(np.float32)
-        
-        # 2. Comb Buffer 0
-        self.mode = 'comb'
-        self.comb_phase = 0
-        jam_c0, _ = self.generate(t, Startfre, Endfre)
-        self.pre_buffer_comb0 = jam_c0.astype(np.float32)
-        
-        # 3. Comb Buffer 1
-        self.mode = 'comb'
-        self.comb_phase = 1
-        jam_c1, _ = self.generate(t, Startfre, Endfre)
-        self.pre_buffer_comb1 = jam_c1.astype(np.float32)
-        
-        # Restore state
-        self.mode = old_mode
-        self._sweep_idx = old_idx
+        bw_total = max(float(Endfre) - float(Startfre), 1.0)
+        samples_per_dwell = max(1, int(round(self.s_dwell * self.Fs)))
+        num_steps = max(1, int(np.floor(bw_total / self.s_step)))
+        return bw_total, samples_per_dwell, num_steps
+
+    @property
+    def comb_enabled(self):
+        return self.mode in {'comb', 'both'}
+
+    @property
+    def sweep_enabled(self):
+        return self.mode in {'sweep', 'both'}
+
+    def comb_phase_at(self, sample_idx):
+        sample_idx = int(sample_idx)
+        if sample_idx < 0:
+            raise ValueError("sample_idx must be non-negative.")
+        return (sample_idx // self.comb_switch_samples) % 2
+
+    def reset(self):
+        """Reset the jammer's continuous timeline to its deterministic origin."""
+        # Sweep and comb positions are derived from the environment sample clock.
+        # The method remains explicit so reset semantics stay centralized.
+        return None
+
+    @staticmethod
+    def _periodic_slice(buffer, start_sample_idx, num_samples):
+        if buffer is None or len(buffer) == 0:
+            raise RuntimeError("Requested jammer buffer has not been pre-computed.")
+        if num_samples < 0:
+            raise ValueError("num_samples must be non-negative.")
+
+        result = np.empty(num_samples, dtype=buffer.dtype)
+        source_idx = int(start_sample_idx) % len(buffer)
+        result_idx = 0
+        while result_idx < num_samples:
+            take = min(len(buffer) - source_idx, num_samples - result_idx)
+            result[result_idx:result_idx + take] = buffer[source_idx:source_idx + take]
+            result_idx += take
+            source_idx = 0
+        return result
+
+    def _comb_buffer_slice(self, start_sample_idx, num_samples):
+        result = np.empty(num_samples, dtype=np.float32)
+        global_idx = int(start_sample_idx)
+        result_idx = 0
+
+        while result_idx < num_samples:
+            phase = self.comb_phase_at(global_idx)
+            phase_offset = global_idx % self.comb_switch_samples
+            take = min(
+                self.comb_switch_samples - phase_offset,
+                num_samples - result_idx,
+            )
+            buffer = self.pre_buffer_comb0 if phase == 0 else self.pre_buffer_comb1
+            if buffer is None:
+                raise RuntimeError("Comb jammer buffers have not been pre-computed.")
+            result[result_idx:result_idx + take] = buffer[
+                phase_offset:phase_offset + take
+            ]
+            global_idx += take
+            result_idx += take
+
+        return result
+
+    def precompute(self, Startfre=3e6, Endfre=4e6):
+        """Pre-compute exactly one natural period for each active jammer."""
+        print(f"Pre-computing Jammers (Mode: {self.mode})...")
+        self.pre_buffer_sweep = None
+        self.pre_buffer_comb0 = None
+        self.pre_buffer_comb1 = None
+        self.sweep_period_samples = 0
+
+        if self.sweep_enabled:
+            _, samples_per_dwell, num_steps = self._sweep_layout(Startfre, Endfre)
+            self.sweep_period_samples = samples_per_dwell * num_steps
+            jam_s, _ = self._generate_sweep_signal(
+                self.sweep_period_samples,
+                0,
+                Startfre,
+                Endfre,
+            )
+            self.pre_buffer_sweep = jam_s.astype(np.float32)
+
+        if self.comb_enabled:
+            jam_c0, _ = self._generate_comb_signal(
+                self.comb_switch_samples,
+                0,
+                Startfre,
+                Endfre,
+                fixed_phase=0,
+            )
+            jam_c1, _ = self._generate_comb_signal(
+                self.comb_switch_samples,
+                0,
+                Startfre,
+                Endfre,
+                fixed_phase=1,
+            )
+            self.pre_buffer_comb0 = jam_c0.astype(np.float32)
+            self.pre_buffer_comb1 = jam_c1.astype(np.float32)
+
         print("Jammer Pre-computation complete.")
+
+    def precomputed_period_samples(self):
+        periods = []
+        if self.sweep_enabled:
+            if self.sweep_period_samples <= 0:
+                raise RuntimeError("Sweep jammer has not been pre-computed.")
+            periods.append(self.sweep_period_samples)
+        if self.comb_enabled:
+            periods.append(self.comb_period_samples)
+        if not periods:
+            return 1
+        return math.lcm(*periods)
 
     def get_composite_signal(self, start_sample_idx, num_samples):
         """
-        Retrieve a slice of the pre-computed jamming signal based on current mode and comb phase.
-        Auto-wraps if exceeding buffer duration.
+        Retrieve a continuous-time slice of the active pre-computed jammers.
         """
-        if self.pre_buffer_sweep is None:
-            # Fallback (should not happen if precompute called)
-            return np.zeros(num_samples)
-            
-        # Determine slices (handling wrap-around)
-        idx_start = start_sample_idx % self.pre_len
-        idx_end = idx_start + num_samples
-        
-        # Helper to get slice from a buffer
-        def get_slice(buf):
-            if idx_end <= self.pre_len:
-                return buf[idx_start:idx_end]
-            else:
-                # Wrap around
-                part1 = buf[idx_start:]
-                rem = idx_end - self.pre_len
-                part2 = buf[:rem]
-                return np.concatenate([part1, part2])
-
+        start_sample_idx = int(start_sample_idx)
+        num_samples = int(num_samples)
+        if start_sample_idx < 0:
+            raise ValueError("start_sample_idx must be non-negative.")
+        if num_samples < 0:
+            raise ValueError("num_samples must be non-negative.")
         jam_total = np.zeros(num_samples, dtype=np.float32)
-        
-        if self.mode == 'sweep' or self.mode == 'both':
-            jam_total += get_slice(self.pre_buffer_sweep)
-            
-        if self.mode == 'comb' or self.mode == 'both':
-            if self.comb_phase == 0:
-                jam_total += get_slice(self.pre_buffer_comb0)
-            else:
-                jam_total += get_slice(self.pre_buffer_comb1)
-                
+
+        if self.sweep_enabled:
+            jam_total += self._periodic_slice(
+                self.pre_buffer_sweep,
+                start_sample_idx,
+                num_samples,
+            )
+        if self.comb_enabled:
+            jam_total += self._comb_buffer_slice(start_sample_idx, num_samples)
+
         return jam_total
 
-    def generate(self, t, Startfre, Endfre):
-        N = len(t)
-        if N == 0:
-            return np.zeros_like(t), []
-            
-        jam = np.zeros_like(t)
+    def _comb_frequencies(self, phase, Startfre, Endfre):
+        sub_interval = 50000.0
+        target_indices = np.asarray(self.comb_channels[phase])
+        freqs = Startfre + target_indices * sub_interval + 0.5 * sub_interval
+        return freqs[(freqs >= Startfre) & (freqs < Endfre)]
+
+    def _generate_comb_signal(
+        self,
+        num_samples,
+        start_sample_idx,
+        Startfre,
+        Endfre,
+        fixed_phase=None,
+    ):
+        jam = np.zeros(num_samples, dtype=np.float64)
         freqs_used = []
-        phase_k = 2 * np.pi / self.Fs
-        bw_total = max(Endfre - Startfre, 1.0)
+        if num_samples == 0:
+            return jam, freqs_used
 
-        # -----------------------------
-        # Comb Jamming
-        # -----------------------------
-        if self.mode == 'comb' or self.mode == 'both':
-            # Use Comb Noise Source
-            raw_noise_c = self.ns_comb.get_noise(N)
-            baseband_noise_c = raw_noise_c * self.c_power
-            
-            # --- Comb tones aligned to 50kHz channel centres ---
-            sub_interval = 50000.0
+        baseband_noise = self.ns_comb.get_noise(num_samples) * self.c_power
+        phase_k = 2.0 * np.pi / self.Fs
+        global_idx = int(start_sample_idx)
+        result_idx = 0
 
-            # Two alternating comb groups, configurable via comb_config.
-            target_indices = np.asarray(self.comb_channels[self.comb_phase])
-            
-            # Map to frequencies: Start + k*sub + 0.5*sub
-            freqs = Startfre + target_indices * sub_interval + 0.5 * sub_interval
-            freqs = freqs[(freqs >= Startfre) & (freqs < Endfre)]
-            
+        while result_idx < num_samples:
+            phase_offset = global_idx % self.comb_switch_samples
+            phase = (
+                int(fixed_phase)
+                if fixed_phase is not None
+                else self.comb_phase_at(global_idx)
+            )
+            take = min(
+                self.comb_switch_samples - phase_offset,
+                num_samples - result_idx,
+            )
+            freqs = self._comb_frequencies(phase, Startfre, Endfre)
             if len(freqs) > 0:
-                combined_carrier = np.zeros(N)
-                t_local = np.arange(N)
-                
-                # Normalize power so total power remains roughly consistent or per-tone?
-                # Usually comb power is defined per tone or total? 
-                # Code originally: norm_factor = 1.0 / sqrt(len). 
-                # This keeps TOTAL power = baseband power.
-                norm_factor = 1.0 / np.sqrt(len(freqs))
-                
+                combined_carrier = np.zeros(take, dtype=np.float64)
+                t_local = np.arange(phase_offset, phase_offset + take)
                 for f in freqs:
                     combined_carrier += np.cos((phase_k * f) * t_local)
                     freqs_used.append(f)
-                
-                combined_carrier *= norm_factor
-                jam += baseband_noise_c * combined_carrier
+                combined_carrier *= 1.0 / np.sqrt(len(freqs))
+                jam[result_idx:result_idx + take] = (
+                    baseband_noise[result_idx:result_idx + take] * combined_carrier
+                )
 
-        # -----------------------------
-        # Sweep Jamming
-        # -----------------------------
-        if self.mode == 'sweep' or self.mode == 'both':
-            # Use Sweep Noise Source
-            raw_noise_s = self.ns_sweep.get_noise(N)
-            baseband_noise_s = raw_noise_s * self.s_power
-            
-            # Sweep Params
-            step = self.s_step
-            dwell = self.s_dwell
-            
-            samples_per_dwell = max(1, int(round(dwell * self.Fs)))
-            num_segments = int(np.ceil(len(t) / samples_per_dwell))
-            num_steps = max(1, int(np.floor(bw_total / step)))
-            
-            idx = self._sweep_idx
-            
-            for seg in range(num_segments):
-                f = Startfre + (idx % num_steps) * step + step / 2.0
-                if f >= Endfre:
-                    f = Startfre + np.mod(f - Startfre, bw_total)
-                
-                s = seg * samples_per_dwell
-                e = min(len(t), (seg + 1) * samples_per_dwell)
-                length = e - s
-                
-                t_seg_local = np.arange(length)
-                carrier = np.cos((phase_k * f) * t_seg_local)
-                jam[s:e] += baseband_noise_s[s:e] * carrier
-                
-                freqs_used.append(f)
-                idx += 1
-            self._sweep_idx = idx
+            global_idx += take
+            result_idx += take
+
+        return jam, freqs_used
+
+    def _generate_sweep_signal(
+        self,
+        num_samples,
+        start_sample_idx,
+        Startfre,
+        Endfre,
+    ):
+        jam = np.zeros(num_samples, dtype=np.float64)
+        freqs_used = []
+        if num_samples == 0:
+            return jam, freqs_used
+
+        bw_total, samples_per_dwell, num_steps = self._sweep_layout(
+            Startfre,
+            Endfre,
+        )
+        baseband_noise = self.ns_sweep.get_noise(num_samples) * self.s_power
+        phase_k = 2.0 * np.pi / self.Fs
+        global_idx = int(start_sample_idx)
+        result_idx = 0
+
+        while result_idx < num_samples:
+            dwell_offset = global_idx % samples_per_dwell
+            sweep_idx = (global_idx // samples_per_dwell) % num_steps
+            take = min(
+                samples_per_dwell - dwell_offset,
+                num_samples - result_idx,
+            )
+            f = Startfre + sweep_idx * self.s_step + self.s_step / 2.0
+            if f >= Endfre:
+                f = Startfre + np.mod(f - Startfre, bw_total)
+            t_local = np.arange(dwell_offset, dwell_offset + take)
+            carrier = np.cos((phase_k * f) * t_local)
+            jam[result_idx:result_idx + take] = (
+                baseband_noise[result_idx:result_idx + take] * carrier
+            )
+            freqs_used.append(f)
+            global_idx += take
+            result_idx += take
+
+        return jam, freqs_used
+
+    def generate(self, t, Startfre, Endfre, start_sample_idx=0):
+        N = len(t)
+        if N == 0:
+            return np.zeros_like(t), []
+
+        jam = np.zeros(N, dtype=np.float64)
+        freqs_used = []
+
+        if self.comb_enabled:
+            comb_jam, comb_freqs = self._generate_comb_signal(
+                N,
+                start_sample_idx,
+                Startfre,
+                Endfre,
+            )
+            jam += comb_jam
+            freqs_used.extend(comb_freqs)
+
+        if self.sweep_enabled:
+            sweep_jam, sweep_freqs = self._generate_sweep_signal(
+                N,
+                start_sample_idx,
+                Startfre,
+                Endfre,
+            )
+            jam += sweep_jam
+            freqs_used.extend(sweep_freqs)
 
         return jam, freqs_used

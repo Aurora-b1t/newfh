@@ -40,6 +40,10 @@ buffer capacity. Baseline training warns about environment metadata differences;
 MBPO rejects them by default and requires `--allow_replay_config_mismatch` to
 override that check.
 
+Changes to jammer timing, including the comb `switch_interval`, invalidate existing
+replay data. Regenerate the dataset after such changes instead of overriding the
+metadata mismatch.
+
 Select a dataset for baseline training:
 
 ```bash

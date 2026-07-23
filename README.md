@@ -219,6 +219,8 @@ D:\Anaconda\envs\rl_fhss\python.exe train_speed_sweep.py --hoprate_max 20 --step
 
 offset baseline 在首次梯度更新前加载真实 v3 replay。默认数据包含 50,000 条完整环境 step transition，每条都带 10 个 offset 与 10 个 block reward：
 
+修改 comb `switch_interval`、相位信道组或其他干扰配置后，必须重新生成离线 replay。metadata 会记录新配置；baseline 会提示不匹配，MBPO 默认拒绝加载不匹配的数据。
+
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py
 ```
@@ -329,7 +331,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `enable_reactive`：是否启用反应式干扰机。
 - `enable_sweep`：是否启用扫频/梳状干扰机。
 - `enable_rayleigh`：是否启用 Rayleigh 衰落。
-- `use_pregen`、`pregen_steps`：是否使用预生成加速路径以及预生成 observation 周期长度。
+- `use_pregen`：是否使用预生成加速路径。observation 缓存长度根据活动干扰的联合周期自动取最小值；默认 sweep / comb / both 分别为 4 / 6 / 12 张。
 - `noise_std`、`signal_power`：接收端噪声和反应式干扰检测所需信号功率参数。
 - `mseq_seed`、`mseq_taps`、`mseq_nbits`、`mseq_length`：驱动基础跳频图案的 m 序列（LFSR）参数。换一份 m 序列的方法：
   - 改 `mseq_seed`（初始状态）：同一 m 序列的不同相位（循环移位），最简单；
@@ -342,8 +344,8 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 干扰机配置：
 
 - `mode`：`sweep`、`comb` 或 `both`。
-- `sweep`：扫频干扰的步进、功率、驻留时间、噪声带宽。
-- `comb`：梳状干扰的功率、单 tone 带宽，以及两组交替的干扰信道序号 `channels_phase0` / `channels_phase1`（默认为偶数/奇数各 8 个 50 kHz 对齐信道）。序号必须是 `[0, num_channels-1]` 范围内的整数，否则环境启动时直接报 `ValueError`；两组长度可以不同、允许重叠。修改后同样需重新生成离线 replay 数据。
+- `sweep`：扫频干扰的步进、功率、驻留时间、噪声带宽。预生成路径只缓存一轮自然扫频周期；默认 20 个频点 × 4 ms，即 80 ms。
+- `comb`：梳状干扰的功率、单 tone 带宽、相位切换周期 `switch_interval`，以及两组交替的干扰信道序号 `channels_phase0` / `channels_phase1`（默认为偶数/奇数各 8 个 50 kHz 对齐信道）。`switch_interval` 使用秒，必须是有限正数且为 100 ms 的整数倍；默认 0.3 秒。信道序号必须是 `[0, num_channels-1]` 范围内的整数，否则环境启动时直接报 `ValueError`；两组长度可以不同、允许重叠。修改后同样需重新生成离线 replay 数据。
 - `reactive`：反应式干扰机的功率、带宽、虚警概率、检测时长等。检测逻辑基于能量检测理论，按 1 ms slot 扫描/检测/压制。
 
 ### `SAC_CONFIG`
@@ -402,7 +404,7 @@ reward = base_reward - ber_penalty * BER - hoprate_penalty * hoprate
 2. 训练脚本固定 hoprate。
 3. SAC actor 输入当前 observation 与 hoprate，一次前向输出 `[10, num_channels]` raw logits，并从十个条件独立的 categorical head 采样 offset。
 4. 环境一次性执行这 10 个 offset，对应 10 个 100 ms block。
-5. 环境返回下一个 observation、`info["ber_blocks"]`、`info["block_rewards"]` 及其均值 reward。
+5. 环境返回下一个 observation、`info["ber_blocks"]`、`info["block_rewards"]`、每个 block 的 `info["comb_phases"]` 及其均值 reward。
 6. 训练脚本将整组 `actions[10]` 与 `block_rewards[10]` 写为一条 replay transition。
 
 critic 同样输出十个离散 Q 头。每个头使用对应的即时 block reward；下一状态 continuation 先对每个头做离散 SAC 期望，再对十头求均值并广播，从而学习平均 block return，而不再构造虚假的 block 间状态转移。
@@ -426,8 +428,10 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 
 - [fh_env.py](fh_env.py) 中 `PreGeneratedData.common_bits` 生成并复用一份 bits，用于速度和内存优化。
 - `reset_mseq_each_step=True` 的固定模板训练行为保留。
-- `use_pregen=True` 默认使用预生成池和预生成 observation 加速训练。
-- comb 干扰使用两组固定 8 信道频点交替：phase 0 使用偶数信道组，phase 1 使用奇数信道组。
+- `use_pregen=True` 默认使用预生成池和自动最小周期的 observation 缓存加速训练。
+- sweep 缓存一轮自然扫频波形；comb 分别缓存 phase 0/1 的一个驻留周期。数值波形会随各自自然周期精确重复。
+- comb 干扰使用两组固定 8 信道频点交替：phase 0 使用偶数信道组，phase 1 使用奇数信道组。连续 RF 时钟包含 observation 和发送 block；默认 300 ms 下首个 step 的十个 block 相位为 `[0,0,1,1,1,0,0,0,1,1]`。
+- `env.reset()` 将连续 RF 时钟、comb phase 和 sweep 位置全部重置到起点；预生成和动态路径共享同一时序。
 
 如需做更严谨的通信环境对照实验，建议后续单独比较：`use_pregen=True/False`、固定/连续 m-sequence、不同 bits 随机化策略、不同 reward 权重、是否启用 Rayleigh/反应式/扫频干扰组合等。
 

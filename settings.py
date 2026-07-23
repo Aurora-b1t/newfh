@@ -62,7 +62,6 @@ ENV_CONFIG = {
     "debug_plot_psd": False,
     "debug_log_hops": False,
     "use_pregen": True,
-    "pregen_steps": 44,         # Align with 4.4s cycle (0.1s step)
     "noise_std": 0.1,           # Thermal noise std at receiver (also used by reactive jammer)
     # M-sequence (LFSR) driving the base hopping pattern.
     # To switch to a different m-sequence:
@@ -101,6 +100,7 @@ JAMMER_CONFIG = {
     "comb": {
         "power": 0.8,        # Total power or per-tone power factor
         "bandwidth": 50000.0,# Noise bandwidth per tone
+        "switch_interval": 0.3, # Seconds; positive multiple of 100 ms
         # Jammed channel indices for the two alternating comb groups.
         # Each index k maps to the centre of 50kHz channel k
         # (Startfre + k*50kHz + 25kHz); indices must be integers in

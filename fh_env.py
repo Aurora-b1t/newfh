@@ -8,6 +8,7 @@ indiscriminate sweep/comb jammers. The environment exposes a 10-offset
 sequential decision interface for RL agents.
 """
 
+import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -199,10 +200,9 @@ def generate_mseq_states(n_bits=10, length=1000, taps=(10, 7), seed=1):
 # 预生成数据管理器
 # -----------------------------
 class PreGeneratedData:
-    def __init__(self, env, num_steps=44, dtype=np.float32):
+    def __init__(self, env, dtype=np.float32):
         print(f"Initializing PreGeneratedData (Channels Pool Mode)...")
         self.env = env
-        self.num_steps = num_steps
         self.dtype = dtype
         
         # Calculate samples per block
@@ -215,6 +215,17 @@ class PreGeneratedData:
         bits_dummy = env.modem.generate_bits(2 * self.num_syms_block)
         I_dummy, _ = env.modem.pulse_shape(bits_dummy)
         self.block_len = len(I_dummy)
+
+        N_obs = int(0.1 * env.Fs)
+        observation_stride = env.num_blocks * self.block_len + N_obs
+        if env.enable_sweep and env.sweep is not None:
+            jammer_period = env.sweep.precomputed_period_samples()
+            self.num_steps = jammer_period // math.gcd(
+                jammer_period,
+                observation_stride,
+            )
+        else:
+            self.num_steps = 1
         
         # Pool Configuration
         self.num_channels = env.num_channels
@@ -244,7 +255,10 @@ class PreGeneratedData:
         dummy_wf = compute_psd_waterfall(dummy_obs_sig, env.Fs, env.Startfre, env.Endfre, 
                                          dt=env.dt, df=env.df, max_duration=0.1)
         self.obs_shape = dummy_wf.shape
-        self.obs_buffer = np.zeros((num_steps, *self.obs_shape), dtype=np.float32)
+        self.obs_buffer = np.zeros(
+            (self.num_steps, *self.obs_shape),
+            dtype=np.float32,
+        )
 
         self._generate_content()
         print("Pre-generation complete.")
@@ -277,75 +291,29 @@ class PreGeneratedData:
         # Part B: Observation Buffer (Legacy support for Jammers)
         # ---------------------------
         t_obs_template = np.arange(int(0.1 * self.env.Fs)) / self.env.Fs
-        if self.env.enable_sweep and self.env.sweep is not None:
-             self.env.sweep.reset_comb()
-
         # Temporary pointer for generating consistent observations from buffers
         obs_jammer_ptr = 0 
         N_obs = len(t_obs_template)
-        # Duration of transmission phase (10 blocks)
-        # Assuming block_len covers the transmission time roughly?
-        # Actually in step(), it runs 10 times.
-        # hops_per_block * 10 is roughly 1s if hoprate=100.
-        # But we should use exact sample count logic.
-        # In step(), loop 10 times:
-        #   RX len is self.block_len (from pool).
-        # So transmission consumes 10 * self.block_len samples.
-        N_tx_total = 10 * self.block_len
+        N_tx_total = self.env.num_blocks * self.block_len
 
-        # Generate s=0 (Reset state)
-        if self.num_steps > 0:
-            # At Reset: No Toggle yet (reset_comb called above).
-            
-            # Generate Jammer for observation
+        for s in range(self.num_steps):
+            if s > 0:
+                obs_jammer_ptr += N_tx_total
+
             jam_obs = np.zeros_like(t_obs_template)
             if self.env.enable_sweep and self.env.sweep is not None:
-                if self.env.sweep.pre_buffer_sweep is not None:
-                    jam_obs = self.env.sweep.get_composite_signal(obs_jammer_ptr, N_obs)
-                else:
-                    jam_obs, _ = self.env.sweep.generate(t_obs_template, self.env.Startfre, self.env.Endfre)
-            
-            # Advance ptr by observation length
-            obs_jammer_ptr += N_obs
+                jam_obs = self.env.sweep.get_composite_signal(
+                    obs_jammer_ptr,
+                    N_obs,
+                )
 
+            obs_jammer_ptr += N_obs
             noise_obs = noise_std * np.random.randn(len(t_obs_template))
             sig_obs = jam_obs + noise_obs
 
-            wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre,
-                                         dt=self.env.dt, df=self.env.df, max_duration=0.1, plot=False)
-            self.obs_buffer[0] = wf.astype(np.float32)
-
-        # Loop for remaining steps (s=1 to num_steps-1)
-        for s in range(1, self.num_steps):
-            # 1. Simulate Transmission Phase Gap
-            # Advance pointer past the transmission duration
-            obs_jammer_ptr += N_tx_total
-
-            # Toggle Comb for NEXT observation
-            if self.env.enable_sweep and self.env.sweep is not None:
-                self.env.sweep.step_comb()
-
-            # 2. Generate Observation for next step
-            jam_obs = np.zeros_like(t_obs_template)
-            if self.env.enable_sweep and self.env.sweep is not None:
-                if self.env.sweep.pre_buffer_sweep is not None:
-                    jam_obs = self.env.sweep.get_composite_signal(obs_jammer_ptr, N_obs)
-                else:
-                    jam_obs, _ = self.env.sweep.generate(t_obs_template, self.env.Startfre, self.env.Endfre)
-
-            # Advance ptr by observation length
-            obs_jammer_ptr += N_obs
-
-            noise_obs = noise_std * np.random.randn(len(t_obs_template))
-            sig_obs = jam_obs + noise_obs
-            
             wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre, 
                                          dt=self.env.dt, df=self.env.df, max_duration=0.1, plot=False)
             self.obs_buffer[s] = wf.astype(np.float32)
-            
-        # Restore environment state
-        if self.env.enable_sweep and self.env.sweep is not None:
-             self.env.sweep.reset_comb()
 
 
     def get_block(self, hop_seq):
@@ -582,7 +550,6 @@ class FHSSQPSKEnv(gym.Env):
                  debug_log_hops=False,
                  reset_mseq_each_step=True,
                  use_pregen=True,
-                 pregen_steps=44,
                  noise_std=0.1,
                  signal_power=0.0025):
         super().__init__()
@@ -661,19 +628,14 @@ class FHSSQPSKEnv(gym.Env):
 
         # Init Pre-generator
         self.use_pregen = bool(use_pregen)
-        # 1. First, precompute Jammers if needed (to ensure consistency and speed)
         if self.use_pregen and self.enable_sweep and self.sweep is not None:
-             # Calculate required steps to cover the full cycle if pregen_steps is not explicitly matched?
-             # User specified 4.4s.
-             self.sweep.precompute(duration=4.4, Startfre=self.Startfre, Endfre=self.Endfre)
+             self.sweep.precompute(Startfre=self.Startfre, Endfre=self.Endfre)
 
-        # 2. Then, Initialize PreGeneratedData (which uses the Jammers)
         self.pregen_data = None
         if self.use_pregen:
-            # Recommend matching pregen_steps to the jammer cycle (44 steps for 4.4s at dt=0.1)
-            self.pregen_data = PreGeneratedData(self, num_steps=pregen_steps)
+            self.pregen_data = PreGeneratedData(self)
         
-        self.jammer_ptr = 0 # Global pointer for pre-computed jammer signals
+        self.jammer_ptr = 0  # Continuous RF sample clock for indiscriminate jammers
 
 
         self.action_space = spaces.Dict({
@@ -785,8 +747,6 @@ class FHSSQPSKEnv(gym.Env):
         if self.use_pregen and self.pregen_data is not None:
              obs = self.pregen_data.get_observation(self.current_step)
              
-             # Update jammer_ptr to simulate time passage (0.1s)
-             # This ensures synchronization with the 1s transmission phase
              if self.enable_sweep and self.sweep is not None:
                  N_obs = int(0.1 * self.Fs)
                  self.jammer_ptr += N_obs
@@ -815,16 +775,14 @@ class FHSSQPSKEnv(gym.Env):
         
         sweep_jam = np.zeros(N_obs)
         if self.enable_sweep and self.sweep is not None:
-            if self.use_pregen and self.sweep.pre_buffer_sweep is not None:
-                # Optimized Path
-                sweep_jam = self.sweep.get_composite_signal(self.jammer_ptr, N_obs)
-                # Only advance if we are actually consuming time steps that matter
-                # _observe_100ms is called at reset (time=0) and end of step.
-                self.jammer_ptr += N_obs
-            else:
-                # Dynamic Path
-                t_obs = np.arange(N_obs) / self.Fs
-                sweep_jam, _ = self.sweep.generate(t_obs, self.Startfre, self.Endfre)
+            t_obs = np.arange(N_obs) / self.Fs
+            sweep_jam, _ = self.sweep.generate(
+                t_obs,
+                self.Startfre,
+                self.Endfre,
+                start_sample_idx=self.jammer_ptr,
+            )
+            self.jammer_ptr += N_obs
 
         noise = self.noise_std * np.random.randn(N_obs)
         obs_signal = sweep_jam + noise
@@ -868,9 +826,8 @@ class FHSSQPSKEnv(gym.Env):
         self.jammer_ptr = 0 # Reset jammer pointer
         _ = self._apply_hoprate(self.base_hoprate)
         
-        # Reset Comb State
         if self.enable_sweep and self.sweep is not None:
-             self.sweep.reset_comb()
+             self.sweep.reset()
 
         # Reset Reactive Jammer state machine
         if self.enable_reactive and self.reactive is not None:
@@ -884,6 +841,7 @@ class FHSSQPSKEnv(gym.Env):
         self.last_info = {
             "ber_blocks": [],
             "hoprate_used": self.current_hoprate,
+            "comb_phases": [],
         }
         return self.state, self.last_info
 
@@ -928,19 +886,23 @@ class FHSSQPSKEnv(gym.Env):
         hops_per_block = int(round(self.current_hoprate * 0.1))
         hops_per_block = max(1, hops_per_block)
 
-        # Toggle Comb Jamming was here, now moved to AFTER transmission to match PreGen logic.
-        # Ideally: Reset->Obs(P0)->Transmit(P0)->StepEnds->Toggle(P1)->Obs(P1)
-        # So transmission uses current state, and observation captures NEXT state.
-
         ber_blocks = []
         reactive_active_blocks = []
         hop_sequences = []
+        comb_phases = []
         capture_figures = (
             (self.current_step + 1) in self._fig_save_steps
             and self._fig_save_dir is not None
         )
 
         for b in range(self.num_blocks):
+            if (
+                self.enable_sweep
+                and self.sweep is not None
+                and self.sweep.comb_enabled
+            ):
+                comb_phases.append(self.sweep.comb_phase_at(self.jammer_ptr))
+
             # ----------------------------------------------------------------
             # 2. Hopping Sequence (Dynamic)
             # ----------------------------------------------------------------
@@ -979,14 +941,11 @@ class FHSSQPSKEnv(gym.Env):
                 # User asked to save "Carrier time".
                 sweep_jam = np.zeros(len(rx_static))
                 if self.enable_sweep and self.sweep is not None:
-                     if self.sweep.pre_buffer_sweep is not None:
-                         # Use pre-computed
-                         # Note: get_composite_signal uses self.comb_phase internally
-                         sweep_jam = self.sweep.get_composite_signal(self.jammer_ptr, len(rx_static))
-                         self.jammer_ptr += len(rx_static)
-                     else:
-                         # Dynamic
-                         sweep_jam, _ = self.sweep.generate(t_block, self.Startfre, self.Endfre)
+                     sweep_jam = self.sweep.get_composite_signal(
+                         self.jammer_ptr,
+                         len(rx_static),
+                     )
+                     self.jammer_ptr += len(rx_static)
                      
                 rx_real = rx_static + sweep_jam
                 
@@ -1010,7 +969,13 @@ class FHSSQPSKEnv(gym.Env):
                     
                 sweep_jam = np.zeros(len(I_pulse))
                 if self.enable_sweep and self.sweep is not None:
-                    sweep_jam, _ = self.sweep.generate(t_block, self.Startfre, self.Endfre)
+                    sweep_jam, _ = self.sweep.generate(
+                        t_block,
+                        self.Startfre,
+                        self.Endfre,
+                        start_sample_idx=self.jammer_ptr,
+                    )
+                    self.jammer_ptr += len(I_pulse)
                 
                 rx_real = np.real(rf_complex * rayleigh_mag) + sweep_jam + noise
 
@@ -1073,10 +1038,6 @@ class FHSSQPSKEnv(gym.Env):
         
         self.current_step += 1
         
-        # Toggle Comb Jamming BEFORE Observe (for the next step)
-        if self.enable_sweep and self.sweep is not None:
-             self.sweep.step_comb()
-
         obs = self._observe_100ms(block_id=0)
         self.state = obs.astype(np.float32)
 
@@ -1099,6 +1060,7 @@ class FHSSQPSKEnv(gym.Env):
             "hops_per_block": hops_per_block,
             "reactive_active_blocks": reactive_active_blocks,
             "hop_sequences": hop_sequences,
+            "comb_phases": comb_phases,
         }
 
         terminated = False
@@ -1126,8 +1088,7 @@ if __name__ == "__main__":
                       enable_rayleigh=True,
                       debug_plot_psd=False,
                       debug_log_hops=False,
-                      use_pregen=True,
-                      pregen_steps=44) # Match the 4.4s cycle (44 * 0.1s)
+                      use_pregen=True)
     pr_end = time.time()
     print(f"Environment Initialization Time: {pr_end - pr_start:.4f} s")
     obs, info = env.reset()
