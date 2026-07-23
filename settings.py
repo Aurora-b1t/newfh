@@ -136,16 +136,17 @@ SAC_CONFIG = {
 
 # Replay Buffer Configuration
 BUFFER_CONFIG = {
-    "capacity": 50000,
+    "capacity": 5000,
     "batch_size": 256,
 }
 
 # Offline real-environment replay configuration. Each transition represents one
 # complete environment step with ten offset actions and ten block rewards.
 OFFLINE_REPLAY_CONFIG = {
-    "num_step_transitions": 50000,
-    "default_path": "outputs/offline_replay/replay_50000_random_hoprate_v3.npz",
-    "hoprate_mode": "random",
+    "num_step_transitions": 5000,
+    "default_path": "outputs/offline_replay/replay_5000_100_hoprate_v3.npz",
+    "hoprate_mode": "fixed",
+    "fixed_hoprate": 100.0,
 }
 
 # MBPO Reward-Model Configuration
@@ -161,10 +162,10 @@ MBPO_CONFIG = {
     "early_stop_patience": 5,
     "max_epochs": 100,
     "min_improvement": 0.01,
-    "rollout_batch_size": 2000,
+    "rollout_batch_size": 500,
     "rollout_length": 1,
     "real_ratio": 0.2,
-    "model_replay_size": 30000,
+    "model_replay_size": 4000,
 }
 
 # Noisy Binary Search Configuration
@@ -198,7 +199,7 @@ PLOT_CONFIG = {
 # Reward Calculation Configuration
 # Matches FHSSQPSKEnv.step(): base_reward - BER * ber_penalty - hoprate * hoprate_penalty
 REWARD_CONFIG = {
-    "base_reward": 1.0,
-    "ber_penalty": 8.0,
+    "base_reward": 10.0,
+    "ber_penalty": 80.0,
     "hoprate_penalty": 0,
 }
