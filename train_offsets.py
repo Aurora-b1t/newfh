@@ -42,6 +42,25 @@ def setup_logger(log_file):
 
     return logger, hop_logger
 
+
+def log_active_comb_channels(env, logger=None):
+    """Log the two configured comb channel groups once when comb is active."""
+    if not (
+        env.enable_sweep
+        and env.sweep is not None
+        and env.sweep.comb_enabled
+    ):
+        return False
+
+    logger = logger or logging.getLogger()
+    channels_phase0, channels_phase1 = env.sweep.comb_channels
+    logger.info(
+        "Comb channels_phase0=%s | channels_phase1=%s",
+        channels_phase0,
+        channels_phase1,
+    )
+    return True
+
 def build_agent_and_env(args):
     # -------------------------------------------------------------------------
     # 1. Device Configuration (GPU/CPU)
@@ -58,6 +77,7 @@ def build_agent_and_env(args):
     # -------------------------------------------------------------------------
     # Pass configuration from settings
     env = FHSSQPSKEnv(**settings.ENV_CONFIG)
+    log_active_comb_channels(env)
 
     # Number of discrete actions matches number of channels
     n_actions = env.num_channels

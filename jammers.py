@@ -12,6 +12,113 @@ import numpy as np
 from scipy.stats import chi2, ncx2
 from scipy.special import roots_laguerre
 
+
+def _generate_band_limited_noise(Fs, bandwidth, length):
+    """Generate one normalized band-limited Gaussian sequence."""
+    length = int(length)
+    if length <= 0:
+        raise ValueError("Band-limited noise length must be positive.")
+
+    n = np.random.randn(length).astype(np.float32)
+    spec = np.fft.rfft(n)
+    if bandwidth > 0:
+        cutoff_idx = int(np.floor(float(bandwidth) * length / (2.0 * float(Fs))))
+        if cutoff_idx + 1 < len(spec):
+            spec[cutoff_idx + 1:] = 0
+
+    n_lp = np.fft.irfft(spec, n=length)
+    std_val = np.std(n_lp)
+    if std_val > 1e-12:
+        n_lp /= std_val
+    return n_lp
+
+
+def validate_baseband_variant_count(value):
+    """Return a validated positive integer jammer baseband variant count."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError("JAMMER_CONFIG['baseband_variant_count'] must be a positive integer.")
+    value = int(value)
+    if value <= 0:
+        raise ValueError("JAMMER_CONFIG['baseband_variant_count'] must be a positive integer.")
+    return value
+
+
+class BandLimitedNoiseVariantPool:
+    """Independent normalized baseband-noise variants for one bandwidth."""
+
+    def __init__(self, Fs, bandwidth, num_variants, length):
+        self.Fs = float(Fs)
+        self.bandwidth = float(bandwidth)
+        self.num_variants = validate_baseband_variant_count(num_variants)
+        self.length = int(length)
+        if self.length <= 0:
+            raise ValueError("Band-limited noise variant length must be positive.")
+
+        self.variants = np.empty(
+            (self.num_variants, self.length),
+            dtype=np.float32,
+        )
+        for variant_idx in range(self.num_variants):
+            self.variants[variant_idx] = _generate_band_limited_noise(
+                self.Fs,
+                self.bandwidth,
+                self.length,
+            )
+
+    def get_variant(self, variant_idx, num_samples=None, start_sample_idx=0):
+        """Return a periodic slice from one stored variant."""
+        variant_idx = int(variant_idx)
+        if variant_idx < 0 or variant_idx >= self.num_variants:
+            raise IndexError("variant_idx is outside the configured baseband pool.")
+
+        if num_samples is None:
+            num_samples = self.length
+        num_samples = int(num_samples)
+        start_sample_idx = int(start_sample_idx)
+        if num_samples < 0 or start_sample_idx < 0:
+            raise ValueError("Noise slice indices must be non-negative.")
+        if num_samples == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        source = self.variants[variant_idx]
+        result = np.empty(num_samples, dtype=np.float32)
+        source_idx = start_sample_idx % self.length
+        result_idx = 0
+        while result_idx < num_samples:
+            take = min(self.length - source_idx, num_samples - result_idx)
+            result[result_idx:result_idx + take] = source[source_idx:source_idx + take]
+            result_idx += take
+            source_idx = 0
+        return result
+
+
+class JammerVariantSelector:
+    """One reproducible random-with-replacement selector shared by jammers."""
+
+    def __init__(self, num_variants, seed=None):
+        self.num_variants = validate_baseband_variant_count(num_variants)
+        if seed is None:
+            seed = int(np.random.randint(0, np.iinfo(np.int32).max))
+        self.seed = int(seed)
+        self._rng = np.random.RandomState(self.seed)
+        self._cycle_choices = {}
+
+    def reset(self):
+        self._rng = np.random.RandomState(self.seed)
+        self._cycle_choices.clear()
+
+    def draw(self):
+        return int(self._rng.randint(0, self.num_variants))
+
+    def choice_for_cycle(self, jammer_kind, cycle_idx):
+        cycle_idx = int(cycle_idx)
+        if cycle_idx < 0:
+            raise ValueError("cycle_idx must be non-negative.")
+        key = (str(jammer_kind), cycle_idx)
+        if key not in self._cycle_choices:
+            self._cycle_choices[key] = self.draw()
+        return self._cycle_choices[key]
+
 # -----------------------------
 # 快速噪声源
 # -----------------------------
@@ -21,23 +128,7 @@ class FastNoiseSource:
     """
     def __init__(self, Fs, bandwidth, duration=1.0):
         self.length = int(Fs * duration)
-        # 1. Generate Gaussian noise
-        n = np.random.randn(self.length).astype(np.float32)
-        # 2. FFT
-        spec = np.fft.rfft(n)
-        # 3. Low-pass
-        if bandwidth > 0:
-            cutoff_idx = int(np.floor(bandwidth * self.length / (2.0 * Fs)))
-            if cutoff_idx + 1 < len(spec):
-                spec[cutoff_idx + 1:] = 0
-                
-        # 4. IFFT
-        n_lp = np.fft.irfft(spec, n=self.length)
-        # 5. Normalize
-        std_val = np.std(n_lp)
-        if std_val > 1e-12:
-            n_lp /= std_val
-        self.noise = n_lp
+        self.noise = _generate_band_limited_noise(Fs, bandwidth, self.length)
 
     def get_noise(self, num_samples):
         if num_samples >= self.length:
@@ -73,14 +164,15 @@ class ReactiveJammer:
 
     Channel scan order: 0 → 1 → … → (num_channels-1) → 0 → …  (cyclic).
 
-    Jamming signals are pre-generated once per channel (20 possibilities).
+    Jamming signals are pre-generated once per channel and baseband variant.
     """
 
     def __init__(self, Fs, num_channels=20, sub_interval=50000.0,
                  detection_time=0.001, p_fa=0.1,
                  power=0.8, bandwidth=50000.0, Startfre=3e6,
                  noise_source=None, speed=None,
-                 noise_std=0.1, signal_power=None, Baud=25000):
+                 noise_std=0.1, signal_power=None, Baud=25000,
+                 variant_pool=None, variant_selector=None):
         # ---- basic parameters ----
         self.Fs = float(Fs)
         self.num_channels = int(num_channels)
@@ -124,7 +216,13 @@ class ReactiveJammer:
         self.P_D = self._fading_averaged_P_D(n_laguerre=50)
 
         # ---- noise source & pre-generated jamming signals ----
-        if noise_source is None:
+        self.variant_pool = variant_pool
+        self.variant_selector = variant_selector
+        if self.variant_pool is not None:
+            if not np.isclose(self.variant_pool.bandwidth, self.bandwidth):
+                raise ValueError("Reactive jammer variant-pool bandwidth does not match.")
+            self.noise_source = None
+        elif noise_source is None:
             self.noise_source = FastNoiseSource(Fs, bandwidth)
         else:
             self.noise_source = noise_source
@@ -160,19 +258,40 @@ class ReactiveJammer:
     # ------------------------------------------------------------------
     def _pregenerate_jam_signals(self):
         """
-        Pre-generate one 1-ms jamming segment per channel.
+        Pre-generate one jamming segment per channel and baseband variant.
 
-        Jamming signal = band-limited noise × cos(2π·f_c·t).
-        Stored as float32 arrays keyed by channel index.
+        Jamming signal = band-limited noise × cos(2π·f_c·t). Each cache entry
+        has shape ``[num_variants, samples_per_slot]``.
         """
         self._jam_cache = {}
         t_1ms = np.arange(self.samples_per_ms, dtype=np.float64) / self.Fs
-        noise_1ms = self.noise_source.get_noise(self.samples_per_ms) * self.power
+        num_variants = (
+            self.variant_pool.num_variants
+            if self.variant_pool is not None
+            else 1
+        )
+        baseband_variants = np.empty(
+            (num_variants, self.samples_per_ms),
+            dtype=np.float32,
+        )
+        for variant_idx in range(num_variants):
+            if self.variant_pool is not None:
+                noise_1ms = self.variant_pool.get_variant(
+                    variant_idx,
+                    self.samples_per_ms,
+                )
+            else:
+                noise_1ms = self.noise_source.get_noise(self.samples_per_ms)
+            baseband_variants[variant_idx] = (
+                np.asarray(noise_1ms, dtype=np.float32) * self.power
+            )
 
         for k in range(self.num_channels):
             f_c = self.Startfre + k * self.sub_interval + 0.5 * self.sub_interval
             carrier = np.cos(2.0 * np.pi * f_c * t_1ms)
-            self._jam_cache[k] = (noise_1ms * carrier).astype(np.float32)
+            self._jam_cache[k] = (
+                baseband_variants * carrier[np.newaxis, :]
+            ).astype(np.float32)
 
     # ------------------------------------------------------------------
     def reset(self):
@@ -259,7 +378,12 @@ class ReactiveJammer:
             elif self.state == 'jam':
                 # output pre-generated jamming signal for current channel
                 ch = self.current_channel % self.num_channels
-                cached = self._jam_cache[ch]
+                num_variants = self._jam_cache[ch].shape[0]
+                if self.variant_selector is not None and num_variants > 1:
+                    variant_idx = self.variant_selector.draw()
+                else:
+                    variant_idx = 0
+                cached = self._jam_cache[ch][variant_idx]
                 if seg_len >= len(cached):
                     jam[pos:pos + len(cached)] = cached
                 else:
@@ -277,7 +401,9 @@ class IndiscriminateJammer:
     COMB_TIME_QUANTUM = 0.1
 
     def __init__(self, Fs, sweep_config=None, comb_config=None, 
-                 noise_source=None, mode='sweep'):
+                 noise_source=None, mode='sweep',
+                 sweep_variant_pool=None, comb_variant_pool=None,
+                 variant_selector=None, defer_dynamic_noise=False):
         self.Fs = float(Fs)
         if mode not in {'sweep', 'comb', 'both'}:
             raise ValueError("mode must be 'sweep', 'comb', or 'both'.")
@@ -314,10 +440,17 @@ class IndiscriminateJammer:
                                       [1, 3, 5, 7, 9, 11, 13, 15])),
         )
         
-        # --- Noise Sources ---
+        self.sweep_variant_pool = sweep_variant_pool
+        self.comb_variant_pool = comb_variant_pool
+        self.variant_selector = variant_selector
+
+        # --- Dynamic Noise Sources ---
         if noise_source:
              self.ns_sweep = noise_source
              self.ns_comb = noise_source
+        elif defer_dynamic_noise:
+             self.ns_sweep = None
+             self.ns_comb = None
         else:
              self.ns_sweep = FastNoiseSource(Fs, self.s_bw)
              # Reuse if bandwidth same
@@ -332,10 +465,63 @@ class IndiscriminateJammer:
         self.pre_buffer_comb1 = None
         self.sweep_period_samples = 0
 
+        self._validate_variant_pools()
+
     def set_mode(self, mode):
         if mode not in {'sweep', 'comb', 'both'}:
             raise ValueError("mode must be 'sweep', 'comb', or 'both'.")
         self.mode = mode
+
+    def _validate_variant_pools(self):
+        if (
+            self.sweep_variant_pool is not None
+            and not np.isclose(self.sweep_variant_pool.bandwidth, self.s_bw)
+        ):
+            raise ValueError("Sweep jammer variant-pool bandwidth does not match.")
+        if (
+            self.comb_variant_pool is not None
+            and not np.isclose(self.comb_variant_pool.bandwidth, self.c_bw)
+        ):
+            raise ValueError("Comb jammer variant-pool bandwidth does not match.")
+
+        counts = {
+            pool.num_variants
+            for pool in (self.sweep_variant_pool, self.comb_variant_pool)
+            if pool is not None
+        }
+        if len(counts) > 1:
+            raise ValueError("Sweep and comb variant pools must use the same count.")
+        if counts and self.variant_selector is not None:
+            count = next(iter(counts))
+            if self.variant_selector.num_variants != count:
+                raise ValueError("Jammer selector and baseband pool counts do not match.")
+
+    def set_variant_sources(
+        self,
+        sweep_variant_pool=None,
+        comb_variant_pool=None,
+        variant_selector=None,
+    ):
+        self.sweep_variant_pool = sweep_variant_pool
+        self.comb_variant_pool = comb_variant_pool
+        self.variant_selector = variant_selector
+        self._validate_variant_pools()
+
+    def _dynamic_noise_source(self, jammer_kind):
+        if jammer_kind == "sweep":
+            if self.ns_sweep is None:
+                self.ns_sweep = FastNoiseSource(self.Fs, self.s_bw)
+                if self.c_bw == self.s_bw and self.ns_comb is None:
+                    self.ns_comb = self.ns_sweep
+            return self.ns_sweep
+        if jammer_kind == "comb":
+            if self.ns_comb is None:
+                if self.c_bw == self.s_bw and self.ns_sweep is not None:
+                    self.ns_comb = self.ns_sweep
+                else:
+                    self.ns_comb = FastNoiseSource(self.Fs, self.c_bw)
+            return self.ns_comb
+        raise ValueError(f"Unsupported jammer kind: {jammer_kind}")
 
     def _validate_comb_switch_interval(self):
         interval = self.comb_switch_interval
@@ -387,39 +573,72 @@ class IndiscriminateJammer:
         return None
 
     @staticmethod
-    def _periodic_slice(buffer, start_sample_idx, num_samples):
-        if buffer is None or len(buffer) == 0:
+    def _as_variant_buffer(buffer):
+        if buffer is None or np.size(buffer) == 0:
             raise RuntimeError("Requested jammer buffer has not been pre-computed.")
-        if num_samples < 0:
-            raise ValueError("num_samples must be non-negative.")
+        buffer = np.asarray(buffer)
+        if buffer.ndim == 1:
+            return buffer[np.newaxis, :]
+        if buffer.ndim != 2:
+            raise ValueError("Pre-computed jammer buffers must be one- or two-dimensional.")
+        return buffer
 
-        result = np.empty(num_samples, dtype=buffer.dtype)
-        source_idx = int(start_sample_idx) % len(buffer)
-        result_idx = 0
-        while result_idx < num_samples:
-            take = min(len(buffer) - source_idx, num_samples - result_idx)
-            result[result_idx:result_idx + take] = buffer[source_idx:source_idx + take]
-            result_idx += take
-            source_idx = 0
-        return result
+    def _variant_for_cycle(self, jammer_kind, cycle_idx, num_variants):
+        if num_variants <= 1 or self.variant_selector is None:
+            return 0
+        return self.variant_selector.choice_for_cycle(jammer_kind, cycle_idx)
 
-    def _comb_buffer_slice(self, start_sample_idx, num_samples):
+    def _sweep_buffer_slice(self, start_sample_idx, num_samples):
+        buffers = self._as_variant_buffer(self.pre_buffer_sweep)
+        period_samples = buffers.shape[1]
         result = np.empty(num_samples, dtype=np.float32)
         global_idx = int(start_sample_idx)
         result_idx = 0
 
         while result_idx < num_samples:
-            phase = self.comb_phase_at(global_idx)
-            phase_offset = global_idx % self.comb_switch_samples
+            cycle_idx = global_idx // period_samples
+            cycle_offset = global_idx % period_samples
+            variant_idx = self._variant_for_cycle(
+                "sweep",
+                cycle_idx,
+                buffers.shape[0],
+            )
+            take = min(period_samples - cycle_offset, num_samples - result_idx)
+            result[result_idx:result_idx + take] = buffers[
+                variant_idx,
+                cycle_offset:cycle_offset + take,
+            ]
+            global_idx += take
+            result_idx += take
+        return result
+
+    def _comb_buffer_slice(self, start_sample_idx, num_samples):
+        buffers0 = self._as_variant_buffer(self.pre_buffer_comb0)
+        buffers1 = self._as_variant_buffer(self.pre_buffer_comb1)
+        if buffers0.shape != buffers1.shape:
+            raise RuntimeError("Comb phase buffers must have matching shapes.")
+        result = np.empty(num_samples, dtype=np.float32)
+        global_idx = int(start_sample_idx)
+        result_idx = 0
+
+        while result_idx < num_samples:
+            cycle_idx = global_idx // self.comb_period_samples
+            cycle_offset = global_idx % self.comb_period_samples
+            phase = 0 if cycle_offset < self.comb_switch_samples else 1
+            phase_offset = cycle_offset % self.comb_switch_samples
+            variant_idx = self._variant_for_cycle(
+                "comb",
+                cycle_idx,
+                buffers0.shape[0],
+            )
             take = min(
                 self.comb_switch_samples - phase_offset,
                 num_samples - result_idx,
             )
-            buffer = self.pre_buffer_comb0 if phase == 0 else self.pre_buffer_comb1
-            if buffer is None:
-                raise RuntimeError("Comb jammer buffers have not been pre-computed.")
+            buffer = buffers0 if phase == 0 else buffers1
             result[result_idx:result_idx + take] = buffer[
-                phase_offset:phase_offset + take
+                variant_idx,
+                phase_offset:phase_offset + take,
             ]
             global_idx += take
             result_idx += take
@@ -427,7 +646,7 @@ class IndiscriminateJammer:
         return result
 
     def precompute(self, Startfre=3e6, Endfre=4e6):
-        """Pre-compute exactly one natural period for each active jammer."""
+        """Pre-compute one natural-cycle RF buffer per baseband variant."""
         print(f"Pre-computing Jammers (Mode: {self.mode})...")
         self.pre_buffer_sweep = None
         self.pre_buffer_comb0 = None
@@ -437,35 +656,71 @@ class IndiscriminateJammer:
         if self.sweep_enabled:
             _, samples_per_dwell, num_steps = self._sweep_layout(Startfre, Endfre)
             self.sweep_period_samples = samples_per_dwell * num_steps
-            jam_s, _ = self._generate_sweep_signal(
-                self.sweep_period_samples,
-                0,
-                Startfre,
-                Endfre,
+            num_variants = (
+                self.sweep_variant_pool.num_variants
+                if self.sweep_variant_pool is not None
+                else 1
             )
-            self.pre_buffer_sweep = jam_s.astype(np.float32)
+            self.pre_buffer_sweep = np.empty(
+                (num_variants, self.sweep_period_samples),
+                dtype=np.float32,
+            )
+            for variant_idx in range(num_variants):
+                baseband = (
+                    self.sweep_variant_pool.get_variant(
+                        variant_idx,
+                        self.sweep_period_samples,
+                    )
+                    if self.sweep_variant_pool is not None
+                    else None
+                )
+                jam_s, _ = self._generate_sweep_signal(
+                    self.sweep_period_samples,
+                    0,
+                    Startfre,
+                    Endfre,
+                    baseband_noise=baseband,
+                )
+                self.pre_buffer_sweep[variant_idx] = jam_s.astype(np.float32)
 
         if self.comb_enabled:
-            jam_c0, _ = self._generate_comb_signal(
-                self.comb_switch_samples,
-                0,
-                Startfre,
-                Endfre,
-                fixed_phase=0,
+            num_variants = (
+                self.comb_variant_pool.num_variants
+                if self.comb_variant_pool is not None
+                else 1
             )
-            jam_c1, _ = self._generate_comb_signal(
-                self.comb_switch_samples,
-                0,
-                Startfre,
-                Endfre,
-                fixed_phase=1,
+            self.pre_buffer_comb0 = np.empty(
+                (num_variants, self.comb_switch_samples),
+                dtype=np.float32,
             )
-            self.pre_buffer_comb0 = jam_c0.astype(np.float32)
-            self.pre_buffer_comb1 = jam_c1.astype(np.float32)
+            self.pre_buffer_comb1 = np.empty_like(self.pre_buffer_comb0)
+            for variant_idx in range(num_variants):
+                baseband = (
+                    self.comb_variant_pool.get_variant(
+                        variant_idx,
+                        self.comb_period_samples,
+                    )
+                    if self.comb_variant_pool is not None
+                    else None
+                )
+                jam_cycle, _ = self._generate_comb_signal(
+                    self.comb_period_samples,
+                    0,
+                    Startfre,
+                    Endfre,
+                    baseband_noise=baseband,
+                )
+                self.pre_buffer_comb0[variant_idx] = jam_cycle[
+                    :self.comb_switch_samples
+                ].astype(np.float32)
+                self.pre_buffer_comb1[variant_idx] = jam_cycle[
+                    self.comb_switch_samples:
+                ].astype(np.float32)
 
         print("Jammer Pre-computation complete.")
 
     def precomputed_period_samples(self):
+        """Return the LCM of timing cycles, not a numerical waveform period."""
         periods = []
         if self.sweep_enabled:
             if self.sweep_period_samples <= 0:
@@ -490,8 +745,7 @@ class IndiscriminateJammer:
         jam_total = np.zeros(num_samples, dtype=np.float32)
 
         if self.sweep_enabled:
-            jam_total += self._periodic_slice(
-                self.pre_buffer_sweep,
+            jam_total += self._sweep_buffer_slice(
                 start_sample_idx,
                 num_samples,
             )
@@ -513,13 +767,19 @@ class IndiscriminateJammer:
         Startfre,
         Endfre,
         fixed_phase=None,
+        baseband_noise=None,
     ):
         jam = np.zeros(num_samples, dtype=np.float64)
         freqs_used = []
         if num_samples == 0:
             return jam, freqs_used
 
-        baseband_noise = self.ns_comb.get_noise(num_samples) * self.c_power
+        if baseband_noise is None:
+            baseband_noise = self._dynamic_noise_source("comb").get_noise(num_samples)
+        baseband_noise = np.asarray(baseband_noise)
+        if len(baseband_noise) != num_samples:
+            raise ValueError("Comb baseband noise length does not match num_samples.")
+        baseband_noise = baseband_noise * self.c_power
         phase_k = 2.0 * np.pi / self.Fs
         global_idx = int(start_sample_idx)
         result_idx = 0
@@ -558,6 +818,7 @@ class IndiscriminateJammer:
         start_sample_idx,
         Startfre,
         Endfre,
+        baseband_noise=None,
     ):
         jam = np.zeros(num_samples, dtype=np.float64)
         freqs_used = []
@@ -568,7 +829,12 @@ class IndiscriminateJammer:
             Startfre,
             Endfre,
         )
-        baseband_noise = self.ns_sweep.get_noise(num_samples) * self.s_power
+        if baseband_noise is None:
+            baseband_noise = self._dynamic_noise_source("sweep").get_noise(num_samples)
+        baseband_noise = np.asarray(baseband_noise)
+        if len(baseband_noise) != num_samples:
+            raise ValueError("Sweep baseband noise length does not match num_samples.")
+        baseband_noise = baseband_noise * self.s_power
         phase_k = 2.0 * np.pi / self.Fs
         global_idx = int(start_sample_idx)
         result_idx = 0

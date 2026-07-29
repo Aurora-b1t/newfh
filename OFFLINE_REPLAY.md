@@ -40,9 +40,11 @@ buffer capacity. Baseline training warns about environment metadata differences;
 MBPO rejects them by default and requires `--allow_replay_config_mismatch` to
 override that check.
 
-Changes to jammer timing, including the comb `switch_interval`, invalidate existing
-replay data. Regenerate the dataset after such changes instead of overriding the
-metadata mismatch.
+Changes to jammer timing or waveform generation, including the comb
+`switch_interval`, phase channel groups, or `baseband_variant_count`, invalidate
+existing replay data. Regenerate the dataset after such changes for normal use.
+The existing `--allow_replay_config_mismatch` flag remains available only for an
+explicit cross-configuration experiment.
 
 Select a dataset for baseline training:
 
@@ -62,6 +64,8 @@ Formats v1 and v2 modeled each block as a separate transition with a
 rejected rather than converted. Regenerate those datasets with the v3 generator.
 
 The default now means 50,000 real environment steps, not 50,000 block rows.
-Current measurements are roughly 15 seconds for initial pre-generation and
-0.5 seconds per step, so full generation can take several hours. Both baseline
-offset SAC and the step-level MBPO reward ensemble consume this v3 format.
+Pre-generation caches QPSK I/Q plus multiple jammer baseband/RF variants, while
+communication noise, per-hop Rayleigh fading, and observation noise remain fresh.
+Observation PSD is therefore recomputed for every state, and full generation can
+still take several hours. Both baseline offset SAC and the step-level MBPO reward
+ensemble consume this v3 format.

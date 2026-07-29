@@ -5,7 +5,12 @@ import numpy as np
 
 import settings
 from fh_env import FHSSQPSKEnv
-from jammers import IndiscriminateJammer
+from jammers import (
+    BandLimitedNoiseVariantPool,
+    IndiscriminateJammer,
+    JammerVariantSelector,
+    ReactiveJammer,
+)
 
 
 class ConstantNoise:
@@ -13,9 +18,42 @@ class ConstantNoise:
         return np.ones(num_samples, dtype=np.float32)
 
 
+class ArrayVariantPool:
+    def __init__(self, bandwidth, variants):
+        self.bandwidth = float(bandwidth)
+        self.variants = np.asarray(variants, dtype=np.float32)
+        self.num_variants, self.length = self.variants.shape
+
+    def get_variant(self, variant_idx, num_samples=None, start_sample_idx=0):
+        if num_samples is None:
+            num_samples = self.length
+        source = self.variants[int(variant_idx)]
+        indices = (
+            np.arange(int(num_samples), dtype=np.int64) + int(start_sample_idx)
+        ) % self.length
+        return source[indices]
+
+
+class MappingSelector:
+    def __init__(self, num_variants, cycle_choices=None, draws=None):
+        self.num_variants = int(num_variants)
+        self.cycle_choices = dict(cycle_choices or {})
+        self.draws = list(draws or [0])
+        self.draw_count = 0
+
+    def choice_for_cycle(self, jammer_kind, cycle_idx):
+        return int(self.cycle_choices[(jammer_kind, int(cycle_idx))])
+
+    def draw(self):
+        value = self.draws[self.draw_count % len(self.draws)]
+        self.draw_count += 1
+        return int(value)
+
+
 def jammer_config(mode):
     return {
         "mode": mode,
+        "baseband_variant_count": 4,
         "sweep": {
             "step": 5.0,
             "power": 0.8,
@@ -51,8 +89,14 @@ def make_jammer(mode, switch_interval=0.3):
     )
 
 
-def make_environment(mode="comb", use_pregen=False, enable_sweep=True):
-    config = jammer_config(mode)
+def make_environment(
+    mode="comb",
+    use_pregen=False,
+    enable_sweep=True,
+    enable_reactive=False,
+    config=None,
+):
+    config = jammer_config(mode) if config is None else config
     patcher = mock.patch.object(settings, "JAMMER_CONFIG", config)
     patcher.start()
     try:
@@ -67,7 +111,7 @@ def make_environment(mode="comb", use_pregen=False, enable_sweep=True):
             Baud=100,
             dt=0.01,
             df=10.0,
-            enable_reactive=False,
+            enable_reactive=enable_reactive,
             enable_sweep=enable_sweep,
             enable_rayleigh=False,
             use_pregen=use_pregen,
@@ -99,19 +143,19 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
                 actual_sweep_len = (
                     None
                     if jammer.pre_buffer_sweep is None
-                    else len(jammer.pre_buffer_sweep)
+                    else jammer.pre_buffer_sweep.shape[-1]
                 )
                 actual_comb_len = (
                     None
                     if jammer.pre_buffer_comb0 is None
-                    else len(jammer.pre_buffer_comb0)
+                    else jammer.pre_buffer_comb0.shape[-1]
                 )
                 self.assertEqual(sweep_len, actual_sweep_len)
                 self.assertEqual(comb_len, actual_comb_len)
                 actual_comb1_len = (
                     None
                     if jammer.pre_buffer_comb1 is None
-                    else len(jammer.pre_buffer_comb1)
+                    else jammer.pre_buffer_comb1.shape[-1]
                 )
                 self.assertEqual(comb_len, actual_comb1_len)
                 self.assertEqual(total_period, jammer.precomputed_period_samples())
@@ -175,21 +219,243 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
             actual,
         )
 
+    def test_variant_pool_validates_count_and_generates_independent_float32_rows(self):
+        for invalid in (0, -1, 1.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    BandLimitedNoiseVariantPool(1000, 100, invalid, 256)
+
+        np.random.seed(7)
+        pool = BandLimitedNoiseVariantPool(1000, 100, 4, 256)
+        self.assertEqual((4, 256), pool.variants.shape)
+        self.assertEqual(np.float32, pool.variants.dtype)
+        for left in range(pool.num_variants):
+            self.assertAlmostEqual(float(np.std(pool.variants[left])), 1.0, places=5)
+            for right in range(left + 1, pool.num_variants):
+                self.assertFalse(np.array_equal(pool.variants[left], pool.variants[right]))
+
+    def test_shared_selector_replays_choices_after_reset(self):
+        selector = JammerVariantSelector(4, seed=123)
+        first = [
+            selector.choice_for_cycle("sweep", 0),
+            selector.choice_for_cycle("sweep", 0),
+            selector.draw(),
+            selector.choice_for_cycle("comb", 0),
+        ]
+        self.assertEqual(first[0], first[1])
+
+        selector.reset()
+        second = [
+            selector.choice_for_cycle("sweep", 0),
+            selector.choice_for_cycle("sweep", 0),
+            selector.draw(),
+            selector.choice_for_cycle("comb", 0),
+        ]
+        self.assertEqual(first, second)
+        self.assertTrue(all(0 <= value < 4 for value in first))
+
+    def test_sweep_selects_one_variant_for_each_complete_cycle(self):
+        jammer = make_jammer("sweep")
+        jammer.pre_buffer_sweep = np.vstack(
+            [
+                np.zeros(4, dtype=np.float32),
+                np.full(4, 10, dtype=np.float32),
+            ]
+        )
+        jammer.variant_selector = MappingSelector(
+            2,
+            cycle_choices={("sweep", 0): 1, ("sweep", 1): 0},
+        )
+        actual = jammer.get_composite_signal(2, 4)
+        np.testing.assert_array_equal(
+            np.array([10, 10, 0, 0], dtype=np.float32),
+            actual,
+        )
+
+    def test_comb_uses_same_variant_across_both_phases(self):
+        jammer = make_jammer("comb")
+        jammer.pre_buffer_comb0 = np.vstack(
+            [
+                np.zeros(300, dtype=np.float32),
+                np.full(300, 10, dtype=np.float32),
+            ]
+        )
+        jammer.pre_buffer_comb1 = np.vstack(
+            [
+                np.ones(300, dtype=np.float32),
+                np.full(300, 11, dtype=np.float32),
+            ]
+        )
+        jammer.variant_selector = MappingSelector(
+            2,
+            cycle_choices={("comb", 0): 1, ("comb", 1): 0},
+        )
+        actual = jammer.get_composite_signal(298, 304)
+        expected = np.concatenate(
+            [
+                np.full(2, 10, dtype=np.float32),
+                np.full(300, 11, dtype=np.float32),
+                np.zeros(2, dtype=np.float32),
+            ]
+        )
+        np.testing.assert_array_equal(expected, actual)
+
+    def test_comb_precompute_keeps_baseband_continuous_across_phase_switch(self):
+        jammer = make_jammer("comb")
+        jammer.c_power = 1.0
+        baseband = np.arange(jammer.comb_period_samples, dtype=np.float32)
+        pool = ArrayVariantPool(jammer.c_bw, baseband[np.newaxis, :])
+        jammer.set_variant_sources(
+            comb_variant_pool=pool,
+            variant_selector=MappingSelector(1),
+        )
+        jammer.precompute(Startfre=0.0, Endfre=100000.0)
+
+        np.testing.assert_allclose(
+            baseband[:jammer.comb_switch_samples],
+            jammer.pre_buffer_comb0[0],
+            rtol=0.0,
+            atol=1e-4,
+        )
+        np.testing.assert_allclose(
+            baseband[jammer.comb_switch_samples:],
+            jammer.pre_buffer_comb1[0],
+            rtol=0.0,
+            atol=1e-4,
+        )
+
+    def test_reactive_jammer_draws_a_variant_for_every_jam_slot(self):
+        pool = ArrayVariantPool(
+            10.0,
+            np.array([[1.0], [2.0]], dtype=np.float32),
+        )
+        selector = MappingSelector(2, draws=[0, 1])
+        jammer = ReactiveJammer(
+            Fs=1000,
+            num_channels=1,
+            sub_interval=1000.0,
+            detection_time=0.001,
+            p_fa=0.1,
+            power=1.0,
+            bandwidth=10.0,
+            Startfre=0.0,
+            noise_std=0.1,
+            signal_power=0.1,
+            Baud=100,
+            variant_pool=pool,
+            variant_selector=selector,
+        )
+        t = np.arange(1, dtype=np.float64) / jammer.Fs
+
+        outputs = []
+        for _ in range(2):
+            jammer.state = "jam"
+            jammer.current_channel = 0
+            signal, active = jammer.generate(t, [0], 0.0, 1000.0, 10.0)
+            self.assertTrue(active)
+            outputs.append(float(signal[0]))
+
+        self.assertEqual([1.0, 2.0], outputs)
+        self.assertEqual(2, selector.draw_count)
+
 
 class EnvironmentJammerTimingTests(unittest.TestCase):
-    def test_observation_cache_uses_minimum_mode_period(self):
-        expected_steps = {"sweep": 4, "comb": 6, "both": 12}
-        for mode, expected in expected_steps.items():
-            with self.subTest(mode=mode):
-                env = make_environment(mode=mode, use_pregen=True)
-                self.assertEqual(expected, env.pregen_data.num_steps)
-                np.testing.assert_array_equal(
-                    env.pregen_data.get_observation(0),
-                    env.pregen_data.get_observation(expected),
-                )
+    def test_equal_bandwidth_jammers_share_pool_and_selector(self):
+        config = jammer_config("both")
+        shared_bandwidth = 10.0
+        config["reactive"]["bandwidth"] = shared_bandwidth
+        config["sweep"]["bandwidth"] = shared_bandwidth
+        config["comb"]["bandwidth"] = shared_bandwidth
+        env = make_environment(
+            mode="both",
+            use_pregen=True,
+            enable_reactive=True,
+            config=config,
+        )
 
+        self.assertEqual(1, len(env.jammer_variant_pools))
+        pool = env.jammer_variant_pools[shared_bandwidth]
+        self.assertIs(pool, env.reactive.variant_pool)
+        self.assertIs(pool, env.sweep.sweep_variant_pool)
+        self.assertIs(pool, env.sweep.comb_variant_pool)
+        self.assertIs(env.jammer_variant_selector, env.reactive.variant_selector)
+        self.assertIs(env.jammer_variant_selector, env.sweep.variant_selector)
+        self.assertEqual(4, pool.num_variants)
+
+    def test_different_bandwidths_create_distinct_variant_pools(self):
+        config = jammer_config("both")
+        config["reactive"]["bandwidth"] = 10.0
+        config["sweep"]["bandwidth"] = 20.0
+        config["comb"]["bandwidth"] = 30.0
+        env = make_environment(
+            mode="both",
+            use_pregen=True,
+            enable_reactive=True,
+            config=config,
+        )
+        self.assertEqual({10.0, 20.0, 30.0}, set(env.jammer_variant_pools))
+        self.assertIsNot(env.reactive.variant_pool, env.sweep.sweep_variant_pool)
+        self.assertIsNot(env.sweep.sweep_variant_pool, env.sweep.comb_variant_pool)
+
+    def test_environment_rejects_invalid_variant_count(self):
+        for invalid in (0, -1, 1.5, True):
+            config = jammer_config("comb")
+            config["baseband_variant_count"] = invalid
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    make_environment(
+                        use_pregen=False,
+                        enable_sweep=False,
+                        config=config,
+                    )
+
+    def test_pregenerated_observation_recomputes_with_fresh_noise(self):
         env = make_environment(use_pregen=True, enable_sweep=False)
-        self.assertEqual(1, env.pregen_data.num_steps)
+        self.assertFalse(hasattr(env.pregen_data, "obs_buffer"))
+        captured_signals = []
+
+        def capture_waterfall(signal, *args, **kwargs):
+            captured_signals.append(np.asarray(signal).copy())
+            return np.zeros((10, 10), dtype=np.float32)
+
+        noise_samples = [
+            np.zeros(100, dtype=np.float32),
+            np.ones(100, dtype=np.float32),
+        ]
+        with mock.patch(
+            "fh_env.np.random.randn",
+            side_effect=noise_samples,
+        ), mock.patch(
+            "fh_env.compute_psd_waterfall",
+            side_effect=capture_waterfall,
+        ) as psd_mock:
+            env._observe_100ms()
+            env._observe_100ms()
+
+        self.assertEqual(2, psd_mock.call_count)
+        np.testing.assert_array_equal(captured_signals[0], np.zeros(100))
+        np.testing.assert_allclose(
+            captured_signals[1],
+            np.full(100, 0.01),
+            rtol=0.0,
+            atol=1e-8,
+        )
+
+    def test_environment_reset_replays_pregenerated_variant_choices(self):
+        env = make_environment(use_pregen=True)
+        action = {
+            "hoprate": 10.0,
+            "offsets": np.zeros(10, dtype=np.int64),
+        }
+
+        env.reset()
+        env.step(action)
+        first_choices = dict(env.jammer_variant_selector._cycle_choices)
+
+        env.reset()
+        env.step(action)
+        second_choices = dict(env.jammer_variant_selector._cycle_choices)
+        self.assertEqual(first_choices, second_choices)
 
     def test_first_step_phases_match_for_dynamic_and_pregenerated_paths(self):
         expected = [0, 0, 1, 1, 1, 0, 0, 0, 1, 1]

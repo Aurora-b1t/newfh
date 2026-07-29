@@ -87,6 +87,9 @@ ENV_CONFIG = {
 JAMMER_CONFIG = {
     # Global Jamming Mode: 'sweep', 'comb', or 'both'
     "mode": "comb",
+    # Independent band-limited baseband realizations used by pre-generated
+    # reactive/sweep/comb waveforms. Equal bandwidths share the same pool.
+    "baseband_variant_count": 4,
     
     # Sweep Jamming Configuration
     "sweep": {

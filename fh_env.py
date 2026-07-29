@@ -8,7 +8,6 @@ indiscriminate sweep/comb jammers. The environment exposes a 10-offset
 sequential decision interface for RL agents.
 """
 
-import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,7 +16,13 @@ from scipy.signal import upfirdn
 import gymnasium as gym
 from gymnasium import spaces
 import time
-from jammers import FastNoiseSource, ReactiveJammer, IndiscriminateJammer
+from jammers import (
+    BandLimitedNoiseVariantPool,
+    IndiscriminateJammer,
+    JammerVariantSelector,
+    ReactiveJammer,
+    validate_baseband_variant_count,
+)
 import settings
 
 
@@ -201,36 +206,10 @@ def generate_mseq_states(n_bits=10, length=1000, taps=(10, 7), seed=1):
 # -----------------------------
 class PreGeneratedData:
     def __init__(self, env, dtype=np.float32):
-        print(f"Initializing PreGeneratedData (Channels Pool Mode)...")
+        print("Initializing PreGeneratedData (Reusable QPSK Baseband Mode)...")
         self.env = env
         self.dtype = dtype
-        
-        # Calculate samples per block
-        self.hops_per_block = int(round(env.base_hoprate * 0.1))
-        self.hops_per_block = max(1, self.hops_per_block)
-        
         self.num_syms_block = int(round(env.Baud * 0.1))
-        
-        # Estimate block length using one dummy generation
-        bits_dummy = env.modem.generate_bits(2 * self.num_syms_block)
-        I_dummy, _ = env.modem.pulse_shape(bits_dummy)
-        self.block_len = len(I_dummy)
-
-        N_obs = int(0.1 * env.Fs)
-        observation_stride = env.num_blocks * self.block_len + N_obs
-        if env.enable_sweep and env.sweep is not None:
-            jammer_period = env.sweep.precomputed_period_samples()
-            self.num_steps = jammer_period // math.gcd(
-                jammer_period,
-                observation_stride,
-            )
-        else:
-            self.num_steps = 1
-        
-        # Pool Configuration
-        self.num_channels = env.num_channels
-        
-        print(f"Generating Pool for {self.num_channels} channels. Block len: {self.block_len}")
 
         # 1. Baseband Bits (Ground Truth for BER) - Shared for all channels
         # Note: We use the same bits for all channels in this prototype optimization
@@ -242,163 +221,18 @@ class PreGeneratedData:
         self.common_I, self.common_Q = env.modem.pulse_shape(self.common_bits)
         self.common_I = self.common_I.astype(dtype)
         self.common_Q = self.common_Q.astype(dtype)
-        
-        # 3. Per-channel faded baseband (complex) [num_channels, block_len]
-        #    = (common_I + j*common_Q) * ray_mag  — pre-computed for speed
-        self.pool_baseband = np.zeros((self.num_channels, self.block_len), dtype=np.complex64)
-
-        # 4. Per-channel thermal noise [num_channels, block_len]
-        self.pool_noise = np.zeros((self.num_channels, self.block_len), dtype=np.float32)
-
-        # 5. Observations Buffer
-        dummy_obs_sig = np.zeros(int(0.1 * env.Fs))
-        dummy_wf = compute_psd_waterfall(dummy_obs_sig, env.Fs, env.Startfre, env.Endfre, 
-                                         dt=env.dt, df=env.df, max_duration=0.1)
-        self.obs_shape = dummy_wf.shape
-        self.obs_buffer = np.zeros(
-            (self.num_steps, *self.obs_shape),
-            dtype=np.float32,
-        )
-
-        self._generate_content()
+        self.block_len = len(self.common_I)
+        print(f"Reusable QPSK block length: {self.block_len}")
         print("Pre-generation complete.")
 
-    def _generate_content(self):
-        # ---------------------------
-        # Part A: Generate per-channel faded baseband & noise
-        # ---------------------------
-        print("Optimizing: Generating baseband*ray & noise pool...")
-
-        baseband = (self.common_I + 1j * self.common_Q).astype(np.complex64)
-        noise_std = getattr(self.env, 'noise_std', 0.1)
-
-        for k in range(self.num_channels):
-            # Rayleigh fading per channel
-            if self.env.enable_rayleigh:
-                ray_mag = self.env._generate_rayleigh(self.block_len)
-                if ray_mag is None:
-                    ray_mag = np.ones(self.block_len, dtype=np.float32)
-            else:
-                ray_mag = np.ones(self.block_len, dtype=np.float32)
-
-            # Store faded baseband: (I + jQ) * ray  (carrier modulation deferred to get_block)
-            self.pool_baseband[k] = (baseband * ray_mag.astype(np.complex64))
-
-            # Thermal noise per channel (real, std from env.noise_std)
-            self.pool_noise[k] = (noise_std * np.random.randn(self.block_len)).astype(np.float32)
-
-        # ---------------------------
-        # Part B: Observation Buffer (Legacy support for Jammers)
-        # ---------------------------
-        t_obs_template = np.arange(int(0.1 * self.env.Fs)) / self.env.Fs
-        # Temporary pointer for generating consistent observations from buffers
-        obs_jammer_ptr = 0 
-        N_obs = len(t_obs_template)
-        N_tx_total = self.env.num_blocks * self.block_len
-
-        for s in range(self.num_steps):
-            if s > 0:
-                obs_jammer_ptr += N_tx_total
-
-            jam_obs = np.zeros_like(t_obs_template)
-            if self.env.enable_sweep and self.env.sweep is not None:
-                jam_obs = self.env.sweep.get_composite_signal(
-                    obs_jammer_ptr,
-                    N_obs,
-                )
-
-            obs_jammer_ptr += N_obs
-            noise_obs = noise_std * np.random.randn(len(t_obs_template))
-            sig_obs = jam_obs + noise_obs
-
-            wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre, 
-                                         dt=self.env.dt, df=self.env.df, max_duration=0.1, plot=False)
-            self.obs_buffer[s] = wf.astype(np.float32)
-
-
     def get_block(self, hop_seq):
-        """
-        Assemble a signal block from the pre-generated pool.
-
-        Uses a **phase-continuous** carrier generated on the fly (same algorithm
-        as ``FHSSChannel.hop_carrier``), while the expensive baseband * Rayleigh
-        product and thermal noise are pre-computed per channel.
-
-        Processing is done per-hop to keep working sets cache-resident (~20k
-        samples per hop) and avoid large intermediate array allocations.
-        """
-        N = self.block_len
-        n_hops = len(hop_seq)
-        if n_hops == 0 or N == 0:
-            return (np.zeros(N, dtype=np.float32),
-                    np.zeros(N, dtype=np.complex64),
-                    self.common_bits)
-
-        s_per_hop_float = self.env.Fs / float(self.env.current_hoprate)
-        two_pi_over_Fs = 2.0 * np.pi / self.env.Fs
-
-        rx_assembled = np.empty(N, dtype=np.float32)
-        carrier_assembled = np.empty(N, dtype=np.complex64)
-
-        pos = 0
-        # cumsum_end = Σ f[i] for i = 0 … (pos-1), i.e. the cumulative sum
-        # up to the sample just before the current hop.  The carrier phase
-        # at sample n is  2π/Fs · (cumsum_end + f_curr · (n-pos+1)).
-        cumsum_end = 0.0
-
-        for k in range(n_hops):
-            next_pos = int(round((k + 1) * s_per_hop_float))
-            next_pos = min(N, max(pos + 1, next_pos))
-            length = next_pos - pos
-            if length <= 0:
-                continue
-
-            ch_idx = int(hop_seq[k]) % self.num_channels
-            f_c = (self.env.Startfre + ch_idx * self.env.Sub_interval
-                   + 0.5 * self.env.Sub_interval)
-
-            # t = [1, 2, …, length]  →  phase = 2π/Fs · (cumsum_end + f_c · t)
-            t_local = np.arange(1, length + 1, dtype=np.float64)
-            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
-            carrier_hop = np.exp(1j * phase).astype(np.complex64)
-
-            cumsum_end += f_c * length  # now holds Σf up to last sample of this hop
-
-            # slice pre-computed baseband*ray and noise for this channel
-            bb_ray = self.pool_baseband[ch_idx, pos:next_pos]
-            noise = self.pool_noise[ch_idx, pos:next_pos]
-
-            # modulate: rx = Real(baseband_ray * carrier) + noise
-            rx_hop = np.real(bb_ray * carrier_hop)
-            rx_hop += noise
-
-            rx_assembled[pos:next_pos] = rx_hop
-            carrier_assembled[pos:next_pos] = carrier_hop
-            pos = next_pos
-
-        # handle any remainder
-        if pos < N:
-            ch_idx = int(hop_seq[min(k, n_hops - 1)]) % self.num_channels
-            f_c = (self.env.Startfre + ch_idx * self.env.Sub_interval
-                   + 0.5 * self.env.Sub_interval)
-            length = N - pos
-            t_local = np.arange(1, length + 1, dtype=np.float64)
-            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
-            carrier_hop = np.exp(1j * phase).astype(np.complex64)
-
-            bb_ray = self.pool_baseband[ch_idx, pos:]
-            noise = self.pool_noise[ch_idx, pos:]
-            rx_hop = np.real(bb_ray * carrier_hop)
-            rx_hop += noise
-
-            rx_assembled[pos:] = rx_hop
-            carrier_assembled[pos:] = carrier_hop
-
+        """Assemble one block from reusable I/Q and fresh channel randomness."""
+        rx_assembled, carrier_assembled = self.env._assemble_signal_block(
+            self.common_I,
+            self.common_Q,
+            hop_seq,
+        )
         return rx_assembled, carrier_assembled, self.common_bits
-
-    def get_observation(self, step_idx):
-        eff_step = step_idx % self.num_steps
-        return self.obs_buffer[eff_step]
 
 
 # -----------------------------
@@ -580,11 +414,20 @@ class FHSSQPSKEnv(gym.Env):
         
         self.enable_reactive = bool(enable_reactive)
         self.enable_sweep = bool(enable_sweep)
+        self.use_pregen = bool(use_pregen)
 
         # 加载配置
         j_conf = settings.JAMMER_CONFIG
         self.noise_std = float(noise_std)
         self.signal_power = float(signal_power)
+
+        self.baseband_variant_count = validate_baseband_variant_count(
+            j_conf.get('baseband_variant_count', 4)
+        )
+        (
+            self.jammer_variant_pools,
+            self.jammer_variant_selector,
+        ) = self._build_jammer_variant_resources(j_conf)
 
         if self.enable_reactive:
             r_conf = j_conf['reactive']
@@ -600,7 +443,11 @@ class FHSSQPSKEnv(gym.Env):
                                            speed=r_conf.get('speed', None),
                                            noise_std=self.noise_std,
                                            signal_power=self.signal_power,
-                                           Baud=self.Baud)
+                                           Baud=self.Baud,
+                                           variant_pool=self.jammer_variant_pools[
+                                               float(r_conf['bandwidth'])
+                                           ],
+                                           variant_selector=self.jammer_variant_selector)
         else:
             self.reactive = None
                                        
@@ -611,7 +458,27 @@ class FHSSQPSKEnv(gym.Env):
                                               sweep_config=j_conf['sweep'],
                                               comb_config=j_conf['comb'],
                                               noise_source=None,
-                                              mode=s_mode)
+                                              mode=s_mode,
+                                              sweep_variant_pool=(
+                                                  self.jammer_variant_pools.get(
+                                                      float(j_conf['sweep']['bandwidth'])
+                                                  )
+                                                  if self.use_pregen and s_mode in {'sweep', 'both'}
+                                                  else None
+                                              ),
+                                              comb_variant_pool=(
+                                                  self.jammer_variant_pools.get(
+                                                      float(j_conf['comb']['bandwidth'])
+                                                  )
+                                                  if self.use_pregen and s_mode in {'comb', 'both'}
+                                                  else None
+                                              ),
+                                              variant_selector=(
+                                                  self.jammer_variant_selector
+                                                  if self.use_pregen
+                                                  else None
+                                              ),
+                                              defer_dynamic_noise=self.use_pregen)
         else:
             self.sweep = None
 
@@ -627,7 +494,6 @@ class FHSSQPSKEnv(gym.Env):
         self.reset_mseq_each_step = bool(reset_mseq_each_step)
 
         # Init Pre-generator
-        self.use_pregen = bool(use_pregen)
         if self.use_pregen and self.enable_sweep and self.sweep is not None:
              self.sweep.precompute(Startfre=self.Startfre, Endfre=self.Endfre)
 
@@ -665,6 +531,89 @@ class FHSSQPSKEnv(gym.Env):
         self._fig_save_dir = None
 
         self._apply_hoprate(self.base_hoprate)
+
+    def _build_jammer_variant_resources(self, jammer_config):
+        requirements = {}
+
+        def require_pool(bandwidth, min_samples):
+            bandwidth = float(bandwidth)
+            min_samples = max(1, int(min_samples))
+            requirements[bandwidth] = max(
+                requirements.get(bandwidth, 0),
+                min_samples,
+            )
+
+        if self.enable_reactive:
+            reactive_config = jammer_config['reactive']
+            reactive_samples = max(
+                1,
+                int(
+                    self.Fs
+                    * float(reactive_config.get('detection_time', 0.001))
+                ),
+            )
+            require_pool(reactive_config['bandwidth'], reactive_samples)
+
+        if self.use_pregen and self.enable_sweep:
+            mode = jammer_config.get('mode', 'sweep')
+            if mode not in {'sweep', 'comb', 'both'}:
+                raise ValueError("mode must be 'sweep', 'comb', or 'both'.")
+
+            if mode in {'sweep', 'both'}:
+                sweep_config = jammer_config['sweep']
+                sweep_step = float(sweep_config.get('step', 125000.0))
+                sweep_dwell = float(sweep_config.get('dwell_time', 0.004))
+                if not np.isfinite(sweep_step) or sweep_step <= 0.0:
+                    raise ValueError("Sweep step must be finite and positive.")
+                if not np.isfinite(sweep_dwell) or sweep_dwell <= 0.0:
+                    raise ValueError("Sweep dwell_time must be finite and positive.")
+                bandwidth_span = max(self.Endfre - self.Startfre, 1.0)
+                samples_per_dwell = max(1, int(round(sweep_dwell * self.Fs)))
+                num_steps = max(1, int(np.floor(bandwidth_span / sweep_step)))
+                require_pool(
+                    sweep_config['bandwidth'],
+                    samples_per_dwell * num_steps,
+                )
+
+            if mode in {'comb', 'both'}:
+                comb_config = jammer_config['comb']
+                switch_interval = float(comb_config.get('switch_interval', 0.3))
+                interval_units = (
+                    switch_interval / IndiscriminateJammer.COMB_TIME_QUANTUM
+                )
+                if (
+                    not np.isfinite(switch_interval)
+                    or switch_interval <= 0.0
+                    or not np.isclose(
+                        interval_units,
+                        round(interval_units),
+                        rtol=0.0,
+                        atol=1e-9,
+                    )
+                ):
+                    raise ValueError(
+                        "JAMMER_CONFIG['comb']['switch_interval'] must be a finite "
+                        "positive multiple of 0.1 seconds."
+                    )
+                require_pool(
+                    comb_config['bandwidth'],
+                    2 * int(round(switch_interval * self.Fs)),
+                )
+
+        if not requirements:
+            return {}, None
+
+        selector = JammerVariantSelector(self.baseband_variant_count)
+        pools = {
+            bandwidth: BandLimitedNoiseVariantPool(
+                self.Fs,
+                bandwidth,
+                self.baseband_variant_count,
+                requirements[bandwidth],
+            )
+            for bandwidth in sorted(requirements)
+        }
+        return pools, selector
 
     def _validate_comb_channels(self, comb_config):
         """
@@ -742,49 +691,99 @@ class FHSSQPSKEnv(gym.Env):
         mag_seq = np.repeat(mags, coh)[:length]
         return mag_seq
 
-    def _observe_100ms(self, block_id=None):
-        # Pre-generated observation path
-        if self.use_pregen and self.pregen_data is not None:
-             obs = self.pregen_data.get_observation(self.current_step)
-             
-             if self.enable_sweep and self.sweep is not None:
-                 N_obs = int(0.1 * self.Fs)
-                 self.jammer_ptr += N_obs
+    def _assemble_signal_block(self, I_pulse, Q_pulse, hop_seq):
+        """Apply fresh per-block AWGN and fresh per-hop Rayleigh fading."""
+        I_pulse = np.asarray(I_pulse, dtype=np.float32)
+        Q_pulse = np.asarray(Q_pulse, dtype=np.float32)
+        if I_pulse.shape != Q_pulse.shape:
+            raise ValueError("I_pulse and Q_pulse must have matching shapes.")
 
-             if self.debug_plot_psd:
-                plot_title = ""
-                if block_id is not None:
-                    plot_title = f"Step {self.current_step} - Block {block_id}"
-                
-                plt.figure(figsize=(8, 4))
-                plt.imshow(obs.T, origin="lower", aspect="auto", cmap="jet")
-                plt.colorbar(label='PSD (dB)')
-                plt.xlabel('Time bin')
-                plt.ylabel('Freq bin')
-                title_str = 'PSD Waterfall (100 ms)'
-                if plot_title:
-                    title_str += f"\n{plot_title}"
-                plt.title(title_str)
-                plt.tight_layout()
-                plt.show()
-                
-             return obs
+        baseband = (I_pulse + 1j * Q_pulse).astype(np.complex64)
+        N = len(baseband)
+        noise = (
+            self.noise_std * np.random.randn(N)
+        ).astype(np.float32)
+        rx_assembled = np.empty(N, dtype=np.float32)
+        carrier_assembled = np.empty(N, dtype=np.complex64)
 
-        # Fallback to dynamic generation
-        N_obs = int(0.1 * self.Fs)
-        
-        sweep_jam = np.zeros(N_obs)
-        if self.enable_sweep and self.sweep is not None:
-            t_obs = np.arange(N_obs) / self.Fs
-            sweep_jam, _ = self.sweep.generate(
-                t_obs,
-                self.Startfre,
-                self.Endfre,
-                start_sample_idx=self.jammer_ptr,
+        n_hops = len(hop_seq)
+        if N == 0:
+            return rx_assembled, carrier_assembled
+        if n_hops == 0:
+            rx_assembled[:] = noise
+            carrier_assembled[:] = 0.0
+            return rx_assembled, carrier_assembled
+
+        s_per_hop_float = self.Fs / float(self.current_hoprate)
+        two_pi_over_Fs = 2.0 * np.pi / self.Fs
+        pos = 0
+        cumsum_end = 0.0
+
+        for hop_idx in range(n_hops):
+            if hop_idx == n_hops - 1:
+                next_pos = N
+            else:
+                next_pos = int(round((hop_idx + 1) * s_per_hop_float))
+                next_pos = min(N, max(pos + 1, next_pos))
+            length = next_pos - pos
+            if length <= 0:
+                continue
+
+            ch_idx = int(hop_seq[hop_idx]) % self.num_channels
+            f_c = (
+                self.Startfre
+                + ch_idx * self.Sub_interval
+                + 0.5 * self.Sub_interval
             )
+            t_local = np.arange(1, length + 1, dtype=np.float64)
+            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
+            carrier_hop = np.exp(1j * phase).astype(np.complex64)
+            cumsum_end += f_c * length
+
+            rayleigh_mag = self._generate_rayleigh(length)
+            if rayleigh_mag is None:
+                rayleigh_mag = np.ones(length, dtype=np.float32)
+            else:
+                rayleigh_mag = np.asarray(rayleigh_mag, dtype=np.float32)
+
+            faded_baseband = (
+                baseband[pos:next_pos] * rayleigh_mag.astype(np.complex64)
+            )
+            rx_assembled[pos:next_pos] = (
+                np.real(faded_baseband * carrier_hop) + noise[pos:next_pos]
+            )
+            carrier_assembled[pos:next_pos] = carrier_hop
+            pos = next_pos
+            if pos >= N:
+                break
+
+        if pos < N:
+            rx_assembled[pos:] = noise[pos:]
+            carrier_assembled[pos:] = 0.0
+        return rx_assembled, carrier_assembled
+
+    def _observe_100ms(self, block_id=None):
+        N_obs = int(0.1 * self.Fs)
+        sweep_jam = np.zeros(N_obs, dtype=np.float32)
+        if self.enable_sweep and self.sweep is not None:
+            if self.use_pregen:
+                sweep_jam = self.sweep.get_composite_signal(
+                    self.jammer_ptr,
+                    N_obs,
+                )
+            else:
+                t_obs = np.arange(N_obs) / self.Fs
+                sweep_jam, _ = self.sweep.generate(
+                    t_obs,
+                    self.Startfre,
+                    self.Endfre,
+                    start_sample_idx=self.jammer_ptr,
+                )
             self.jammer_ptr += N_obs
 
-        noise = self.noise_std * np.random.randn(N_obs)
+        noise = (
+            self.noise_std * np.random.randn(N_obs)
+        ).astype(np.float32)
         obs_signal = sweep_jam + noise
 
         plot_title = ""
@@ -825,6 +824,9 @@ class FHSSQPSKEnv(gym.Env):
         self.current_step = 0
         self.jammer_ptr = 0 # Reset jammer pointer
         _ = self._apply_hoprate(self.base_hoprate)
+
+        if self.jammer_variant_selector is not None:
+            self.jammer_variant_selector.reset()
         
         if self.enable_sweep and self.sweep is not None:
              self.sweep.reset()
@@ -958,14 +960,11 @@ class FHSSQPSKEnv(gym.Env):
                 I_pulse, Q_pulse = self.modem.pulse_shape(bits_block)
 
                 t_block = np.arange(len(I_pulse)) / self.Fs
-                
-                carrier_complex = self.channel.hop_carrier(t_block, hop_seq_block)
-
-                rf_complex, noise = self.channel.transmit(I_pulse, Q_pulse, carrier_complex, noise_std=self.noise_std)
-
-                rayleigh_mag = self._generate_rayleigh(len(I_pulse))
-                if rayleigh_mag is None:
-                    rayleigh_mag = np.ones_like(I_pulse)
+                rx_static, carrier_complex = self._assemble_signal_block(
+                    I_pulse,
+                    Q_pulse,
+                    hop_seq_block,
+                )
                     
                 sweep_jam = np.zeros(len(I_pulse))
                 if self.enable_sweep and self.sweep is not None:
@@ -977,7 +976,7 @@ class FHSSQPSKEnv(gym.Env):
                     )
                     self.jammer_ptr += len(I_pulse)
                 
-                rx_real = np.real(rf_complex * rayleigh_mag) + sweep_jam + noise
+                rx_real = rx_static + sweep_jam
 
             # ----------------------------------------------------------------
             # 4. Reactive Jammer (Dynamic) - Independent of path

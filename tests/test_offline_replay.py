@@ -218,6 +218,43 @@ class OfflineReplayTests(unittest.TestCase):
         self.assertEqual(2, count)
         self.assertEqual(2, destination.size())
 
+    def test_variant_count_mismatch_is_strict_by_default_but_overridable(self):
+        stored = environment_metadata(
+            {"mode": "current"},
+            {"mode": "comb"},
+            {"base_reward": 1.0},
+        )
+        current = environment_metadata(
+            {"mode": "current"},
+            {"mode": "comb", "baseband_variant_count": 4},
+            {"base_reward": 1.0},
+        )
+        save_replay_buffer(
+            self.path,
+            make_buffer(),
+            {"num_actions": 20, **stored},
+        )
+
+        with self.assertRaisesRegex(ValueError, "metadata does not match"):
+            load_replay_into_buffer(
+                self.path,
+                ReplayBuffer(8, 10, 20),
+                expected_num_actions=20,
+                current_environment_metadata=current,
+                strict_environment_metadata=True,
+            )
+
+        destination = ReplayBuffer(8, 10, 20)
+        count, _ = load_replay_into_buffer(
+            self.path,
+            destination,
+            expected_num_actions=20,
+            current_environment_metadata=current,
+            strict_environment_metadata=False,
+        )
+        self.assertEqual(2, count)
+        self.assertEqual(2, destination.size())
+
 
 if __name__ == "__main__":
     unittest.main()
