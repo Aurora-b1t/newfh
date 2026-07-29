@@ -398,7 +398,7 @@ class ReactiveJammer:
 
 
 class IndiscriminateJammer:
-    COMB_TIME_QUANTUM = 0.1
+    COMB_TIME_QUANTUM = 0.01
 
     def __init__(self, Fs, sweep_config=None, comb_config=None, 
                  noise_source=None, mode='sweep',
@@ -424,7 +424,7 @@ class IndiscriminateJammer:
         self.c_power = float(self.comb_config.get('power', 0.5))
         self.c_bw = float(self.comb_config.get('bandwidth', 30000.0))
         self.comb_switch_interval = float(
-            self.comb_config.get('switch_interval', 0.3)
+            self.comb_config.get('switch_interval', 0.05)
         )
         self._validate_comb_switch_interval()
         self.comb_switch_samples = int(round(self.comb_switch_interval * self.Fs))
@@ -538,7 +538,7 @@ class IndiscriminateJammer:
         ):
             raise ValueError(
                 "JAMMER_CONFIG['comb']['switch_interval'] must be a finite "
-                "positive multiple of 0.1 seconds."
+                "positive multiple of 0.01 seconds."
             )
 
     def _sweep_layout(self, Startfre, Endfre):

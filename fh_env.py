@@ -577,7 +577,7 @@ class FHSSQPSKEnv(gym.Env):
 
             if mode in {'comb', 'both'}:
                 comb_config = jammer_config['comb']
-                switch_interval = float(comb_config.get('switch_interval', 0.3))
+                switch_interval = float(comb_config.get('switch_interval', 0.05))
                 interval_units = (
                     switch_interval / IndiscriminateJammer.COMB_TIME_QUANTUM
                 )
@@ -593,7 +593,7 @@ class FHSSQPSKEnv(gym.Env):
                 ):
                     raise ValueError(
                         "JAMMER_CONFIG['comb']['switch_interval'] must be a finite "
-                        "positive multiple of 0.1 seconds."
+                        "positive multiple of 0.01 seconds."
                     )
                 require_pool(
                     comb_config['bandwidth'],
@@ -892,18 +892,37 @@ class FHSSQPSKEnv(gym.Env):
         reactive_active_blocks = []
         hop_sequences = []
         comb_phases = []
+        comb_active = (
+            self.enable_sweep
+            and self.sweep is not None
+            and self.sweep.comb_enabled
+        )
+        comb_phase_sample_offsets = ()
+        if comb_active:
+            comb_phase_slot_count = int(round(
+                0.1 / IndiscriminateJammer.COMB_TIME_QUANTUM
+            ))
+            comb_phase_sample_offsets = tuple(
+                int(round(
+                    slot_idx
+                    * IndiscriminateJammer.COMB_TIME_QUANTUM
+                    * self.Fs
+                ))
+                for slot_idx in range(comb_phase_slot_count)
+            )
         capture_figures = (
             (self.current_step + 1) in self._fig_save_steps
             and self._fig_save_dir is not None
         )
 
         for b in range(self.num_blocks):
-            if (
-                self.enable_sweep
-                and self.sweep is not None
-                and self.sweep.comb_enabled
-            ):
-                comb_phases.append(self.sweep.comb_phase_at(self.jammer_ptr))
+            if comb_active:
+                comb_phases.append([
+                    self.sweep.comb_phase_at(
+                        self.jammer_ptr + sample_offset
+                    )
+                    for sample_offset in comb_phase_sample_offsets
+                ])
 
             # ----------------------------------------------------------------
             # 2. Hopping Sequence (Dynamic)

@@ -63,7 +63,7 @@ def jammer_config(mode):
         "comb": {
             "power": 0.8,
             "bandwidth": 10.0,
-            "switch_interval": 0.3,
+            "switch_interval": 0.05,
             "channels_phase0": [0],
             "channels_phase1": [1],
         },
@@ -76,7 +76,7 @@ def jammer_config(mode):
     }
 
 
-def make_jammer(mode, switch_interval=0.3):
+def make_jammer(mode, switch_interval=0.05):
     config = jammer_config(mode)
     config["sweep"]["step"] = 50.0
     config["comb"]["switch_interval"] = switch_interval
@@ -124,17 +124,29 @@ def make_environment(
 
 
 class IndiscriminateJammerTimingTests(unittest.TestCase):
-    def test_rejects_invalid_comb_switch_intervals(self):
-        for interval in (0.0, -0.1, np.nan, np.inf, 0.25):
+    def test_accepts_10ms_comb_switch_intervals(self):
+        for interval, expected_samples in (
+            (0.01, 10),
+            (0.05, 50),
+            (0.15, 150),
+            (0.3, 300),
+        ):
             with self.subTest(interval=interval):
-                with self.assertRaisesRegex(ValueError, "positive multiple of 0.1"):
+                jammer = make_jammer("comb", switch_interval=interval)
+                self.assertEqual(expected_samples, jammer.comb_switch_samples)
+                self.assertEqual(2 * expected_samples, jammer.comb_period_samples)
+
+    def test_rejects_invalid_comb_switch_intervals(self):
+        for interval in (0.0, -0.01, np.nan, np.inf, 0.055):
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, "positive multiple of 0.01"):
                     make_jammer("comb", switch_interval=interval)
 
     def test_precomputes_only_active_natural_periods(self):
         expected = {
             "sweep": (80, None, 80),
-            "comb": (None, 300, 600),
-            "both": (80, 300, 1200),
+            "comb": (None, 50, 100),
+            "both": (80, 50, 400),
         }
         for mode, (sweep_len, comb_len, total_period) in expected.items():
             with self.subTest(mode=mode):
@@ -161,43 +173,60 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
                 self.assertEqual(total_period, jammer.precomputed_period_samples())
 
     def test_dynamic_generation_selects_phase_channels_from_sample_clock(self):
-        jammer = make_jammer("comb")
-        t = np.arange(100, dtype=np.float64) / jammer.Fs
-
-        _, phase0_freqs = jammer.generate(
-            t,
-            Startfre=0.0,
-            Endfre=100000.0,
-            start_sample_idx=0,
-        )
-        _, phase1_freqs = jammer.generate(
-            t,
-            Startfre=0.0,
-            Endfre=100000.0,
-            start_sample_idx=300,
-        )
-        self.assertEqual({25000.0}, set(phase0_freqs))
-        self.assertEqual({75000.0}, set(phase1_freqs))
+        for interval, start_sample_idx in ((0.05, 0), (0.15, 100)):
+            with self.subTest(interval=interval):
+                jammer = make_jammer("comb", switch_interval=interval)
+                t = np.arange(100, dtype=np.float64) / jammer.Fs
+                _, frequencies = jammer.generate(
+                    t,
+                    Startfre=0.0,
+                    Endfre=100000.0,
+                    start_sample_idx=start_sample_idx,
+                )
+                self.assertEqual([25000.0, 75000.0], frequencies)
 
     def test_comb_slice_hard_switches_and_wraps_multiple_times(self):
         jammer = make_jammer("comb")
-        jammer.pre_buffer_comb0 = np.zeros(300, dtype=np.float32)
-        jammer.pre_buffer_comb1 = np.ones(300, dtype=np.float32)
+        jammer.pre_buffer_comb0 = np.zeros(50, dtype=np.float32)
+        jammer.pre_buffer_comb1 = np.ones(50, dtype=np.float32)
 
-        actual = jammer.get_composite_signal(250, 800)
+        actual = jammer.get_composite_signal(25, 250)
         expected = np.concatenate(
             [
+                np.zeros(25, dtype=np.float32),
+                np.ones(50, dtype=np.float32),
                 np.zeros(50, dtype=np.float32),
-                np.ones(300, dtype=np.float32),
-                np.zeros(300, dtype=np.float32),
-                np.ones(150, dtype=np.float32),
+                np.ones(50, dtype=np.float32),
+                np.zeros(50, dtype=np.float32),
+                np.ones(25, dtype=np.float32),
             ]
         )
         np.testing.assert_array_equal(expected, actual)
         self.assertEqual([0, 0, 1, 1, 0], [
             jammer.comb_phase_at(index)
-            for index in (0, 299, 300, 599, 600)
+            for index in (0, 49, 50, 99, 100)
         ])
+
+    def test_comb_slice_switches_inside_100ms_blocks(self):
+        for interval, start_sample_idx in ((0.05, 0), (0.15, 100)):
+            with self.subTest(interval=interval):
+                jammer = make_jammer("comb", switch_interval=interval)
+                jammer.pre_buffer_comb0 = np.zeros(
+                    jammer.comb_switch_samples,
+                    dtype=np.float32,
+                )
+                jammer.pre_buffer_comb1 = np.ones(
+                    jammer.comb_switch_samples,
+                    dtype=np.float32,
+                )
+                actual = jammer.get_composite_signal(start_sample_idx, 100)
+                expected = np.concatenate(
+                    [
+                        np.zeros(50, dtype=np.float32),
+                        np.ones(50, dtype=np.float32),
+                    ]
+                )
+                np.testing.assert_array_equal(expected, actual)
 
     def test_sweep_slice_supports_more_than_one_wrap(self):
         jammer = make_jammer("sweep")
@@ -211,9 +240,9 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
     def test_both_mode_adds_independent_periodic_slices(self):
         jammer = make_jammer("both")
         jammer.pre_buffer_sweep = np.array([1, 2], dtype=np.float32)
-        jammer.pre_buffer_comb0 = np.full(300, 10, dtype=np.float32)
-        jammer.pre_buffer_comb1 = np.full(300, 20, dtype=np.float32)
-        actual = jammer.get_composite_signal(298, 6)
+        jammer.pre_buffer_comb0 = np.full(50, 10, dtype=np.float32)
+        jammer.pre_buffer_comb1 = np.full(50, 20, dtype=np.float32)
+        actual = jammer.get_composite_signal(48, 6)
         np.testing.assert_array_equal(
             np.array([11, 12, 21, 22, 21, 22], dtype=np.float32),
             actual,
@@ -276,25 +305,25 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
         jammer = make_jammer("comb")
         jammer.pre_buffer_comb0 = np.vstack(
             [
-                np.zeros(300, dtype=np.float32),
-                np.full(300, 10, dtype=np.float32),
+                np.zeros(50, dtype=np.float32),
+                np.full(50, 10, dtype=np.float32),
             ]
         )
         jammer.pre_buffer_comb1 = np.vstack(
             [
-                np.ones(300, dtype=np.float32),
-                np.full(300, 11, dtype=np.float32),
+                np.ones(50, dtype=np.float32),
+                np.full(50, 11, dtype=np.float32),
             ]
         )
         jammer.variant_selector = MappingSelector(
             2,
             cycle_choices={("comb", 0): 1, ("comb", 1): 0},
         )
-        actual = jammer.get_composite_signal(298, 304)
+        actual = jammer.get_composite_signal(48, 54)
         expected = np.concatenate(
             [
                 np.full(2, 10, dtype=np.float32),
-                np.full(300, 11, dtype=np.float32),
+                np.full(50, 11, dtype=np.float32),
                 np.zeros(2, dtype=np.float32),
             ]
         )
@@ -457,25 +486,50 @@ class EnvironmentJammerTimingTests(unittest.TestCase):
         second_choices = dict(env.jammer_variant_selector._cycle_choices)
         self.assertEqual(first_choices, second_choices)
 
-    def test_first_step_phases_match_for_dynamic_and_pregenerated_paths(self):
-        expected = [0, 0, 1, 1, 1, 0, 0, 0, 1, 1]
+    def test_comb_phase_slots_match_for_dynamic_and_pregenerated_paths(self):
+        phase0_then_phase1 = [0] * 5 + [1] * 5
+        expected_by_interval = {
+            0.05: [phase0_then_phase1] * 10,
+            0.15: [
+                phase0_then_phase1,
+                [1] * 10,
+                [0] * 10,
+                phase0_then_phase1,
+                [1] * 10,
+                [0] * 10,
+                phase0_then_phase1,
+                [1] * 10,
+                [0] * 10,
+                phase0_then_phase1,
+            ],
+        }
         action = {
             "hoprate": 10.0,
             "offsets": np.zeros(10, dtype=np.int64),
         }
 
-        for use_pregen in (False, True):
-            with self.subTest(use_pregen=use_pregen):
-                env = make_environment(use_pregen=use_pregen)
-                env.reset()
-                self.assertEqual(100, env.jammer_ptr)
-                _, _, _, _, info = env.step(action)
-                self.assertEqual(expected, info["comb_phases"])
-                self.assertEqual(1200, env.jammer_ptr)
+        for interval, expected in expected_by_interval.items():
+            config = jammer_config("comb")
+            config["comb"]["switch_interval"] = interval
+            for use_pregen in (False, True):
+                with self.subTest(
+                    interval=interval,
+                    use_pregen=use_pregen,
+                ):
+                    env = make_environment(
+                        use_pregen=use_pregen,
+                        config=config,
+                    )
+                    _, reset_info = env.reset()
+                    self.assertEqual([], reset_info["comb_phases"])
+                    self.assertEqual(100, env.jammer_ptr)
+                    _, _, _, _, info = env.step(action)
+                    self.assertEqual(expected, info["comb_phases"])
+                    self.assertEqual(1200, env.jammer_ptr)
 
-                env.reset()
-                _, _, _, _, reset_info = env.step(action)
-                self.assertEqual(expected, reset_info["comb_phases"])
+                    env.reset()
+                    _, _, _, _, replayed_info = env.step(action)
+                    self.assertEqual(expected, replayed_info["comb_phases"])
 
     def test_comb_phases_is_empty_when_comb_is_inactive(self):
         action = {

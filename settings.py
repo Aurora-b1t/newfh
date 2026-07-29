@@ -103,7 +103,7 @@ JAMMER_CONFIG = {
     "comb": {
         "power": 0.8,        # Total power or per-tone power factor
         "bandwidth": 50000.0,# Noise bandwidth per tone
-        "switch_interval": 0.3, # Seconds; positive multiple of 100 ms
+        "switch_interval": 0.05, # Seconds; positive multiple of 10 ms
         # Jammed channel indices for the two alternating comb groups.
         # Each index k maps to the centre of 50kHz channel k
         # (Startfre + k*50kHz + 25kHz); indices must be integers in
@@ -184,7 +184,7 @@ NBS_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 150,       # Total environment steps per episode
+    "steps_per_episode": 200,       # Total environment steps per episode
     "update_iters_per_step": 10,      # Gradient updates per environment step
     "fixed_hoprate": 100.0,          # Fixed hopping rate for training
 }
@@ -196,7 +196,7 @@ TRAIN_CONFIG = {
 # Multiple steps may be listed; values outside [1, steps_per_episode] are
 # ignored with a warning. Empty list disables figure saving.
 PLOT_CONFIG = {
-    "figure_save_steps": [50, 100],
+    "figure_save_steps": [49, 50, 100, 101, 149, 150, 151, 198, 199],
 }
 
 # Reward Calculation Configuration
