@@ -103,7 +103,7 @@ JAMMER_CONFIG = {
     "comb": {
         "power": 0.8,        # Total power or per-tone power factor
         "bandwidth": 50000.0,# Noise bandwidth per tone
-        "switch_interval": 0.05, # Seconds; positive multiple of 10 ms
+        "switch_interval": 0.05, # Seconds; positive multiple of 1 ms
         # Jammed channel indices for the two alternating comb groups.
         # Each index k maps to the centre of 50kHz channel k
         # (Startfre + k*50kHz + 25kHz); indices must be integers in

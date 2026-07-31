@@ -76,17 +76,27 @@ def jammer_config(mode):
     }
 
 
-def make_jammer(mode, switch_interval=0.05):
+def make_jammer(mode, switch_interval=0.05, fs=1000):
     config = jammer_config(mode)
     config["sweep"]["step"] = 50.0
     config["comb"]["switch_interval"] = switch_interval
     return IndiscriminateJammer(
-        Fs=1000,
+        Fs=fs,
         sweep_config=config["sweep"],
         comb_config=config["comb"],
         noise_source=ConstantNoise(),
         mode=mode,
     )
+
+
+def expected_comb_phases(start_sample_idx, num_samples, switch_samples):
+    return [
+        int((sample_idx // switch_samples) % 2)
+        for sample_idx in range(
+            int(start_sample_idx),
+            int(start_sample_idx) + int(num_samples),
+        )
+    ]
 
 
 def make_environment(
@@ -124,22 +134,29 @@ def make_environment(
 
 
 class IndiscriminateJammerTimingTests(unittest.TestCase):
-    def test_accepts_10ms_comb_switch_intervals(self):
+    def test_accepts_1ms_comb_switch_intervals(self):
         for interval, expected_samples in (
-            (0.01, 10),
+            (0.001, 1),
+            (0.007, 7),
             (0.05, 50),
+            (0.055, 55),
+            (0.073, 73),
             (0.15, 150),
-            (0.3, 300),
         ):
             with self.subTest(interval=interval):
                 jammer = make_jammer("comb", switch_interval=interval)
                 self.assertEqual(expected_samples, jammer.comb_switch_samples)
                 self.assertEqual(2 * expected_samples, jammer.comb_period_samples)
 
+    def test_73ms_interval_is_exact_at_production_sample_rate(self):
+        jammer = make_jammer("comb", switch_interval=0.073, fs=10_000_000)
+        self.assertEqual(730_000, jammer.comb_switch_samples)
+        self.assertEqual(1_460_000, jammer.comb_period_samples)
+
     def test_rejects_invalid_comb_switch_intervals(self):
-        for interval in (0.0, -0.01, np.nan, np.inf, 0.055):
+        for interval in (0.0, -0.001, np.nan, np.inf, 0.0005, 0.0735):
             with self.subTest(interval=interval):
-                with self.assertRaisesRegex(ValueError, "positive multiple of 0.01"):
+                with self.assertRaisesRegex(ValueError, "positive multiple of 0.001"):
                     make_jammer("comb", switch_interval=interval)
 
     def test_precomputes_only_active_natural_periods(self):
@@ -173,17 +190,23 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
                 self.assertEqual(total_period, jammer.precomputed_period_samples())
 
     def test_dynamic_generation_selects_phase_channels_from_sample_clock(self):
-        for interval, start_sample_idx in ((0.05, 0), (0.15, 100)):
+        cases = (
+            (0.001, 0, 4, [25000.0, 75000.0, 25000.0, 75000.0]),
+            (0.007, 3, 30, [25000.0, 75000.0, 25000.0, 75000.0, 25000.0]),
+            (0.05, 0, 100, [25000.0, 75000.0]),
+            (0.15, 100, 100, [25000.0, 75000.0]),
+        )
+        for interval, start_sample_idx, num_samples, expected in cases:
             with self.subTest(interval=interval):
                 jammer = make_jammer("comb", switch_interval=interval)
-                t = np.arange(100, dtype=np.float64) / jammer.Fs
+                t = np.arange(num_samples, dtype=np.float64) / jammer.Fs
                 _, frequencies = jammer.generate(
                     t,
                     Startfre=0.0,
                     Endfre=100000.0,
                     start_sample_idx=start_sample_idx,
                 )
-                self.assertEqual([25000.0, 75000.0], frequencies)
+                self.assertEqual(expected, frequencies)
 
     def test_comb_slice_hard_switches_and_wraps_multiple_times(self):
         jammer = make_jammer("comb")
@@ -207,8 +230,13 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
             for index in (0, 49, 50, 99, 100)
         ])
 
-    def test_comb_slice_switches_inside_100ms_blocks(self):
-        for interval, start_sample_idx in ((0.05, 0), (0.15, 100)):
+    def test_comb_slice_switches_at_millisecond_boundaries(self):
+        for interval, start_sample_idx in (
+            (0.001, 0),
+            (0.007, 3),
+            (0.05, 0),
+            (0.15, 100),
+        ):
             with self.subTest(interval=interval):
                 jammer = make_jammer("comb", switch_interval=interval)
                 jammer.pre_buffer_comb0 = np.zeros(
@@ -220,11 +248,13 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
                     dtype=np.float32,
                 )
                 actual = jammer.get_composite_signal(start_sample_idx, 100)
-                expected = np.concatenate(
-                    [
-                        np.zeros(50, dtype=np.float32),
-                        np.ones(50, dtype=np.float32),
-                    ]
+                expected = np.asarray(
+                    expected_comb_phases(
+                        start_sample_idx,
+                        100,
+                        jammer.comb_switch_samples,
+                    ),
+                    dtype=np.float32,
                 )
                 np.testing.assert_array_equal(expected, actual)
 
@@ -389,6 +419,17 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
 
 
 class EnvironmentJammerTimingTests(unittest.TestCase):
+    def test_environment_uses_1ms_comb_interval_quantum(self):
+        config = jammer_config("comb")
+        config["comb"]["switch_interval"] = 0.007
+        env = make_environment(use_pregen=False, config=config)
+        self.assertEqual(7, env.sweep.comb_switch_samples)
+
+        invalid_config = jammer_config("comb")
+        invalid_config["comb"]["switch_interval"] = 0.0075
+        with self.assertRaisesRegex(ValueError, "positive multiple of 0.001"):
+            make_environment(use_pregen=False, config=invalid_config)
+
     def test_equal_bandwidth_jammers_share_pool_and_selector(self):
         config = jammer_config("both")
         shared_bandwidth = 10.0
@@ -487,28 +528,12 @@ class EnvironmentJammerTimingTests(unittest.TestCase):
         self.assertEqual(first_choices, second_choices)
 
     def test_comb_phase_slots_match_for_dynamic_and_pregenerated_paths(self):
-        phase0_then_phase1 = [0] * 5 + [1] * 5
-        expected_by_interval = {
-            0.05: [phase0_then_phase1] * 10,
-            0.15: [
-                phase0_then_phase1,
-                [1] * 10,
-                [0] * 10,
-                phase0_then_phase1,
-                [1] * 10,
-                [0] * 10,
-                phase0_then_phase1,
-                [1] * 10,
-                [0] * 10,
-                phase0_then_phase1,
-            ],
-        }
         action = {
             "hoprate": 10.0,
             "offsets": np.zeros(10, dtype=np.int64),
         }
 
-        for interval, expected in expected_by_interval.items():
+        for interval in (0.007, 0.05, 0.15):
             config = jammer_config("comb")
             config["comb"]["switch_interval"] = interval
             for use_pregen in (False, True):
@@ -524,6 +549,15 @@ class EnvironmentJammerTimingTests(unittest.TestCase):
                     self.assertEqual([], reset_info["comb_phases"])
                     self.assertEqual(100, env.jammer_ptr)
                     _, _, _, _, info = env.step(action)
+                    expected = [
+                        expected_comb_phases(
+                            100 + block_idx * 100,
+                            100,
+                            env.sweep.comb_switch_samples,
+                        )
+                        for block_idx in range(10)
+                    ]
+                    self.assertEqual((10, 100), np.asarray(info["comb_phases"]).shape)
                     self.assertEqual(expected, info["comb_phases"])
                     self.assertEqual(1200, env.jammer_ptr)
 

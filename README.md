@@ -346,7 +346,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `mode`：`sweep`、`comb` 或 `both`。
 - `baseband_variant_count`：预生成干扰使用的独立带限噪声基带数量，必须为正整数，默认 4；相同带宽的 reactive / sweep / comb 共享同一波形池。
 - `sweep`：扫频干扰的步进、功率、驻留时间、噪声带宽。预生成路径为每个基带变体缓存一轮自然扫频周期；每轮周期随机有放回选择一个变体。默认 20 个频点 × 4 ms，即 80 ms。
-- `comb`：梳状干扰的功率、单 tone 带宽、相位切换周期 `switch_interval`，以及两组交替的干扰信道序号 `channels_phase0` / `channels_phase1`（默认为偶数/奇数各 8 个 50 kHz 对齐信道）。一个基带变体连续贯穿 phase 0 和 phase 1，并在下一个完整周期重新随机选择。`switch_interval` 使用秒，必须是有限正数且为 10 ms 的整数倍；默认 0.05 秒。相位按连续 RF 时钟切换，因此可以在一个 100 ms block 内发生切换。信道序号必须是 `[0, num_channels-1]` 范围内的整数，否则环境启动时直接报 `ValueError`；两组长度可以不同、允许重叠。修改后同样需重新生成离线 replay 数据。
+- `comb`：梳状干扰的功率、单 tone 带宽、相位切换周期 `switch_interval`，以及两组交替的干扰信道序号 `channels_phase0` / `channels_phase1`（默认为偶数/奇数各 8 个 50 kHz 对齐信道）。一个基带变体连续贯穿 phase 0 和 phase 1，并在下一个完整周期重新随机选择。`switch_interval` 使用秒，必须是有限正数且为 1 ms 的整数倍（例如 `0.001`、`0.007`、`0.073`）；默认 0.05 秒，不支持亚毫秒值。相位按连续 RF 时钟切换，因此可以在一个 100 ms block 内发生切换。信道序号必须是 `[0, num_channels-1]` 范围内的整数，否则环境启动时直接报 `ValueError`；两组长度可以不同、允许重叠。修改后同样需重新生成离线 replay 数据。
 - `reactive`：反应式干扰机的功率、带宽、虚警概率、检测时长等。检测逻辑基于能量检测理论，按 slot 扫描/检测/压制；每次实际压制都会随机选择一个缓存基带变体。
 
 ### `SAC_CONFIG`
@@ -405,7 +405,7 @@ reward = base_reward - ber_penalty * BER - hoprate_penalty * hoprate
 2. 训练脚本固定 hoprate。
 3. SAC actor 输入当前 observation 与 hoprate，一次前向输出 `[10, num_channels]` raw logits，并从十个条件独立的 categorical head 采样 offset。
 4. 环境一次性执行这 10 个 offset，对应 10 个 100 ms block。
-5. 环境返回下一个 observation、`info["ber_blocks"]`、`info["block_rewards"]`、`info["comb_phases"]` 及其均值 reward；`comb_phases` 的形状为 10 个 block × 10 个 10 ms 槽，每个值表示对应半开时间槽起点生效的 phase。
+5. 环境返回下一个 observation、`info["ber_blocks"]`、`info["block_rewards"]`、`info["comb_phases"]` 及其均值 reward；`comb_phases` 的形状为 10 个 block × 100 个 1 ms 槽，每个值表示对应半开时间槽起点生效的 phase。
 6. 训练脚本将整组 `actions[10]` 与 `block_rewards[10]` 写为一条 replay transition。
 
 当 SAC/MBPO 实际启用 comb 或 both 模式时，启动日志会在控制台和 `training_log.txt` 中各记录一次实际 `channels_phase0` / `channels_phase1` 配置；逐 step 日志仍不重复输出该配置。
@@ -433,7 +433,7 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - `reset_mseq_each_step=True` 的固定模板训练行为保留。
 - `use_pregen=True` 默认复用 QPSK 基带和干扰 RF 变体；每次 observation 都加入全新时域白噪声并精确重算 PSD waterfall。
 - 相同带宽的干扰共享 4 条默认基带变体和一个随机选择流。sweep 按完整扫频周期选择，comb 按 phase0+phase1 完整周期选择，reactive 按每次压制选择；随机有放回，因此相邻周期可能偶然使用同一变体。
-- comb 干扰使用两组固定 8 信道频点交替：phase 0 使用偶数信道组，phase 1 使用奇数信道组。连续 RF 时钟包含 observation 和发送 block；默认 50 ms 下首个 step 的每个 block 都在前五个 10 ms 槽使用 phase 0、后五个槽使用 phase 1，即 `[0,0,0,0,0,1,1,1,1,1]`。
+- comb 干扰使用两组固定 8 信道频点交替：phase 0 使用偶数信道组，phase 1 使用奇数信道组。连续 RF 时钟包含 observation 和发送 block；默认 50 ms 下首个 step 的每个 block 都在前 50 个 1 ms 槽使用 phase 0、后 50 个槽使用 phase 1，即 `[0] * 50 + [1] * 50`。
 - `env.reset()` 将连续 RF 时钟、comb phase、sweep 位置和干扰变体选择流重置到可复现起点；通信 AWGN/Rayleigh 随机流不会因此回退复用。
 
 如需做更严谨的通信环境对照实验，建议后续单独比较：`use_pregen=True/False`、固定/连续 m-sequence、不同 bits 随机化策略、不同 reward 权重、是否启用 Rayleigh/反应式/扫频干扰组合等。

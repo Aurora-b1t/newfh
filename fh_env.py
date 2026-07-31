@@ -593,7 +593,7 @@ class FHSSQPSKEnv(gym.Env):
                 ):
                     raise ValueError(
                         "JAMMER_CONFIG['comb']['switch_interval'] must be a finite "
-                        "positive multiple of 0.01 seconds."
+                        "positive multiple of 0.001 seconds (1 ms)."
                     )
                 require_pool(
                     comb_config['bandwidth'],
