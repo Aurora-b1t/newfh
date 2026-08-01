@@ -9,6 +9,9 @@ sequential decision interface for RL agents.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+
 import numpy as np
 import matplotlib.pyplot as plt
 from commpy.filters import rrcosfilter
@@ -62,28 +65,17 @@ def rcosdesign_srv(rolloff, span, sps):
     return rrc_filter
 
 
-def compute_psd_waterfall(signal, fs, f_start, f_end,
-                          dt=0.001,      # 1 ms time resolution
-                          df=10000.0,    # 10 kHz frequency resolution
-                          max_duration=0.1,  # analyze first 100 ms
-                          window='hann',
-                          plot=False,
-                          plot_title=""):
-    """
-    Optimized Compute PSD waterfall.
-    """
-    # ---- trim to first max_duration seconds ----
-    if max_duration is not None and max_duration > 0:
-        max_samples = int(max_duration * fs)
-        signal = signal[:max_samples]
-
+@lru_cache(maxsize=32)
+def _get_psd_plan(fs, f_start, f_end, dt, df, window):
+    """Return immutable FFT/window/bin geometry shared by PSD calls."""
+    fs = float(fs)
+    f_start = float(f_start)
+    f_end = float(f_end)
+    dt = float(dt)
+    df = float(df)
     Nwin = int(dt * fs)
     if Nwin <= 0:
         raise ValueError("Nwin must be positive. Check dt and fs.")
-    if len(signal) < Nwin:
-        return np.zeros((0, max(1, int(np.floor((f_end - f_start) / df)))) )
-
-    step = Nwin
 
     if window == 'hann':
         win = np.hanning(Nwin)
@@ -91,55 +83,72 @@ def compute_psd_waterfall(signal, fs, f_start, f_end,
         win = np.hamming(Nwin)
     else:
         win = np.ones(Nwin)
-        
-    win_sq_sum = np.sum(win ** 2)
+    win = np.asarray(win, dtype=np.float64)
 
     Nfft = int(2 ** np.ceil(np.log2(Nwin)))
     freqs = np.fft.rfftfreq(Nfft, d=1.0 / fs)
-
-    n_bins = int(np.floor((f_end - f_start) / df))
-    n_bins = max(1, n_bins)
+    n_bins = max(1, int(np.floor((f_end - f_start) / df)))
     f_bin_edges = f_start + np.arange(n_bins + 1) * df
-
-    # Vectorized bin search
-    # Find insertion points of edges in freqs
-    # freqs is sorted.
     edge_indices = np.searchsorted(freqs, f_bin_edges)
-    
-    valid_bins = []
-    for k in range(n_bins):
-        start_idx = edge_indices[k]
-        end_idx = edge_indices[k+1]
-        if end_idx > start_idx:
-            valid_bins.append((k, start_idx, end_idx))
+    starts = edge_indices[:-1].astype(np.intp, copy=False)
+    ends = edge_indices[1:].astype(np.intp, copy=False)
+    valid_bins = np.flatnonzero(ends > starts).astype(np.intp, copy=False)
+    norm_factor = 1.0 / (fs * np.sum(win ** 2) / Nwin)
 
-    waterfall = []
-    num_frames = (len(signal) - Nwin) // step + 1
-    
-    # Pre-calculate constants
-    norm_factor = 1.0 / (fs * win_sq_sum / Nwin)
+    for array in (win, freqs, starts, ends, valid_bins):
+        array.setflags(write=False)
+    return Nwin, Nfft, n_bins, win, freqs, starts, ends, valid_bins, norm_factor
 
-    for i in range(num_frames):
-        start = i * step
-        frame = signal[start:start + Nwin]
-        if len(frame) < Nwin:
-            break
 
-        frame_win = frame * win
-        spec = np.fft.rfft(frame_win, n=Nfft)
-        # Compute PSD directly
-        psd = (np.abs(spec) ** 2) * norm_factor
+def compute_psd_waterfall(signal, fs, f_start, f_end,
+                          dt=0.001,      # 1 ms time resolution
+                          df=10000.0,    # 10 kHz frequency resolution
+                          max_duration=0.1,  # analyze first 100 ms
+                          window='hann',
+                          plot=False,
+                          plot_title=""):
+    """Compute the unchanged PSD representation with one batched FFT."""
+    if max_duration is not None and max_duration > 0:
+        max_samples = int(max_duration * fs)
+        signal = signal[:max_samples]
 
-        band_powers = np.zeros(n_bins)
-        
-        # Optimize loop using slicing
-        for k, s_idx, e_idx in valid_bins:
-            # sum is much faster on slice than np.where
-            band_powers[k] = np.sum(psd[s_idx:e_idx])
+    (
+        Nwin,
+        Nfft,
+        n_bins,
+        win,
+        _freqs,
+        starts,
+        ends,
+        valid_bins,
+        norm_factor,
+    ) = _get_psd_plan(fs, f_start, f_end, dt, df, window)
 
-        waterfall.append(band_powers)
+    if len(signal) < Nwin:
+        return np.zeros((0, n_bins))
 
-    waterfall = np.array(waterfall)  # [time, freq_bin]
+    num_frames = len(signal) // Nwin
+    frame_samples = np.asarray(signal[:num_frames * Nwin])
+    frames = frame_samples.reshape(num_frames, Nwin)
+    spec = np.fft.rfft(frames * win[np.newaxis, :], n=Nfft, axis=1)
+    psd = np.square(spec.real)
+    psd += np.square(spec.imag)
+    psd *= norm_factor
+
+    waterfall = np.zeros((num_frames, n_bins), dtype=np.float64)
+    if valid_bins.size:
+        prefix = np.cumsum(psd, axis=1)
+        valid_starts = starts[valid_bins]
+        valid_ends = ends[valid_bins]
+        band_powers = prefix[:, valid_ends - 1].copy()
+        nonzero_start = valid_starts > 0
+        if np.any(nonzero_start):
+            band_powers[:, nonzero_start] -= prefix[
+                :,
+                valid_starts[nonzero_start] - 1,
+            ]
+        waterfall[:, valid_bins] = band_powers
+
     eps = 1e-12
     waterfall_db = 10 * np.log10(waterfall + eps)
 
@@ -149,7 +158,9 @@ def compute_psd_waterfall(signal, fs, f_start, f_end,
         plt.colorbar(label='PSD (dB)')
         plt.xlabel('Time bin')
         plt.ylabel('Freq bin')
-        title_str = 'PSD Waterfall ({:.0f} ms)'.format(max_duration * 1e3)
+        title_str = plot_title or 'PSD Waterfall ({:.0f} ms)'.format(
+            max_duration * 1e3
+        )
         plt.title(title_str)
         plt.tight_layout()
         plt.show()
@@ -176,6 +187,20 @@ def save_waterfall_figure(waterfall_db, path, title=""):
     plt.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def show_waterfall_figure(waterfall_db, title=""):
+    """Render an already-computed waterfall on the main thread."""
+    waterfall_db = np.asarray(waterfall_db)
+    plt.figure(figsize=(8, 4))
+    plt.imshow(waterfall_db.T, origin="lower", aspect="auto", cmap="jet")
+    plt.colorbar(label='PSD (dB)')
+    plt.xlabel('Time bin')
+    plt.ylabel('Freq bin')
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
 
 # -----------------------------
@@ -221,16 +246,23 @@ class PreGeneratedData:
         self.common_I, self.common_Q = env.modem.pulse_shape(self.common_bits)
         self.common_I = self.common_I.astype(dtype)
         self.common_Q = self.common_Q.astype(dtype)
+        self.common_baseband = (
+            self.common_I.astype(np.complex64)
+            + 1j * self.common_Q.astype(np.complex64)
+        ).astype(np.complex64, copy=False)
         self.block_len = len(self.common_I)
         print(f"Reusable QPSK block length: {self.block_len}")
         print("Pre-generation complete.")
 
-    def get_block(self, hop_seq):
+    def get_block(self, hop_seq, rng=None, rayleigh_rng=None):
         """Assemble one block from reusable I/Q and fresh channel randomness."""
         rx_assembled, carrier_assembled = self.env._assemble_signal_block(
             self.common_I,
             self.common_Q,
             hop_seq,
+            rng=rng,
+            rayleigh_rng=rayleigh_rng,
+            baseband=self.common_baseband,
         )
         return rx_assembled, carrier_assembled, self.common_bits
 
@@ -246,8 +278,9 @@ class QPSKModem:
         self.Nh = Nh
         self.LBF = rcosdesign_srv(0.5, 16, Ns)
 
-    def generate_bits(self, Bitrate):
-        return np.random.binomial(n=1, p=0.5, size=Bitrate)
+    def generate_bits(self, Bitrate, rng=None):
+        rng = np.random if rng is None else rng
+        return rng.binomial(n=1, p=0.5, size=Bitrate)
 
     def pulse_shape(self, bits):
         bits = np.asarray(bits).astype(np.int8)
@@ -301,11 +334,21 @@ class FHSSChannel:
         carrier_complex = np.exp(1j * phase)
         return carrier_complex
 
-    def transmit(self, I_pulse, Q_pulse, carrier_complex, noise_std=0.1):
+    def transmit(
+        self,
+        I_pulse,
+        Q_pulse,
+        carrier_complex,
+        noise_std=0.1,
+        rng=None,
+    ):
         # carrier_complex is exp(j*phi)
         baseband = I_pulse + 1j * Q_pulse
         rf_complex = baseband * carrier_complex
-        noise = noise_std * np.random.randn(len(rf_complex))
+        if rng is None:
+            noise = noise_std * np.random.randn(len(rf_complex))
+        else:
+            noise = noise_std * rng.standard_normal(len(rf_complex))
         return rf_complex, noise
 
 
@@ -352,6 +395,7 @@ class QPSKReceiver:
 # -----------------------------
 class FHSSQPSKEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
+    AUTO_THREAD_MIN_BLOCK_SAMPLES = 100_000
 
     def __init__(self,
                  Startfre=3e6,
@@ -385,7 +429,8 @@ class FHSSQPSKEnv(gym.Env):
                  reset_mseq_each_step=True,
                  use_pregen=True,
                  noise_std=0.1,
-                 signal_power=0.0025):
+                 signal_power=0.0025,
+                 block_workers=None):
         super().__init__()
 
         self.Startfre = float(Startfre)
@@ -401,6 +446,24 @@ class FHSSQPSKEnv(gym.Env):
         self.num_channels = int(round((self.Endfre - self.Startfre) / self.Sub_interval))
         self.num_channels = max(1, self.num_channels)
         self.num_blocks = NUM_BLOCKS
+        self._num_syms_block = int(round(self.Baud * 0.1))
+        self._block_len = self._num_syms_block * self.Ns
+
+        self._block_workers_requested = block_workers
+        self.block_workers = self._resolve_block_workers(block_workers)
+        self._executor = None
+
+        self._carrier_templates = None
+        self._carrier_template_key = None
+        self._carrier_template_fallback_key = None
+
+        # Draw one environment-local master stream from NumPy's seeded global
+        # stream.  Only the main thread advances it; workers receive integer
+        # seeds and never touch shared random state.
+        self._random_seed = int(
+            np.random.randint(0, np.iinfo(np.int32).max)
+        )
+        self._rng = np.random.RandomState(self._random_seed)
 
         self.hoprate_min = float(hoprate_min)
         self.hoprate_max = float(hoprate_max) if hoprate_max is not None else float(Baud)
@@ -532,6 +595,80 @@ class FHSSQPSKEnv(gym.Env):
 
         self._apply_hoprate(self.base_hoprate)
 
+    def _resolve_block_workers(self, block_workers):
+        if block_workers is None:
+            if (
+                self.num_blocks < 2
+                or self._block_len < self.AUTO_THREAD_MIN_BLOCK_SAMPLES
+            ):
+                return 1
+            return max(1, min(10, os.cpu_count() or 1, self.num_blocks))
+        if (
+            isinstance(block_workers, bool)
+            or not isinstance(block_workers, (int, np.integer))
+            or int(block_workers) <= 0
+        ):
+            raise ValueError("block_workers must be None or a positive integer.")
+        return int(block_workers)
+
+    def _get_executor(self):
+        if self.block_workers <= 1:
+            return None
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.block_workers,
+                thread_name_prefix="fhss-block",
+            )
+        return self._executor
+
+    def close(self):
+        """Idempotently release the lazily-created block worker pool."""
+        executor = getattr(self, "_executor", None)
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        super().close()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_executor"] = None
+        # Carrier templates are a rebuildable runtime cache and can be large,
+        # so omit them from serialized environments.
+        state["_carrier_templates"] = None
+        state["_carrier_template_key"] = None
+        state["_carrier_template_fallback_key"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._executor = None
+        self._carrier_templates = None
+        self._carrier_template_key = None
+        self._carrier_template_fallback_key = None
+        if not hasattr(self, "_block_workers_requested"):
+            self._block_workers_requested = 1
+        self.block_workers = self._resolve_block_workers(
+            self._block_workers_requested
+        )
+        if not hasattr(self, "_rng"):
+            self._random_seed = int(
+                np.random.randint(0, np.iinfo(np.int32).max)
+            )
+            self._rng = np.random.RandomState(self._random_seed)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _draw_substream_seeds(self, shape):
+        return self._rng.randint(
+            0,
+            np.iinfo(np.int32).max,
+            size=shape,
+        )
+
     def _build_jammer_variant_resources(self, jammer_config):
         requirements = {}
 
@@ -661,7 +798,13 @@ class FHSSQPSKEnv(gym.Env):
         os.makedirs(self._fig_save_dir, exist_ok=True)
 
     def seed(self, seed=None):
+        if seed is None:
+            seed = int(np.random.randint(0, np.iinfo(np.int32).max))
+        seed = int(seed)
         np.random.seed(seed)
+        self._random_seed = seed
+        self._rng = np.random.RandomState(seed)
+        return [seed]
 
     def _apply_hoprate(self, hoprate_target):
         hoprate_clip = float(np.clip(hoprate_target, self.hoprate_min, self.hoprate_max))
@@ -682,27 +825,113 @@ class FHSSQPSKEnv(gym.Env):
             "Nh_used": Nh
         }
 
-    def _generate_rayleigh(self, length):
+    def _generate_rayleigh(self, length, rng=None):
         if (not self.enable_rayleigh) or length <= 0:
             return None
         coh = max(1, int(self.rayleigh_coherence))
         num_seg = int(np.ceil(length / coh))
-        mags = np.random.rayleigh(scale=np.sqrt(2) / 2, size=num_seg)
+        rng = np.random if rng is None else rng
+        mags = rng.rayleigh(scale=np.sqrt(2) / 2, size=num_seg)
         mag_seq = np.repeat(mags, coh)[:length]
         return mag_seq
 
-    def _assemble_signal_block(self, I_pulse, Q_pulse, hop_seq):
+    def _hop_segment_lengths(self, length, n_hops):
+        if length <= 0 or n_hops <= 0:
+            return []
+        segments = []
+        s_per_hop_float = self.Fs / float(self.current_hoprate)
+        pos = 0
+        for hop_idx in range(n_hops):
+            if hop_idx == n_hops - 1:
+                next_pos = length
+            else:
+                next_pos = int(round((hop_idx + 1) * s_per_hop_float))
+                next_pos = min(length, max(pos + 1, next_pos))
+            if next_pos > pos:
+                segments.append(next_pos - pos)
+            pos = next_pos
+            if pos >= length:
+                break
+        return segments
+
+    def _ensure_carrier_templates(self, max_hop_length):
+        """Cache per-channel complex64 carriers for the current hop size."""
+        max_hop_length = int(max_hop_length)
+        key = (
+            max_hop_length,
+            self.Fs,
+            self.Startfre,
+            self.Sub_interval,
+            self.num_channels,
+        )
+        if key == self._carrier_template_key:
+            return self._carrier_templates
+        if key == self._carrier_template_fallback_key:
+            return None
+
+        self._carrier_templates = None
+        self._carrier_template_key = None
+        self._carrier_template_fallback_key = None
+        if max_hop_length <= 0:
+            self._carrier_template_fallback_key = key
+            return None
+
+        try:
+            templates = np.empty(
+                (self.num_channels, max_hop_length),
+                dtype=np.complex64,
+            )
+            sample_idx = np.arange(
+                1,
+                max_hop_length + 1,
+                dtype=np.float64,
+            )
+            phase_k = 2.0 * np.pi / self.Fs
+            for channel_idx in range(self.num_channels):
+                f_c = (
+                    self.Startfre
+                    + channel_idx * self.Sub_interval
+                    + 0.5 * self.Sub_interval
+                )
+                templates[channel_idx] = np.exp(
+                    1j * (phase_k * f_c) * sample_idx
+                ).astype(np.complex64)
+        except MemoryError:
+            self._carrier_template_fallback_key = key
+            return None
+
+        templates.setflags(write=False)
+        self._carrier_templates = templates
+        self._carrier_template_key = key
+        return templates
+
+    def _assemble_signal_block(
+        self,
+        I_pulse,
+        Q_pulse,
+        hop_seq,
+        rng=None,
+        rayleigh_rng=None,
+        baseband=None,
+    ):
         """Apply fresh per-block AWGN and fresh per-hop Rayleigh fading."""
         I_pulse = np.asarray(I_pulse, dtype=np.float32)
         Q_pulse = np.asarray(Q_pulse, dtype=np.float32)
         if I_pulse.shape != Q_pulse.shape:
             raise ValueError("I_pulse and Q_pulse must have matching shapes.")
 
-        baseband = (I_pulse + 1j * Q_pulse).astype(np.complex64)
+        if baseband is None:
+            baseband = (I_pulse + 1j * Q_pulse).astype(np.complex64)
+        else:
+            baseband = np.asarray(baseband, dtype=np.complex64)
+            if baseband.shape != I_pulse.shape:
+                raise ValueError("Cached baseband shape does not match I/Q pulses.")
         N = len(baseband)
-        noise = (
-            self.noise_std * np.random.randn(N)
-        ).astype(np.float32)
+        if rng is None:
+            noise_samples = np.random.randn(N)
+        else:
+            noise_samples = rng.standard_normal(N)
+        noise = (self.noise_std * noise_samples).astype(np.float32)
         rx_assembled = np.empty(N, dtype=np.float32)
         carrier_assembled = np.empty(N, dtype=np.complex64)
 
@@ -714,43 +943,55 @@ class FHSSQPSKEnv(gym.Env):
             carrier_assembled[:] = 0.0
             return rx_assembled, carrier_assembled
 
-        s_per_hop_float = self.Fs / float(self.current_hoprate)
+        segment_lengths = self._hop_segment_lengths(N, n_hops)
+        max_hop_length = max(segment_lengths, default=0)
+        carrier_templates = self._ensure_carrier_templates(max_hop_length)
         two_pi_over_Fs = 2.0 * np.pi / self.Fs
         pos = 0
         cumsum_end = 0.0
 
-        for hop_idx in range(n_hops):
-            if hop_idx == n_hops - 1:
-                next_pos = N
-            else:
-                next_pos = int(round((hop_idx + 1) * s_per_hop_float))
-                next_pos = min(N, max(pos + 1, next_pos))
-            length = next_pos - pos
-            if length <= 0:
-                continue
-
+        for hop_idx, length in enumerate(segment_lengths):
+            next_pos = pos + length
             ch_idx = int(hop_seq[hop_idx]) % self.num_channels
             f_c = (
                 self.Startfre
                 + ch_idx * self.Sub_interval
                 + 0.5 * self.Sub_interval
             )
-            t_local = np.arange(1, length + 1, dtype=np.float64)
-            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
-            carrier_hop = np.exp(1j * phase).astype(np.complex64)
+            if carrier_templates is None:
+                t_local = np.arange(1, length + 1, dtype=np.float64)
+                phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
+                carrier_hop = np.exp(1j * phase).astype(np.complex64)
+            elif cumsum_end == 0.0:
+                carrier_hop = carrier_templates[ch_idx, :length]
+            else:
+                phase_start = np.exp(1j * two_pi_over_Fs * cumsum_end)
+                carrier_hop = (
+                    carrier_templates[ch_idx, :length]
+                    * np.complex64(phase_start)
+                )
             cumsum_end += f_c * length
 
-            rayleigh_mag = self._generate_rayleigh(length)
+            effective_rayleigh_rng = (
+                rayleigh_rng if rayleigh_rng is not None else rng
+            )
+            if effective_rayleigh_rng is None:
+                rayleigh_mag = self._generate_rayleigh(length)
+            else:
+                rayleigh_mag = self._generate_rayleigh(
+                    length,
+                    rng=effective_rayleigh_rng,
+                )
             if rayleigh_mag is None:
-                rayleigh_mag = np.ones(length, dtype=np.float32)
+                modulated = np.real(
+                    baseband[pos:next_pos] * carrier_hop
+                )
             else:
                 rayleigh_mag = np.asarray(rayleigh_mag, dtype=np.float32)
-
-            faded_baseband = (
-                baseband[pos:next_pos] * rayleigh_mag.astype(np.complex64)
-            )
+                faded_baseband = baseband[pos:next_pos] * rayleigh_mag
+                modulated = np.real(faded_baseband * carrier_hop)
             rx_assembled[pos:next_pos] = (
-                np.real(faded_baseband * carrier_hop) + noise[pos:next_pos]
+                modulated + noise[pos:next_pos]
             )
             carrier_assembled[pos:next_pos] = carrier_hop
             pos = next_pos
@@ -762,7 +1003,7 @@ class FHSSQPSKEnv(gym.Env):
             carrier_assembled[pos:] = 0.0
         return rx_assembled, carrier_assembled
 
-    def _observe_100ms(self, block_id=None):
+    def _observe_100ms(self, block_id=None, rng=None, jammer_rng=None):
         N_obs = int(0.1 * self.Fs)
         sweep_jam = np.zeros(N_obs, dtype=np.float32)
         if self.enable_sweep and self.sweep is not None:
@@ -772,18 +1013,23 @@ class FHSSQPSKEnv(gym.Env):
                     N_obs,
                 )
             else:
-                t_obs = np.arange(N_obs) / self.Fs
-                sweep_jam, _ = self.sweep.generate(
-                    t_obs,
+                effective_jammer_rng = (
+                    jammer_rng if jammer_rng is not None else rng
+                )
+                sweep_jam, _ = self.sweep.generate_samples(
+                    N_obs,
                     self.Startfre,
                     self.Endfre,
                     start_sample_idx=self.jammer_ptr,
+                    rng=effective_jammer_rng,
                 )
             self.jammer_ptr += N_obs
 
-        noise = (
-            self.noise_std * np.random.randn(N_obs)
-        ).astype(np.float32)
+        if rng is None:
+            noise_samples = np.random.randn(N_obs)
+        else:
+            noise_samples = rng.standard_normal(N_obs)
+        noise = (self.noise_std * noise_samples).astype(np.float32)
         obs_signal = sweep_jam + noise
 
         plot_title = ""
@@ -804,6 +1050,77 @@ class FHSSQPSKEnv(gym.Env):
         )
         return waterfall_db
 
+    def _process_block_task(self, task):
+        """Run the stateless, CPU-heavy part of one ordered block task."""
+        bits_rng = np.random.RandomState(int(task["bits_seed"]))
+        noise_rng = np.random.RandomState(int(task["noise_seed"]))
+        rayleigh_rng = np.random.RandomState(int(task["rayleigh_seed"]))
+        jammer_rng = np.random.RandomState(int(task["jammer_seed"]))
+        hop_seq = task["hop_seq"]
+
+        if task["use_pre"]:
+            rx_static, carrier_complex, bits_block = self.pregen_data.get_block(
+                hop_seq,
+                rng=noise_rng,
+                rayleigh_rng=rayleigh_rng,
+            )
+        else:
+            bits_block = self.modem.generate_bits(
+                2 * self._num_syms_block,
+                rng=bits_rng,
+            )
+            I_pulse, Q_pulse = self.modem.pulse_shape(bits_block)
+            rx_static, carrier_complex = self._assemble_signal_block(
+                I_pulse,
+                Q_pulse,
+                hop_seq,
+                rng=noise_rng,
+                rayleigh_rng=rayleigh_rng,
+            )
+
+        rx_real = rx_static
+        if task["dynamic_sweep"]:
+            sweep_jam, _ = self.sweep.generate_samples(
+                len(rx_real),
+                self.Startfre,
+                self.Endfre,
+                start_sample_idx=task["jammer_start"],
+                rng=jammer_rng,
+            )
+            rx_real += sweep_jam
+        elif task["sweep_jam"] is not None:
+            rx_real += task["sweep_jam"]
+
+        reactive_jam = task["reactive_jam"]
+        if reactive_jam is not None:
+            rx_real += reactive_jam
+
+        _, ber = self.receiver.demodulate(
+            rx_real,
+            bits_block,
+            carrier_complex,
+        )
+
+        waterfall_db = None
+        if task["compute_waterfall"]:
+            waterfall_db = compute_psd_waterfall(
+                rx_real,
+                fs=self.Fs,
+                f_start=self.Startfre,
+                f_end=self.Endfre,
+                dt=self.dt,
+                df=self.df,
+                max_duration=0.1,
+                plot=False,
+            )
+        return float(ber), waterfall_db
+
+    def _run_block_tasks(self, tasks):
+        if self.block_workers <= 1:
+            return [self._process_block_task(task) for task in tasks]
+        executor = self._get_executor()
+        return list(executor.map(self._process_block_task, tasks))
+
     def _get_block_hopseq(self, hops_per_block, offset):
         if hops_per_block <= 0:
             return np.array([], dtype=int)
@@ -820,7 +1137,10 @@ class FHSSQPSKEnv(gym.Env):
         hop_seq = (base + off_int) % self.num_channels
         return hop_seq
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+        super().reset(seed=seed)
         self.current_step = 0
         self.jammer_ptr = 0 # Reset jammer pointer
         _ = self._apply_hoprate(self.base_hoprate)
@@ -835,7 +1155,12 @@ class FHSSQPSKEnv(gym.Env):
         if self.enable_reactive and self.reactive is not None:
             self.reactive.reset()
 
-        obs = self._observe_100ms(block_id=0)
+        obs_seeds = self._draw_substream_seeds(2)
+        obs = self._observe_100ms(
+            block_id=0,
+            rng=np.random.RandomState(int(obs_seeds[0])),
+            jammer_rng=np.random.RandomState(int(obs_seeds[1])),
+        )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=obs.shape, dtype=np.float32
         )
@@ -888,7 +1213,6 @@ class FHSSQPSKEnv(gym.Env):
         hops_per_block = int(round(self.current_hoprate * 0.1))
         hops_per_block = max(1, hops_per_block)
 
-        ber_blocks = []
         reactive_active_blocks = []
         hop_sequences = []
         comb_phases = []
@@ -914,7 +1238,30 @@ class FHSSQPSKEnv(gym.Env):
             (self.current_step + 1) in self._fig_save_steps
             and self._fig_save_dir is not None
         )
+        compute_block_waterfalls = capture_figures or self.debug_plot_psd
+        use_pre = self.use_pregen and self.pregen_data is not None
+        block_len = (
+            self.pregen_data.block_len if use_pre else self._block_len
+        )
 
+        segment_lengths = self._hop_segment_lengths(
+            block_len,
+            hops_per_block,
+        )
+        self._ensure_carrier_templates(max(segment_lengths, default=0))
+        if (
+            not use_pre
+            and self.enable_sweep
+            and self.sweep is not None
+        ):
+            # Avoid a lazy-cache race when the first step starts all workers.
+            self.sweep._ensure_carrier_cache(self.Startfre, self.Endfre)
+
+        block_seeds = self._draw_substream_seeds((self.num_blocks, 5))
+        obs_seeds = self._draw_substream_seeds(2)
+        tasks = []
+
+        # Advance every stateful timeline on the main thread in block order.
         for b in range(self.num_blocks):
             if comb_active:
                 comb_phases.append([
@@ -930,133 +1277,84 @@ class FHSSQPSKEnv(gym.Env):
             hop_seq_block = self._get_block_hopseq(hops_per_block, offsets_action[b])
             self._mseq_ptr = (self._mseq_ptr + len(hop_seq_block)) % len(self.mseq_channels)
             hop_sequences.append(hop_seq_block.astype(int).tolist())
-            
-            # ----------------------------------------------------------------
-            # 1. Obtain Baseband / Noise / Interference
-            # ----------------------------------------------------------------
-            use_pre = (self.use_pregen and self.pregen_data is not None)
-            
-            if use_pre:
-                # NEW OPTIMIZED PATH: Assemble from Channel Pool
-                # Returns fully assembled RX signal (Baseband*Carrier*Rayleigh + Noise)
-                # But wait, we need separate components for Reactive Jammer logic?
-                # Reactive Jammer needs Pure Carrier (to sync phase) or just frequency knowledge.
-                # pregen_data.get_block returns (rx_signal_static, pure_carrier_for_rx, bits)
-                rx_static, carrier_complex, bits_block = self.pregen_data.get_block(hop_seq_block)
-
-                # t_block is needed for Reactive/Jammer
-                if b == 0:
-                     self._t_block_cache = np.arange(len(rx_static)) / self.Fs
-                t_block = self._t_block_cache
-                
-                if len(t_block) != len(rx_static): # Safety for hoprate change?
-                    t_block = np.arange(len(rx_static)) / self.Fs
-                
-                # Sweep Jammer?
-                # If using pre-gen, we assumed Sweep is baked in? 
-                # No, in new Code, PreGeneratedData does NOT bake in Sweep/Comb to the pool signal.
-                # Because Sweep/Comb evolves over time/steps.
-                # So we calculate it dynamically here.
-                # Is that slow? IndiscriminateJammer.generate() uses cos/sin.
-                # If we want to optimize that too, we should pre-gen 'comb' and 'sweep' buffers...
-                # User asked to save "Carrier time".
-                sweep_jam = np.zeros(len(rx_static))
-                if self.enable_sweep and self.sweep is not None:
-                     sweep_jam = self.sweep.get_composite_signal(
-                         self.jammer_ptr,
-                         len(rx_static),
-                     )
-                     self.jammer_ptr += len(rx_static)
-                     
-                rx_real = rx_static + sweep_jam
-                
-            else:
-                # ----------------------------------------------------------------
-                # OLD DYNAMIC PATH
-                # ----------------------------------------------------------------
-                num_syms_block = int(round(self.Baud * 0.1))
-                bits_block = self.modem.generate_bits(2 * num_syms_block)
-                I_pulse, Q_pulse = self.modem.pulse_shape(bits_block)
-
-                t_block = np.arange(len(I_pulse)) / self.Fs
-                rx_static, carrier_complex = self._assemble_signal_block(
-                    I_pulse,
-                    Q_pulse,
-                    hop_seq_block,
-                )
-                    
-                sweep_jam = np.zeros(len(I_pulse))
-                if self.enable_sweep and self.sweep is not None:
-                    sweep_jam, _ = self.sweep.generate(
-                        t_block,
-                        self.Startfre,
-                        self.Endfre,
-                        start_sample_idx=self.jammer_ptr,
+            jammer_start = self.jammer_ptr
+            sweep_jam = None
+            dynamic_sweep = False
+            if self.enable_sweep and self.sweep is not None:
+                if use_pre:
+                    sweep_jam = self.sweep.get_composite_signal(
+                        jammer_start,
+                        block_len,
                     )
-                    self.jammer_ptr += len(I_pulse)
-                
-                rx_real = rx_static + sweep_jam
+                else:
+                    dynamic_sweep = True
+                self.jammer_ptr += block_len
 
-            # ----------------------------------------------------------------
-            # 4. Reactive Jammer (Dynamic) - Independent of path
-            # ----------------------------------------------------------------
-            reactive_jam = np.zeros(len(rx_real))
+            reactive_jam = None
             reactive_active = False
             if self.enable_reactive and self.reactive is not None:
-                reactive_jam, reactive_active = self.reactive.generate(
-                    t_block, hop_seq_block, self.Startfre, self.Sub_interval, self.current_hoprate
+                reactive_rng = np.random.RandomState(
+                    int(block_seeds[b, 4])
                 )
-            
-            # Final RX mixing
-            rx_real += reactive_jam
+                reactive_jam, reactive_active = self.reactive.generate_samples(
+                    block_len,
+                    hop_seq_block,
+                    self.Startfre,
+                    self.Sub_interval,
+                    self.current_hoprate,
+                    rng=reactive_rng,
+                )
+            reactive_active_blocks.append(bool(reactive_active))
 
-            # Step-triggered per-block PSD figure capture
+            tasks.append({
+                "block_idx": b,
+                "hop_seq": hop_seq_block,
+                "use_pre": use_pre,
+                "sweep_jam": sweep_jam,
+                "dynamic_sweep": dynamic_sweep,
+                "jammer_start": jammer_start,
+                "reactive_jam": reactive_jam,
+                "bits_seed": block_seeds[b, 0],
+                "noise_seed": block_seeds[b, 1],
+                "rayleigh_seed": block_seeds[b, 2],
+                "jammer_seed": block_seeds[b, 3],
+                "compute_waterfall": compute_block_waterfalls,
+            })
+
+        block_results = self._run_block_tasks(tasks)
+        ber_blocks = [result[0] for result in block_results]
+
+        # Matplotlib is intentionally kept on the main thread.  Workers only
+        # return numerical waterfall arrays when capture/debug is enabled.
+        for b, (_, waterfall_db) in enumerate(block_results):
             if capture_figures:
-                wf_db = compute_psd_waterfall(
-                    rx_real,
-                    fs=self.Fs,
-                    f_start=self.Startfre,
-                    f_end=self.Endfre,
-                    dt=self.dt,
-                    df=self.df,
-                    max_duration=0.1,
-                    plot=False,
+                fig_name = (
+                    f"step_{self.current_step + 1:03d}_block_{b + 1:02d}.png"
                 )
-                fig_name = f"step_{self.current_step + 1:03d}_block_{b + 1:02d}.png"
                 save_waterfall_figure(
-                    wf_db,
+                    waterfall_db,
                     os.path.join(self._fig_save_dir, fig_name),
                     title=f"Step {self.current_step + 1} - Block {b + 1} PSD (100 ms)",
                 )
-
-            # ----------------------------------------------------------------
-            # 5. Receive
-            # ----------------------------------------------------------------
-            # RX = (Signal * Rayleigh) + Reactive + Sweep + Noise
-
-            _, ber = self.receiver.demodulate(rx_real, bits_block, carrier_complex)
-            ber_blocks.append(float(ber))
-            reactive_active_blocks.append(bool(reactive_active))
-
             if self.debug_plot_psd:
-                compute_psd_waterfall(
-                    rx_real,
-                    fs=self.Fs,
-                    f_start=self.Startfre,
-                    f_end=self.Endfre,
-                    dt=self.dt,
-                    df=self.df,
-                    max_duration=0.1,
-                    plot=True,
-                    plot_title=f"Step {self.current_step} - Block {b+1}"
+                show_waterfall_figure(
+                    waterfall_db,
+                    title=f"Step {self.current_step} - Block {b + 1}",
                 )
             if self.debug_log_hops:
-                print(f"Block {b+1}: Hop Seq (with offset) = {hop_seq_block.tolist()}")
+                print(
+                    f"Block {b + 1}: Hop Seq (with offset) = "
+                    f"{tasks[b]['hop_seq'].tolist()}"
+                )
 
         
         self.current_step += 1
         
-        obs = self._observe_100ms(block_id=0)
+        obs = self._observe_100ms(
+            block_id=0,
+            rng=np.random.RandomState(int(obs_seeds[0])),
+            jammer_rng=np.random.RandomState(int(obs_seeds[1])),
+        )
         self.state = obs.astype(np.float32)
 
         if self.reset_mseq_each_step:
