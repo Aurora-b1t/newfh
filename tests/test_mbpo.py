@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import tempfile
@@ -21,6 +22,13 @@ from train_mbpo import (
     save_sac_inference_checkpoint,
     should_train_reward_model,
 )
+
+
+TEST_REWARD_CONFIG = {
+    "base_reward": 1.0,
+    "ber_penalty": 2.0,
+    "hoprate_penalty": 0.0,
+}
 
 
 def make_buffer(count=4, num_heads=3, n_actions=4, reward_value=0.0):
@@ -78,6 +86,7 @@ class StepRewardEnsembleTests(unittest.TestCase):
             elite_size=1,
             num_heads=3,
             n_actions=4,
+            reward_config=TEST_REWARD_CONFIG,
             hidden_size=16,
             device="cpu",
         )
@@ -116,7 +125,10 @@ class StepRewardEnsembleTests(unittest.TestCase):
         self.assertEqual((2, 3), sampled.shape)
         self.assertEqual((2,), diagnostics["disagreement"].shape)
         self.assertTrue(np.all(np.isfinite(means)))
-        self.assertTrue(np.all(variances > 0.0))
+        self.assertTrue(np.all((means >= 0.0) & (means <= 1.0)))
+        self.assertTrue(np.all(np.isfinite(variances)))
+        self.assertTrue(np.all(variances >= 0.0))
+        self.assertTrue(np.all((sampled >= 0.0) & (sampled <= 1.0)))
         self.assertTrue(all(epoch <= 2 for epoch in stats["epochs"]))
         self.assertEqual(1, len(stats["elite_model_idxes"]))
 
@@ -170,19 +182,27 @@ class StepRewardEnsembleTests(unittest.TestCase):
             )
         np.testing.assert_allclose(before, after, rtol=1e-6, atol=1e-6)
         self.assertEqual("test", metadata["experiment"])
+        self.assertEqual(TEST_REWARD_CONFIG, loaded.reward_config)
+        self.assertEqual(0.0, loaded.ber_min)
+        self.assertEqual(0.5, loaded.ber_max)
+        self.assertEqual(1e-4, loaded.logit_epsilon)
 
     def test_one_elite_is_used_for_each_complete_reward_vector(self):
         model = self.make_model()
         model.elite_model_idxes = [0, 1]
         model.is_fitted = True
-        means = np.stack(
+        latent_means = np.stack(
             [
-                np.full((4, 3), 1.0, dtype=np.float32),
-                np.full((4, 3), 5.0, dtype=np.float32),
+                np.full((4, 3), -2.0, dtype=np.float32),
+                np.full((4, 3), 2.0, dtype=np.float32),
             ]
         )
-        variances = np.zeros_like(means)
-        with mock.patch.object(model, "predict", return_value=(means, variances)):
+        variances = np.zeros_like(latent_means)
+        with mock.patch.object(
+            model,
+            "_predict_latent",
+            return_value=(latent_means, variances),
+        ):
             with mock.patch(
                 "r_predict_model.model.np.random.normal",
                 return_value=np.zeros((4, 3), dtype=np.float32),
@@ -193,8 +213,111 @@ class StepRewardEnsembleTests(unittest.TestCase):
         for index, selected_model in enumerate(
             diagnostics["selected_model_idxes"]
         ):
-            expected = 1.0 if selected_model == 0 else 5.0
+            latent_value = -2.0 if selected_model == 0 else 2.0
+            expected = 1.0 / (1.0 + np.exp(-latent_value))
             np.testing.assert_allclose(sampled[index], expected)
+
+    def test_extreme_latent_samples_remain_bounded(self):
+        model = self.make_model()
+        model.elite_model_idxes = [0]
+        model.is_fitted = True
+        latent_means = np.array(
+            [[[-1000.0, 0.0, 1000.0], [1000.0, -1000.0, 0.0]]],
+            dtype=np.float32,
+        )
+        latent_variances = np.full_like(latent_means, 100.0)
+        with mock.patch.object(
+            model,
+            "_predict_latent",
+            return_value=(latent_means, latent_variances),
+        ):
+            sampled, _diagnostics = model.sample_rewards(
+                self.states[:2], self.hoprates[:2], self.actions[:2]
+            )
+        self.assertTrue(np.all(np.isfinite(sampled)))
+        self.assertTrue(np.all((sampled >= 0.0) & (sampled <= 1.0)))
+
+    def test_fit_saturates_only_reward_model_targets(self):
+        model = self.make_model()
+        rewards = np.tile([-1.0, 0.5, 2.0], (len(self.states), 1)).astype(
+            np.float32
+        )
+        original_rewards = rewards.copy()
+        stats = model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            rewards,
+            batch_size=2,
+            max_epochs=1,
+            patience=0,
+        )
+        self.assertAlmostEqual(
+            2.0 / 3.0, stats["target_saturation_fraction"], places=6
+        )
+        np.testing.assert_array_equal(rewards, original_rewards)
+        predictions, _variances = model.predict(
+            self.states[:2], self.hoprates[:2], self.actions[:2]
+        )
+        self.assertTrue(np.all((predictions >= 0.0) & (predictions <= 1.0)))
+
+    def test_early_stopping_restores_model_and_optimizer_state(self):
+        model = StepRewardEnsemble(
+            network_size=1,
+            elite_size=1,
+            num_heads=3,
+            n_actions=4,
+            reward_config=TEST_REWARD_CONFIG,
+            hidden_size=16,
+            device="cpu",
+        )
+        captured = {}
+        evaluation_count = 0
+
+        def fake_evaluate(member, _dataset, _indices, _batch_size):
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count == 1:
+                return 10.0
+            if evaluation_count == 2:
+                captured["model"] = copy.deepcopy(member.state_dict())
+                captured["optimizer"] = copy.deepcopy(
+                    model.optimizers[0].state_dict()
+                )
+                return 5.0
+            if evaluation_count == 3:
+                return 6.0
+            return 5.0
+
+        with mock.patch.object(model, "_evaluate_member", side_effect=fake_evaluate):
+            model.fit(
+                self.states,
+                self.hoprates,
+                self.actions,
+                np.full_like(self.rewards, 0.5),
+                batch_size=2,
+                holdout_ratio=0.25,
+                max_epochs=2,
+                patience=1,
+                min_improvement=0.0,
+            )
+
+        restored_model = model.members[0].state_dict()
+        for key, expected in captured["model"].items():
+            torch.testing.assert_close(restored_model[key], expected)
+
+        restored_optimizer = model.optimizers[0].state_dict()
+        self.assertEqual(
+            captured["optimizer"]["param_groups"],
+            restored_optimizer["param_groups"],
+        )
+        for parameter_id, expected_state in captured["optimizer"]["state"].items():
+            actual_state = restored_optimizer["state"][parameter_id]
+            for key, expected in expected_state.items():
+                if torch.is_tensor(expected):
+                    torch.testing.assert_close(actual_state[key], expected)
+                else:
+                    self.assertEqual(actual_state[key], expected)
 
 
 class AdapterTests(unittest.TestCase):
@@ -213,28 +336,23 @@ class AdapterTests(unittest.TestCase):
         batch = sample_mixed_batch(real_buffer, model_buffer, 4, 0.2)
         self.assertEqual((4, 3), batch["block_rewards"].shape)
 
-    def test_rollout_clips_rewards_and_copies_real_successors(self):
+    def test_rollout_uses_bounded_rewards_and_copies_real_successors(self):
         real_buffer = make_buffer(count=2)
         model_buffer = ReplayBuffer(8, num_heads=3, n_actions=4)
         stats = rollout_reward_model(
-            FixedRewardModel([-10.0, 10.0, 0.0]),
+            FixedRewardModel([0.0, 1.0, 0.5]),
             FixedAgent([0, 1, 2]),
             real_buffer,
             model_buffer,
             batch_size=8,
-            reward_config={
-                "base_reward": 1.0,
-                "ber_penalty": 8.0,
-                "hoprate_penalty": 0.0,
-            },
+            reward_config=TEST_REWARD_CONFIG,
         )
         generated = model_buffer.get_all()
 
         self.assertEqual(2, stats["generated"])
-        self.assertAlmostEqual(2.0 / 3.0, stats["clipped_fraction"], places=6)
         np.testing.assert_allclose(
             generated["block_rewards"],
-            np.tile([-7.0, 1.0, 0.0], (2, 1)),
+            np.tile([0.0, 1.0, 0.5], (2, 1)),
         )
         np.testing.assert_array_equal(
             generated["actions"], np.tile([0, 1, 2], (2, 1))
@@ -246,23 +364,44 @@ class AdapterTests(unittest.TestCase):
             )
             self.assertEqual(state_id == 1, bool(generated["dones"][index]))
 
-    def test_model_replay_retains_fifo_capacity_across_rollouts(self):
+    def test_rollout_rejects_out_of_bound_rewards(self):
+        with self.assertRaisesRegex(RuntimeError, "outside its bounds"):
+            rollout_reward_model(
+                FixedRewardModel([-0.1, 1.1, 0.5]),
+                FixedAgent([0, 1, 2]),
+                make_buffer(count=2),
+                ReplayBuffer(8, num_heads=3, n_actions=4),
+                batch_size=2,
+                reward_config=TEST_REWARD_CONFIG,
+            )
+
+    def test_model_replay_can_be_cleared_before_rebuild(self):
         real_buffer = make_buffer(count=2)
         model_buffer = ReplayBuffer(2, num_heads=3, n_actions=4)
-        for _ in range(2):
-            rollout_reward_model(
-                FixedRewardModel([0.0, 0.0, 0.0]),
-                FixedAgent([0, 1, 2]),
-                real_buffer,
-                model_buffer,
-                batch_size=2,
-                reward_config={
-                    "base_reward": 1.0,
-                    "ber_penalty": 8.0,
-                    "hoprate_penalty": 0.0,
-                },
-            )
+        rollout_reward_model(
+            FixedRewardModel([0.0, 0.5, 1.0]),
+            FixedAgent([0, 1, 2]),
+            real_buffer,
+            model_buffer,
+            batch_size=2,
+            reward_config=TEST_REWARD_CONFIG,
+        )
         self.assertEqual(2, model_buffer.size())
+        model_buffer.clear()
+        self.assertEqual(0, model_buffer.size())
+        self.assertIsNone(model_buffer.observation_shape)
+        rollout_reward_model(
+            FixedRewardModel([1.0, 0.5, 0.0]),
+            FixedAgent([0, 1, 2]),
+            real_buffer,
+            model_buffer,
+            batch_size=2,
+            reward_config=TEST_REWARD_CONFIG,
+        )
+        generated = model_buffer.get_all()
+        np.testing.assert_allclose(
+            generated["block_rewards"], np.tile([1.0, 0.5, 0.0], (2, 1))
+        )
 
     def test_reward_bounds_support_penalty_signs(self):
         lower, upper = reward_bounds(
@@ -270,11 +409,45 @@ class AdapterTests(unittest.TestCase):
             {"base_reward": 1.0, "ber_penalty": -2.0, "hoprate_penalty": 0.01},
         )
         np.testing.assert_allclose(lower, [[0.0]])
-        np.testing.assert_allclose(upper, [[2.0]])
+        np.testing.assert_allclose(upper, [[1.0]])
+
+    def test_reward_bounds_use_half_ber_and_dynamic_hoprate_penalty(self):
+        lower, upper = reward_bounds(
+            [100.0, 200.0],
+            {"base_reward": 10.0, "ber_penalty": 80.0, "hoprate_penalty": 0.01},
+        )
+        np.testing.assert_allclose(lower, [[-31.0], [-32.0]])
+        np.testing.assert_allclose(upper, [[9.0], [8.0]])
+
+        default_lower, default_upper = reward_bounds(
+            [100.0],
+            {"base_reward": 10.0, "ber_penalty": 80.0, "hoprate_penalty": 0.0},
+        )
+        np.testing.assert_allclose(default_lower, [[-30.0]])
+        np.testing.assert_allclose(default_upper, [[10.0]])
+
+    def test_reward_bounds_reject_zero_ber_penalty(self):
+        with self.assertRaisesRegex(ValueError, "ber_penalty must be non-zero"):
+            reward_bounds(
+                [100.0],
+                {
+                    "base_reward": 10.0,
+                    "ber_penalty": 0.0,
+                    "hoprate_penalty": 0.0,
+                },
+            )
 
     def test_full_replay_fields_train_model(self):
         buffer = make_buffer(count=4)
-        model = StepRewardEnsemble(1, 1, 3, 4, hidden_size=8, device="cpu")
+        model = StepRewardEnsemble(
+            1,
+            1,
+            3,
+            4,
+            reward_config=TEST_REWARD_CONFIG,
+            hidden_size=8,
+            device="cpu",
+        )
         stats = train_reward_model_from_replay(
             model,
             buffer,

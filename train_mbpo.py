@@ -238,6 +238,7 @@ def train(args):
         elite_size=args.num_elites,
         num_heads=env.num_blocks,
         n_actions=n_actions,
+        reward_config=settings.REWARD_CONFIG,
         hoprate_min=env.hoprate_min,
         hoprate_max=env.hoprate_max,
         hidden_size=args.pred_hidden_size,
@@ -281,7 +282,7 @@ def train(args):
         "model_rewards": [],
         "holdout_losses": [],
         "disagreements": [],
-        "clipped_fractions": [],
+        "target_saturation_fractions": [],
     }
     last_model_stats = {}
     last_rollout_stats = {}
@@ -345,6 +346,7 @@ def train(args):
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
             )
+            model_buffer.clear()
             last_rollout_stats = rollout_reward_model(
                 reward_model,
                 agent,
@@ -357,14 +359,15 @@ def train(args):
             model_fit_time = time.time() - model_start
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
-                "rollout=%d | disagreement=%.6f(p95=%.6f) | clipped=%.2f%% | T=%.2fs",
+                "rollout=%d | disagreement=%.6f(p95=%.6f) | "
+                "target_sat=%.2f%% | T=%.2fs",
                 last_model_stats["holdout_loss_mean"],
                 last_model_stats["elite_model_idxes"],
                 last_model_stats["epochs"],
                 last_rollout_stats["generated"],
                 last_rollout_stats["disagreement_mean"],
                 last_rollout_stats["disagreement_p95"],
-                100.0 * last_rollout_stats["clipped_fraction"],
+                100.0 * last_model_stats["target_saturation_fraction"],
                 model_fit_time,
             )
 
@@ -392,8 +395,8 @@ def train(args):
         metrics["disagreements"].append(
             last_rollout_stats.get("disagreement_mean", np.nan)
         )
-        metrics["clipped_fractions"].append(
-            last_rollout_stats.get("clipped_fraction", np.nan)
+        metrics["target_saturation_fractions"].append(
+            last_model_stats.get("target_saturation_fraction", np.nan)
         )
 
         hop_sequences = info.get("hop_sequences", [])
@@ -517,9 +520,9 @@ def save_plots(output_dir, metrics, logger):
         )
         _save_curve(
             output_dir,
-            metrics["clipped_fractions"],
-            "model_clipped_fraction.png",
-            "Synthetic Reward Clipped Fraction",
+            metrics["target_saturation_fractions"],
+            "model_target_saturation_fraction.png",
+            "Reward-Model Target Saturation Fraction",
             "Fraction",
         )
         logger.info("Plots saved to %s.", output_dir)

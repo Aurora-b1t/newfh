@@ -22,6 +22,58 @@ from SAC import StateEncoder
 
 
 CHECKPOINT_FORMAT_VERSION = 1
+DEFAULT_BER_MIN = 0.0
+DEFAULT_BER_MAX = 0.5
+DEFAULT_LOGIT_EPSILON = 1e-4
+
+
+def _canonical_reward_config(reward_config):
+    required_keys = ("base_reward", "ber_penalty", "hoprate_penalty")
+    if reward_config is None or any(key not in reward_config for key in required_keys):
+        raise ValueError(
+            "reward_config must define base_reward, ber_penalty, and "
+            "hoprate_penalty."
+        )
+    config = {key: float(reward_config[key]) for key in required_keys}
+    if not np.all(np.isfinite(list(config.values()))):
+        raise ValueError("reward_config values must be finite.")
+    if config["ber_penalty"] == 0.0:
+        raise ValueError("ber_penalty must be non-zero for a bounded reward model.")
+    return config
+
+
+def reward_bounds_from_config(
+    hoprates,
+    reward_config,
+    ber_min=DEFAULT_BER_MIN,
+    ber_max=DEFAULT_BER_MAX,
+):
+    """Return reward bounds implied by BER endpoints for each hoprate."""
+    config = _canonical_reward_config(reward_config)
+    ber_min = float(ber_min)
+    ber_max = float(ber_max)
+    if not np.isfinite(ber_min) or not np.isfinite(ber_max) or ber_max <= ber_min:
+        raise ValueError("BER bounds must be finite and satisfy ber_max > ber_min.")
+    hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1, 1)
+    if not np.all(np.isfinite(hoprates)):
+        raise ValueError("Reward bounds require finite hoprates.")
+
+    base = config["base_reward"] - config["hoprate_penalty"] * hoprates
+    reward_at_ber_min = base - config["ber_penalty"] * ber_min
+    reward_at_ber_max = base - config["ber_penalty"] * ber_max
+    return (
+        np.minimum(reward_at_ber_min, reward_at_ber_max).astype(
+            np.float32, copy=False
+        ),
+        np.maximum(reward_at_ber_min, reward_at_ber_max).astype(
+            np.float32, copy=False
+        ),
+    )
+
+
+def _stable_sigmoid(values):
+    values = np.asarray(values)
+    return np.exp(-np.logaddexp(0.0, -values))
 
 
 def _init_linear(module):
@@ -62,12 +114,14 @@ class StepRewardMember(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
         )
-        self.output = nn.Linear(hidden_size, 2 * self.num_heads)
+        self.latent_mean_head = nn.Linear(hidden_size, self.num_heads)
+        self.latent_logvar_head = nn.Linear(hidden_size, self.num_heads)
         self.register_buffer("max_logvar", torch.full((1, self.num_heads), 0.5))
         self.register_buffer("min_logvar", torch.full((1, self.num_heads), -10.0))
         self.action_encoder.apply(_init_linear)
         self.fusion.apply(_init_linear)
-        self.output.apply(_init_linear)
+        self.latent_mean_head.apply(_init_linear)
+        self.latent_logvar_head.apply(_init_linear)
 
     def forward(self, images, hoprates, actions, return_logvar=False):
         if actions.ndim != 2 or actions.shape[1] != self.num_heads:
@@ -84,8 +138,8 @@ class StepRewardMember(nn.Module):
         ).to(dtype=images.dtype)
         action_features = self.action_encoder(one_hot_actions.flatten(start_dim=1))
         fused = self.fusion(torch.cat([state_features, action_features], dim=1))
-        output = self.output(fused)
-        mean, raw_logvar = torch.chunk(output, 2, dim=-1)
+        mean = self.latent_mean_head(fused)
+        raw_logvar = self.latent_logvar_head(fused)
         logvar = self.max_logvar - F.softplus(self.max_logvar - raw_logvar)
         logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
         if return_logvar:
@@ -138,8 +192,12 @@ class StepRewardEnsemble(nn.Module):
         elite_size,
         num_heads,
         n_actions,
+        reward_config,
         hoprate_min=10.0,
         hoprate_max=1000.0,
+        ber_min=DEFAULT_BER_MIN,
+        ber_max=DEFAULT_BER_MAX,
+        logit_epsilon=DEFAULT_LOGIT_EPSILON,
         hidden_size=200,
         learning_rate=1e-3,
         weight_decay=1e-5,
@@ -156,13 +214,21 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("Invalid reward-model optimizer or hidden-size settings.")
         if hoprate_max <= hoprate_min:
             raise ValueError("hoprate_max must be greater than hoprate_min.")
+        if not np.isfinite(ber_min) or not np.isfinite(ber_max) or ber_max <= ber_min:
+            raise ValueError("BER bounds must be finite and satisfy ber_max > ber_min.")
+        if not 0.0 < float(logit_epsilon) < 0.5:
+            raise ValueError("logit_epsilon must be between zero and 0.5.")
 
         self.network_size = int(network_size)
         self.elite_size = int(elite_size)
         self.num_heads = int(num_heads)
         self.n_actions = int(n_actions)
+        self.reward_config = _canonical_reward_config(reward_config)
         self.hoprate_min = float(hoprate_min)
         self.hoprate_max = float(hoprate_max)
+        self.ber_min = float(ber_min)
+        self.ber_max = float(ber_max)
+        self.logit_epsilon = float(logit_epsilon)
         self.hidden_size = int(hidden_size)
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(weight_decay)
@@ -193,6 +259,66 @@ class StepRewardEnsemble(nn.Module):
         self.is_fitted = False
         self.last_train_stats = {}
 
+    def reward_bounds(self, hoprates):
+        return reward_bounds_from_config(
+            hoprates,
+            self.reward_config,
+            ber_min=self.ber_min,
+            ber_max=self.ber_max,
+        )
+
+    def _reward_bounds_tensor(self, hoprates):
+        base = (
+            self.reward_config["base_reward"]
+            - self.reward_config["hoprate_penalty"] * hoprates
+        )
+        reward_at_ber_min = (
+            base - self.reward_config["ber_penalty"] * self.ber_min
+        )
+        reward_at_ber_max = (
+            base - self.reward_config["ber_penalty"] * self.ber_max
+        )
+        return (
+            torch.minimum(reward_at_ber_min, reward_at_ber_max),
+            torch.maximum(reward_at_ber_min, reward_at_ber_max),
+        )
+
+    def _bound_rewards_tensor(self, rewards, hoprates):
+        lower, upper = self._reward_bounds_tensor(hoprates)
+        return torch.minimum(torch.maximum(rewards, lower), upper)
+
+    def _targets_to_latent(self, rewards, hoprates):
+        lower, upper = self._reward_bounds_tensor(hoprates)
+        bounded_rewards = torch.minimum(torch.maximum(rewards, lower), upper)
+        normalized = (bounded_rewards - lower) / (upper - lower)
+        normalized = normalized.clamp(
+            self.logit_epsilon, 1.0 - self.logit_epsilon
+        )
+        latent_targets = torch.log(normalized) - torch.log1p(-normalized)
+        return latent_targets, bounded_rewards
+
+    def _latent_to_rewards_tensor(self, latent_values, hoprates):
+        lower, upper = self._reward_bounds_tensor(hoprates)
+        return lower + (upper - lower) * torch.sigmoid(latent_values)
+
+    def _latent_to_rewards_numpy(self, latent_values, hoprates):
+        latent_values = np.asarray(latent_values)
+        lower, upper = self.reward_bounds(hoprates)
+        while lower.ndim < latent_values.ndim:
+            lower = lower[np.newaxis, ...]
+            upper = upper[np.newaxis, ...]
+        return lower + (upper - lower) * _stable_sigmoid(latent_values)
+
+    def _target_saturation_fraction(self, hoprates, block_rewards):
+        rewards = np.asarray(block_rewards, dtype=np.float32)
+        expected_shape = (len(hoprates), self.num_heads)
+        if rewards.shape != expected_shape:
+            raise ValueError(
+                f"block_rewards must have shape {expected_shape}, got {rewards.shape}."
+            )
+        lower, upper = self.reward_bounds(hoprates)
+        return float(np.mean((rewards < lower) | (rewards > upper)))
+
     def _images_tensor(self, images):
         tensor = torch.as_tensor(images, dtype=torch.float32, device=self.device)
         if tensor.ndim == 3:
@@ -207,8 +333,13 @@ class StepRewardEnsemble(nn.Module):
     def _batch_tensors(self, batch, include_rewards=True):
         images, hoprates, actions, *remaining = batch
         images_t = self._images_tensor(images)
+        hoprates_array = np.asarray(hoprates, dtype=np.float32).reshape(-1)
+        if hoprates_array.shape != (len(images),):
+            raise ValueError(f"hoprates must have shape ({len(images)},).")
+        if not np.all(np.isfinite(hoprates_array)):
+            raise ValueError("hoprates must contain only finite values.")
         hoprates_t = torch.as_tensor(
-            hoprates, dtype=torch.float32, device=self.device
+            hoprates_array, dtype=torch.float32, device=self.device
         ).view(-1, 1)
         raw_actions = np.asarray(actions)
         if raw_actions.shape != (len(images), self.num_heads):
@@ -250,8 +381,18 @@ class StepRewardEnsemble(nn.Module):
             for start in range(0, len(indices), batch_size):
                 batch_indices = indices[start : start + batch_size]
                 tensors = self._batch_tensors(dataset.batch(batch_indices))
-                mean, _variance = member(*tensors[:3])
-                squared_error += torch.sum(torch.square(mean - tensors[3])).item()
+                latent_mean, _logvar = member(
+                    *tensors[:3], return_logvar=True
+                )
+                reward_prediction = self._latent_to_rewards_tensor(
+                    latent_mean, tensors[1]
+                )
+                bounded_targets = self._bound_rewards_tensor(
+                    tensors[3], tensors[1]
+                )
+                squared_error += torch.sum(
+                    torch.square(reward_prediction - bounded_targets)
+                ).item()
                 value_count += tensors[3].numel()
         return squared_error / max(1, value_count)
 
@@ -287,6 +428,9 @@ class StepRewardEnsemble(nn.Module):
                 "Observation shape differs from the fitted reward model: "
                 f"expected {self.observation_shape}, got {observation_shape}."
             )
+        target_saturation_fraction = self._target_saturation_fraction(
+            hoprates, block_rewards
+        )
 
         permutation = np.random.permutation(dataset.size)
         holdout_size = min(
@@ -297,8 +441,13 @@ class StepRewardEnsemble(nn.Module):
         epoch_counts = []
 
         for member, optimizer in zip(self.members, self.optimizers):
-            best_loss = float("inf")
-            best_state = None
+            best_loss = self._evaluate_member(
+                member, dataset, holdout_indices, batch_size
+            )
+            if not np.isfinite(best_loss):
+                raise RuntimeError("Reward-model holdout loss became non-finite.")
+            best_state = copy.deepcopy(member.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
             stale_epochs = 0
             epochs_run = 0
 
@@ -313,7 +462,12 @@ class StepRewardEnsemble(nn.Module):
                     mean, logvar = member(
                         images_t, hoprates_t, actions_t, return_logvar=True
                     )
-                    loss = self._probabilistic_loss(mean, logvar, rewards_t)
+                    latent_targets, _bounded_rewards = self._targets_to_latent(
+                        rewards_t, hoprates_t
+                    )
+                    loss = self._probabilistic_loss(
+                        mean, logvar, latent_targets
+                    )
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -324,13 +478,12 @@ class StepRewardEnsemble(nn.Module):
                 if not np.isfinite(holdout_loss):
                     raise RuntimeError("Reward-model holdout loss became non-finite.")
                 relative_improvement = (
-                    float("inf")
-                    if not np.isfinite(best_loss)
-                    else (best_loss - holdout_loss) / max(abs(best_loss), 1e-12)
+                    (best_loss - holdout_loss) / max(abs(best_loss), 1e-12)
                 )
                 if relative_improvement > min_improvement:
                     best_loss = holdout_loss
                     best_state = copy.deepcopy(member.state_dict())
+                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
                     stale_epochs = 0
                 else:
                     stale_epochs += 1
@@ -338,9 +491,8 @@ class StepRewardEnsemble(nn.Module):
                 if stale_epochs >= patience:
                     break
 
-            if best_state is None:
-                raise RuntimeError("Reward-model member did not produce a valid checkpoint.")
             member.load_state_dict(best_state)
+            optimizer.load_state_dict(best_optimizer_state)
             member.eval()
             epoch_counts.append(epochs_run)
 
@@ -362,6 +514,7 @@ class StepRewardEnsemble(nn.Module):
             "elite_model_idxes": list(self.elite_model_idxes),
             "train_size": int(len(train_indices)),
             "holdout_size": int(len(holdout_indices)),
+            "target_saturation_fraction": target_saturation_fraction,
         }
         return self.last_train_stats
 
@@ -385,8 +538,8 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("Prediction inputs must contain only finite values.")
         return state_imgs, hoprates, actions
 
-    def predict(self, state_imgs, hoprates, actions, batch_size=1024):
-        """Return means and variances with shape [models, batch, heads]."""
+    def _predict_latent(self, state_imgs, hoprates, actions, batch_size=1024):
+        """Return latent Gaussian parameters with shape [models, batch, heads]."""
         if not self.is_fitted:
             raise RuntimeError("StepRewardEnsemble must be fitted before prediction.")
         if batch_size <= 0:
@@ -421,6 +574,25 @@ class StepRewardEnsemble(nn.Module):
             np.stack(ensemble_variances).astype(np.float32, copy=False),
         )
 
+    def predict(self, state_imgs, hoprates, actions, batch_size=1024):
+        """Return bounded reward locations and approximate reward variances."""
+        latent_means, latent_variances = self._predict_latent(
+            state_imgs, hoprates, actions, batch_size=batch_size
+        )
+        reward_locations = self._latent_to_rewards_numpy(
+            latent_means, hoprates
+        )
+        lower, upper = self.reward_bounds(hoprates)
+        lower = lower[np.newaxis, ...]
+        upper = upper[np.newaxis, ...]
+        sigmoid_values = _stable_sigmoid(latent_means)
+        local_slopes = (upper - lower) * sigmoid_values * (1.0 - sigmoid_values)
+        reward_variances = np.square(local_slopes) * latent_variances
+        return (
+            reward_locations.astype(np.float32, copy=False),
+            reward_variances.astype(np.float32, copy=False),
+        )
+
     def sample_rewards(
         self,
         state_imgs,
@@ -430,26 +602,36 @@ class StepRewardEnsemble(nn.Module):
         batch_size=1024,
     ):
         """Sample a complete reward vector from one elite per transition."""
-        means, variances = self.predict(
+        latent_means, latent_variances = self._predict_latent(
             state_imgs, hoprates, actions, batch_size=batch_size
         )
+        reward_locations = self._latent_to_rewards_numpy(
+            latent_means, hoprates
+        )
         elite_indices = np.asarray(self.elite_model_idxes, dtype=np.int64)
-        elite_means = means[elite_indices]
-        disagreement = np.mean(np.std(elite_means, axis=0), axis=1)
-        item_indices = np.arange(means.shape[1])
+        elite_reward_locations = reward_locations[elite_indices]
+        disagreement = np.mean(
+            np.std(elite_reward_locations, axis=0), axis=1
+        )
+        item_indices = np.arange(latent_means.shape[1])
 
         if deterministic:
-            rewards = np.mean(elite_means, axis=0)
-            selected_indices = np.full(means.shape[1], -1, dtype=np.int64)
+            rewards = np.mean(elite_reward_locations, axis=0)
+            selected_indices = np.full(
+                latent_means.shape[1], -1, dtype=np.int64
+            )
         else:
             selected_indices = np.random.choice(
-                elite_indices, size=means.shape[1]
+                elite_indices, size=latent_means.shape[1]
             )
-            selected_means = means[selected_indices, item_indices]
-            selected_variances = variances[selected_indices, item_indices]
-            rewards = selected_means + np.random.normal(
+            selected_means = latent_means[selected_indices, item_indices]
+            selected_variances = latent_variances[
+                selected_indices, item_indices
+            ]
+            latent_samples = selected_means + np.random.normal(
                 size=selected_means.shape
             ) * np.sqrt(np.maximum(selected_variances, 1e-12))
+            rewards = self._latent_to_rewards_numpy(latent_samples, hoprates)
 
         return rewards.astype(np.float32, copy=False), {
             "selected_model_idxes": selected_indices,
@@ -462,8 +644,12 @@ class StepRewardEnsemble(nn.Module):
             "elite_size": self.elite_size,
             "num_heads": self.num_heads,
             "n_actions": self.n_actions,
+            "reward_config": dict(self.reward_config),
             "hoprate_min": self.hoprate_min,
             "hoprate_max": self.hoprate_max,
+            "ber_min": self.ber_min,
+            "ber_max": self.ber_max,
+            "logit_epsilon": self.logit_epsilon,
             "hidden_size": self.hidden_size,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,

@@ -174,6 +174,11 @@ class ReplayBuffer:
             raise ValueError("Cannot read transitions from an empty replay buffer.")
         return self._batch_from_transitions(list(self.buffer))
 
+    def clear(self):
+        """Remove all transitions and reset shape inference for future samples."""
+        self.buffer.clear()
+        self.observation_shape = None
+
     def size(self):
         return len(self.buffer)
 

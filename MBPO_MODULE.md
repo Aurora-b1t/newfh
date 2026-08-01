@@ -47,11 +47,11 @@ dones            [B]
 - hoprate embedding；
 - 完整 offsets one-hot 编码器；
 - fusion MLP；
-- 十维 reward mean/log-variance 输出。
+- 十维 Logistic-Normal latent mean/log-variance 输出。
 
 成员之间不共享 CNN 或其他权重。实现按成员顺序训练和推理，以控制 100×100 PSD 在 GPU 上的峰值显存。
 
-每个成员输出对角高斯分布。训练损失为带预测方差的 Gaussian NLL；holdout 排名使用所有 block reward 的平均 MSE。
+每个成员在潜变量空间输出对角高斯分布。训练 reward 先按每条样本的 hoprate 和 `BER∈[0,0.5]` 推导边界，超界目标仅在奖励模型内部饱和，再归一化、避开 sigmoid 端点并做 logit 变换。训练损失为 latent Gaussian NLL；holdout 排名则在真实 reward 单位下比较 sigmoid 有界预测与有界目标的平均 MSE。
 
 ## 4. 模型训练
 
@@ -63,9 +63,9 @@ dones            [B]
 4. 公共 holdout 默认占 20%；各成员遍历完整 train split，但使用独立随机顺序。
 5. 网络参数在不同环境 step 之间连续训练，不重新初始化。
 6. holdout 连续 5 个 epoch 没有至少 1% 改善时早停，最多 100 epoch。
-7. 恢复各成员本次拟合期间的最佳权重，再选择 holdout MSE 最低的 elite。
+7. 恢复各成员本次拟合期间的最佳权重及对应 Adam 状态，再选择 holdout MSE 最低的 elite。
 
-即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=1`，因此每个在线 step 后都会遍历当时完整的真实 replay。对 50,000 条 100×100 transition 而言成本很高；需要更快实验时应显式调大训练间隔或降低 epoch 上限。
+即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=1`，因此每个在线 step 后都会遍历当时完整的真实 replay。对 5,000 条 100×100 transition 而言仍有较高成本；需要更快实验时应显式调大训练间隔或降低 epoch 上限。
 
 ## 5. 一步合成 Rollout
 
@@ -74,17 +74,17 @@ dones            [B]
 1. 从真实 replay 均匀采样最多 `rollout_batch_size` 个完整 step。
 2. SAC 根据每条样本自己的 PSD 和 hoprate 一次生成完整 offsets 向量。
 3. 每条 transition 随机选择一个 elite。
-4. 从该 elite 的完整 block reward 高斯分布中联合采样一条 reward 向量。
-5. 根据当前奖励公式及 `BER in [0, 1]` 计算每条样本的合法 reward 上下界并裁剪。
-6. 将预测 reward 与真实 transition 的 next state、next hoprate、done 组合后写入 model replay。
+4. 从该 elite 的完整 latent Gaussian 中采样一条向量。
+5. 对每条样本计算 `reward(BER=0)` 与 `reward(BER=0.5)`，取其最小值和最大值为边界，再用仿射 sigmoid 将 latent 样本映射为合法 reward；rollout 不做 reward 裁剪，若模型违反边界则直接报错。
+6. 清空上一版本的 model replay，将预测 reward 与真实 transition 的 next state、next hoprate、done 组合后写入新的 model replay。
 
 同一 transition 的所有 block reward 来自同一个 elite，避免逐 head 选择不同模型。日志同时记录：
 
 - 合成 reward 均值和标准差；
 - elite mean disagreement 的均值和 P95；
-- 被物理 reward 边界裁剪的比例。
+- 真实训练目标在奖励模型内部被物理边界饱和的比例。
 
-model replay 使用固定容量 FIFO。模型更新后不会清空旧合成样本，旧版本样本会在容量满后自然淘汰。
+model replay 仍使用固定容量 FIFO，但每次奖励模型成功拟合后都会先清空，因此其中只包含当前奖励模型版本生成的样本。
 
 ## 6. SAC 混合更新
 
@@ -132,10 +132,10 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `early_stop_patience` | 5 | 早停 patience |
 | `max_epochs` | 100 | 单次全量拟合最大 epoch |
 | `min_improvement` | 0.01 | holdout 相对改善阈值 |
-| `rollout_batch_size` | 2000 | 每次生成的最大合成 step 数 |
+| `rollout_batch_size` | 500 | 每次生成的最大合成 step 数 |
 | `rollout_length` | 1 | 固定为一步 |
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
-| `model_replay_size` | 30000 | 合成 replay FIFO 容量 |
+| `model_replay_size` | 4000 | 合成 replay FIFO 容量 |
 
 所有训练预算参数均有对应 CLI 选项，可通过 `train_mbpo.py --help` 查看。
 
@@ -171,13 +171,13 @@ loss.png
 model_reward.png
 model_holdout.png
 model_disagreement.png
-model_clipped_fraction.png
+model_target_saturation_fraction.png
 sac_inference.pt
 reward_model_inference.pt
 figures/
 ```
 
-`sac_inference.pt` 保存 actor 权重和网络/环境维度；`reward_model_inference.pt` 保存全部 ensemble 权重、elite 索引和元数据。两者都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。
+`sac_inference.pt` 保存 actor 权重和网络/环境维度；`reward_model_inference.pt` 保存全部 ensemble 权重、elite 索引、reward 配置、BER 边界、logit epsilon 和元数据。两者都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。checkpoint 格式版本号仍为 1，但旧的单一无界输出头与新的 latent mean/log-variance 双头权重不兼容，不提供迁移。
 
 若纯在线运行始终未达到奖励模型 warm-up 门槛，只保存 SAC checkpoint，并在日志中明确说明奖励模型尚未拟合。
 
@@ -186,6 +186,7 @@ figures/
 1. 这不是完整 dynamics MBPO，无法在模型内部递推 PSD 状态。
 2. 合成 next state 来自真实 replay，依赖 observation transition 与 action 无关的环境假设。
 3. 默认每 step 全量训练独立 CNN ensemble，计算成本很高。
-4. FIFO model replay 会同时包含不同奖励模型版本生成的样本。
-5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和裁剪率诊断。
-6. v1/v2 block-level replay 与旧奖励模型 checkpoint 不兼容，必须重新生成数据和训练模型。
+4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且各成员遍历同一训练集合；holdout 与分歧可能偏乐观。
+5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
+6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。
+7. v1/v2 block-level replay 与旧的无界奖励模型 checkpoint 不兼容，必须重新生成数据和训练模型。

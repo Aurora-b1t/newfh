@@ -144,9 +144,9 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 
 ## MBPO 奖励模型
 
-[train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，联合输出每个 block 的 reward 均值与方差；它不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
+[train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，为每个 block 输出 Logistic-Normal 潜变量的位置与方差；潜变量经 sigmoid 映射到由 `BER∈[0,0.5]`、hoprate 和奖励公式共同确定的 reward 区间。模型不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
 
-默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite 采样完整 reward 向量，再按当前 reward 公式的物理范围裁剪。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此 50,000 条离线数据下计算成本较高。
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后会清空并重建 model replay。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此计算成本较高。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help
@@ -217,7 +217,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_speed_sweep.py --hoprate_max 20 --step
 
 ### 离线 replay 生成与加载
 
-offset baseline 在首次梯度更新前加载真实 v3 replay。默认数据包含 50,000 条完整环境 step transition，每条都带 10 个 offset 与 10 个 block reward：
+offset baseline 在首次梯度更新前加载真实 v3 replay。当前默认数据包含 5,000 条固定 100 Hz 的完整环境 step transition，每条都带 10 个 offset 与 10 个 block reward：
 
 修改 comb `switch_interval`、相位信道组、`baseband_variant_count` 或其他干扰配置后，必须重新生成离线 replay。metadata 会记录新配置；baseline 会提示不匹配，MBPO 默认拒绝加载不匹配的数据（仍可显式使用 `--allow_replay_config_mismatch` 做跨配置实验）。
 
@@ -228,13 +228,13 @@ D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py
 固定 hoprate 版本：
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py --hoprate_mode fixed --fixed_hoprate 100 --output_path outputs/offline_replay/replay_50000_fixed_100_v3.npz
+D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py --hoprate_mode fixed --fixed_hoprate 100 --output_path outputs/offline_replay/replay_5000_100_hoprate_v3.npz
 ```
 
 指定 replay 文件给训练入口：
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path outputs/offline_replay/replay_50000_fixed_100_v3.npz
+D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path outputs/offline_replay/replay_5000_100_hoprate_v3.npz
 ```
 
 生成少量冒烟数据时使用新的数量参数：
@@ -301,7 +301,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `ber.png`：平均 step BER 曲线。
 - `loss.png`：actor/critic loss 曲线（offset/MBPO 训练）。
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
-- `model_holdout.png`、`model_disagreement.png`、`model_clipped_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和物理边界裁剪率。
+- `model_holdout.png`、`model_disagreement.png`、`model_target_saturation_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和训练目标触及物理边界的比例。
 - `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态。
 - `hoprate.png`、`ber_vs_hoprate.png`、`nbs_weights.png`：NBS 搜索诊断图。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。

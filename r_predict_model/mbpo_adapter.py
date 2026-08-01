@@ -2,6 +2,12 @@
 
 import numpy as np
 
+from .model import (
+    DEFAULT_BER_MAX,
+    DEFAULT_BER_MIN,
+    reward_bounds_from_config,
+)
+
 
 def replay_fields_for_reward_model(replay_buffer):
     """Return reward-model fields without copying every replay image."""
@@ -90,21 +96,18 @@ def train_reward_model_from_replay(reward_model, replay_buffer, **fit_kwargs):
     return reward_model.fit(**fields, **fit_kwargs)
 
 
-def reward_bounds(hoprates, reward_config):
-    """Return per-transition reward bounds implied by BER in [0, 1]."""
-    hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1, 1)
-    base_reward = float(reward_config["base_reward"])
-    ber_penalty = float(reward_config["ber_penalty"])
-    hoprate_penalty = float(reward_config["hoprate_penalty"])
-    if not np.all(
-        np.isfinite([base_reward, ber_penalty, hoprate_penalty])
-    ) or not np.all(np.isfinite(hoprates)):
-        raise ValueError("Reward bounds require finite configuration and hoprates.")
-    reward_at_ber_zero = base_reward - hoprate_penalty * hoprates
-    reward_at_ber_one = reward_at_ber_zero - ber_penalty
-    return (
-        np.minimum(reward_at_ber_zero, reward_at_ber_one),
-        np.maximum(reward_at_ber_zero, reward_at_ber_one),
+def reward_bounds(
+    hoprates,
+    reward_config,
+    ber_min=DEFAULT_BER_MIN,
+    ber_max=DEFAULT_BER_MAX,
+):
+    """Return per-transition reward bounds implied by BER endpoints."""
+    return reward_bounds_from_config(
+        hoprates,
+        reward_config,
+        ber_min=ber_min,
+        ber_max=ber_max,
     )
 
 
@@ -145,26 +148,35 @@ def rollout_reward_model(
     if np.any(actions < 0) or np.any(actions >= reward_model.n_actions):
         raise ValueError("SAC policy returned an action outside the environment range.")
 
-    raw_rewards, prediction_stats = reward_model.sample_rewards(
+    predicted_rewards, prediction_stats = reward_model.sample_rewards(
         state_imgs,
         hoprates,
         actions,
         deterministic=deterministic_model,
     )
-    if raw_rewards.shape != expected_shape or not np.all(np.isfinite(raw_rewards)):
+    if predicted_rewards.shape != expected_shape or not np.all(
+        np.isfinite(predicted_rewards)
+    ):
         raise RuntimeError("Reward ensemble returned invalid block rewards.")
-    lower_bounds, upper_bounds = reward_bounds(hoprates, reward_config)
-    clipped_rewards = np.clip(raw_rewards, lower_bounds, upper_bounds).astype(
-        np.float32, copy=False
+    lower_bounds, upper_bounds = reward_bounds(
+        hoprates,
+        reward_config,
+        ber_min=float(getattr(reward_model, "ber_min", DEFAULT_BER_MIN)),
+        ber_max=float(getattr(reward_model, "ber_max", DEFAULT_BER_MAX)),
     )
-    clipped_fraction = float(np.mean(~np.isclose(raw_rewards, clipped_rewards)))
+    tolerance = 1e-6 * np.maximum(1.0, upper_bounds - lower_bounds)
+    if np.any(predicted_rewards < lower_bounds - tolerance) or np.any(
+        predicted_rewards > upper_bounds + tolerance
+    ):
+        raise RuntimeError("Reward ensemble returned a reward outside its bounds.")
+    predicted_rewards = predicted_rewards.astype(np.float32, copy=False)
 
     for index in range(rollout_size):
         model_buffer.add(
             state_imgs[index],
             float(hoprates[index]),
             actions[index],
-            clipped_rewards[index],
+            predicted_rewards[index],
             starts["next_state_imgs"][index],
             float(starts["next_hoprates"][index]),
             bool(starts["dones"][index]),
@@ -175,10 +187,8 @@ def rollout_reward_model(
     )
     return {
         "generated": rollout_size,
-        "reward_mean": float(np.mean(clipped_rewards)),
-        "reward_std": float(np.std(clipped_rewards)),
-        "raw_reward_mean": float(np.mean(raw_rewards)),
+        "reward_mean": float(np.mean(predicted_rewards)),
+        "reward_std": float(np.std(predicted_rewards)),
         "disagreement_mean": float(np.mean(disagreement)),
         "disagreement_p95": float(np.percentile(disagreement, 95)),
-        "clipped_fraction": clipped_fraction,
     }
