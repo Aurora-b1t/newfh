@@ -6,6 +6,10 @@ import logging
 import numpy as np
 
 from fh_env import FHSSQPSKEnv
+from joint_training import (
+    add_environment_override_args,
+    resolve_environment_configs,
+)
 from SAC import ReplayBuffer
 import settings
 from offline_replay import environment_metadata, save_replay_buffer
@@ -20,6 +24,9 @@ def make_hoprate_sampler(mode, fixed_hoprate, env, rng):
     if mode == "fixed":
         quantized = quantize_hoprate(float(fixed_hoprate), env)
         return lambda: quantized
+
+    if mode != "random":
+        raise ValueError(f"Unsupported hoprate_mode: {mode!r}.")
 
     min_step = int(np.ceil(env.hoprate_min / 10.0))
     max_step = int(np.floor(env.hoprate_max / 10.0))
@@ -36,7 +43,8 @@ def generate(args):
     )
     settings.set_random_seeds(args.seed)
     rng = np.random.default_rng(args.seed)
-    env = FHSSQPSKEnv(**settings.ENV_CONFIG)
+    env_config, jammer_config = resolve_environment_configs(args)
+    env = FHSSQPSKEnv(**env_config, jammer_config=jammer_config)
     state_img, _info = env.reset()
     n_actions = env.num_channels
     num_blocks = env.num_blocks
@@ -94,8 +102,8 @@ def generate(args):
             )
 
     metadata = environment_metadata(
-        settings.ENV_CONFIG,
-        settings.JAMMER_CONFIG,
+        env_config,
+        jammer_config,
         settings.REWARD_CONFIG,
     )
     metadata.update(
@@ -109,6 +117,7 @@ def generate(args):
             "num_env_steps": buffer.size(),
             "num_actions": n_actions,
             "num_blocks": num_blocks,
+            "hoprate_grid_step": 10.0,
         }
     )
     save_replay_buffer(args.output_path, buffer, metadata)
@@ -117,9 +126,10 @@ def generate(args):
         buffer.size(),
         args.output_path,
     )
+    env.close()
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate real FHSS step-level replay with random offsets."
     )
@@ -148,7 +158,8 @@ def parse_args():
         help="Hoprate used when --hoprate_mode=fixed.",
     )
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
-    return parser.parse_args()
+    add_environment_override_args(parser)
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

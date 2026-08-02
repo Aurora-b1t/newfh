@@ -7,6 +7,7 @@
 - **FHSS/QPSK 通信仿真环境**：QPSK 收发链路、跳频信道、PSD waterfall 观测、Rayleigh 衰落、扫频/梳状/反应式干扰机，支持预生成加速。
 - **baseline 十头离散 SAC 训练**：一次前向并行生成 10 个 categorical offset，一次环境 step 对应一条完整 replay transition。
 - **step-level MBPO 奖励增强**：独立 CNN ensemble 联合预测完整十维 block reward，生成与 v3 replay 同构的一步合成样本辅助 SAC（详见 [MBPO_MODULE.md](MBPO_MODULE.md)）。
+- **导数 NBS + offset 联合训练**：每步先由 derivative NBS 选择 hoprate，再将 PSD 与该 hoprate 交给 SAC 或 MBPO-SAC 选择完整 offset 动作。
 - **Noisy Binary Search 跳速阈值搜索**：MWU-based noisy binary search 寻找反应式干扰机的跳速跟踪/失效边界，含 derivative 变体。
 - **hoprate sweep 评估**：确定性网格遍历所有候选 hoprate，作为 NBS 搜索的对照基线。
 - **离线 replay 生成与加载**：生成/复用 v3 step-level 真实环境 replay，供 baseline offset SAC 冷启动（详见 [OFFLINE_REPLAY.md](OFFLINE_REPLAY.md)）。
@@ -26,6 +27,9 @@
 | [SAC.py](SAC.py) | 十头离散 SAC：step-level ReplayBuffer、共享编码器实现、独立 actor/Q 输出头、温度系数自适应和软更新。 |
 | [train_offsets.py](train_offsets.py) | baseline 训练入口：构建环境、SAC agent、replay buffer、训练循环、日志和曲线输出。 |
 | [train_mbpo.py](train_mbpo.py) | step-level SAC + MBPO 入口：真实交互、CNN 奖励 ensemble、合成 replay、混合更新、诊断与推理 checkpoint。 |
+| [train_joint_sac.py](train_joint_sac.py) | derivative NBS 跳速控制 + baseline offset SAC 联合训练入口。 |
+| [train_joint_mbpo.py](train_joint_mbpo.py) | derivative NBS 跳速控制 + reward-model MBPO-SAC 联合训练入口。 |
+| [joint_training.py](joint_training.py) | 联合训练公共因果步骤、环境 CLI 覆盖、严格 replay 加载及 NBS 诊断输出。 |
 | [train_speed.py](train_speed.py) | Noisy Binary Search 跳速阈值搜索入口（随机 offset + 反应式干扰机）。 |
 | [train_speed_derivative.py](train_speed_derivative.py) | derivative-based NBS 变体入口，用 BER-hoprate 导数指标做方向决策。 |
 | [train_speed_sweep.py](train_speed_sweep.py) | hoprate 网格扫描评估入口，NBS 搜索的确定性对照。 |
@@ -115,7 +119,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --help
 短训练冒烟测试：
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --steps_per_episode 3 --batch_size 20 --offline_replay_path outputs/offline_replay/replay_50000_random_hoprate_v3.npz --output_dir outputs/smoke
+D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --steps_per_episode 3 --batch_size 20 --offline_replay_path outputs/offline_replay/replay_5000_100_hoprate_v3.npz --output_dir outputs/smoke
 ```
 
 默认训练（默认输出目录 `outputs/offsets/pre50000/comb/512_start`）：
@@ -160,6 +164,24 @@ D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --offline_replay_path none --s
 ```
 
 MBPO 默认严格拒绝环境、干扰或 reward metadata 不匹配的离线 replay；跨配置实验必须显式使用 `--allow_replay_config_mismatch`。完整设计与参数见 [MBPO_MODULE.md](MBPO_MODULE.md)。
+
+## 导数 NBS + offset 联合训练
+
+两个联合入口保留原固定跳速脚本不变。每个环境 step 的顺序为：NBS 选择当前 hoprate，offset actor 接收当前 PSD 与该 hoprate 并输出 10 个 offset，环境执行动作并返回平均 BER，NBS 再用该 BER 更新并选出下一 hoprate。replay 因而保存真实的 `(state, hoprate, offsets, rewards, next_state, next_hoprate)`。
+
+reactive + comb 的 baseline SAC 联合训练：
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe train_joint_sac.py --enable_reactive true --enable_sweep true --jammer_mode comb
+```
+
+相同配置下的 MBPO-SAC 联合训练：
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe train_joint_mbpo.py --enable_reactive true --enable_sweep true --jammer_mode comb
+```
+
+两者默认加载 `outputs/offline_replay/replay_5000_random_hoprate_v3.npz`，默认严格拒绝环境、干扰或 reward metadata 不匹配的数据。使用 `--offline_replay_path none` 可纯在线运行；只有明确进行跨配置实验时才使用 `--allow_replay_config_mismatch`。NBS 达到收敛阈值后不会停止或冻结，而会继续根据新 BER 更新，以适应 offset 策略学习造成的阈值漂移。
 
 ## 跳速阈值搜索（Noisy Binary Search）
 
@@ -219,7 +241,13 @@ D:\Anaconda\envs\rl_fhss\python.exe train_speed_sweep.py --hoprate_max 20 --step
 
 offset baseline 在首次梯度更新前加载真实 v3 replay。当前默认数据包含 5,000 条固定 100 Hz 的完整环境 step transition，每条都带 10 个 offset 与 10 个 block reward：
 
-修改 comb `switch_interval`、相位信道组、`baseband_variant_count` 或其他干扰配置后，必须重新生成离线 replay。metadata 会记录新配置；baseline 会提示不匹配，MBPO 默认拒绝加载不匹配的数据（仍可显式使用 `--allow_replay_config_mismatch` 做跨配置实验）。
+两个联合入口使用独立的 5,000 条随机 hoprate replay。reactive + comb 版本的完整生成命令为：
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py --num_step_transitions 5000 --hoprate_mode random --enable_reactive true --enable_sweep true --jammer_mode comb --output_path outputs/offline_replay/replay_5000_random_hoprate_v3.npz
+```
+
+修改 comb `switch_interval`、相位信道组、`baseband_variant_count` 或其他干扰配置后，必须重新生成离线 replay。metadata 会记录新配置；固定跳速 baseline 仅提示不匹配，原 MBPO 与两个联合入口默认拒绝不匹配数据（仍可显式使用 `--allow_replay_config_mismatch` 做跨配置实验）。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py
@@ -240,7 +268,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path outpu
 生成少量冒烟数据时使用新的数量参数：
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py --num_step_transitions 2 --output_path outputs/offline_replay/smoke_v3.npz
+D:\Anaconda\envs\rl_fhss\python.exe generate_offline_replay.py --num_step_transitions 2 --hoprate_mode random --enable_reactive true --enable_sweep true --jammer_mode comb --output_path outputs/offline_replay/smoke_random_reactive_comb_v3.npz
 ```
 
 ### special hopping pattern 隔离测试
@@ -289,6 +317,8 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 | --- | --- |
 | [train_offsets.py](train_offsets.py) | `outputs/offsets/pre50000/comb/512_start` |
 | [train_mbpo.py](train_mbpo.py) | `outputs/mbpo/comb/pre50000` |
+| [train_joint_sac.py](train_joint_sac.py) | `outputs/joint_sac` |
+| [train_joint_mbpo.py](train_joint_mbpo.py) | `outputs/joint_mbpo` |
 | [train_speed.py](train_speed.py) | `outputs/speed` |
 | [train_speed_derivative.py](train_speed_derivative.py) | `outputs/speed_derivative/0.5ms/-0.005` |
 | [train_speed_sweep.py](train_speed_sweep.py) | `outputs/speed_sweep/0.5ms` |
@@ -303,7 +333,8 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
 - `model_holdout.png`、`model_disagreement.png`、`model_target_saturation_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和训练目标触及物理边界的比例。
 - `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态。
-- `hoprate.png`、`ber_vs_hoprate.png`、`nbs_weights.png`：NBS 搜索诊断图。
+- `hoprate.png`、`ber_vs_hoprate.png`、`derivative.png`、`nbs_weights.png`：NBS 搜索及联合训练诊断图。
+- `nbs_distribution.npz`：最终候选权重以及逐 step hoprate、BER、导数、MAP/加权估计和收敛状态。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。
 - `figures/`：由 `PLOT_CONFIG["figure_save_steps"]` 指定的 step 保存的动作前 observation 图与 10 个 block PSD 图（offset/MBPO 训练）。
 - PSD capture 图：指定 step 的观测与 10 个 block PSD（special hopping 测试）。
@@ -368,6 +399,11 @@ Noisy Binary Search 配置：
 - `p`：假设的噪声概率，需满足 `0 <= p < 0.5`。
 - `delta`：收敛阈值；当最大权重 `>= 1 - delta` 时认为收敛。
 - `hoprate_step`：候选 hoprate 离散步长，默认 10 Hz，与环境 `_apply_hoprate()` 的量化一致。
+- `derivative_threshold`：联合训练和 derivative NBS 的 BER-hoprate 导数判决阈值，默认 `-0.005`。
+
+### `JOINT_OFFLINE_REPLAY_CONFIG`
+
+联合训练使用的随机 hoprate replay 默认路径与标准规模；与固定 hoprate baseline 的 `OFFLINE_REPLAY_CONFIG` 分离，避免改变原入口默认行为。
 
 ### `TRAIN_CONFIG`
 

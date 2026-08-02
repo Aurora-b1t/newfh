@@ -61,7 +61,7 @@ def log_active_comb_channels(env, logger=None):
     )
     return True
 
-def build_agent_and_env(args):
+def build_agent_and_env(args, env_config=None, jammer_config=None):
     # -------------------------------------------------------------------------
     # 1. Device Configuration (GPU/CPU)
     # -------------------------------------------------------------------------
@@ -76,7 +76,8 @@ def build_agent_and_env(args):
     # 2. Environment Initialization
     # -------------------------------------------------------------------------
     # Pass configuration from settings
-    env = FHSSQPSKEnv(**settings.ENV_CONFIG)
+    env_config = settings.ENV_CONFIG if env_config is None else env_config
+    env = FHSSQPSKEnv(**env_config, jammer_config=jammer_config)
     log_active_comb_channels(env)
 
     # Number of discrete actions matches number of channels

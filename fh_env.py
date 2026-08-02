@@ -8,6 +8,7 @@ indiscriminate sweep/comb jammers. The environment exposes a 10-offset
 sequential decision interface for RL agents.
 """
 
+import copy
 import os
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -430,7 +431,8 @@ class FHSSQPSKEnv(gym.Env):
                  use_pregen=True,
                  noise_std=0.1,
                  signal_power=0.0025,
-                 block_workers=None):
+                 block_workers=None,
+                 jammer_config=None):
         super().__init__()
 
         self.Startfre = float(Startfre)
@@ -480,7 +482,14 @@ class FHSSQPSKEnv(gym.Env):
         self.use_pregen = bool(use_pregen)
 
         # 加载配置
-        j_conf = settings.JAMMER_CONFIG
+        # Keep jammer configuration local to this environment instance so
+        # command-line experiments can override it without mutating settings.
+        j_conf = copy.deepcopy(
+            settings.JAMMER_CONFIG if jammer_config is None else jammer_config
+        )
+        if not isinstance(j_conf, dict):
+            raise TypeError("jammer_config must be a mapping when provided.")
+        self.jammer_config = j_conf
         self.noise_std = float(noise_std)
         self.signal_power = float(signal_power)
 

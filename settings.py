@@ -152,6 +152,14 @@ OFFLINE_REPLAY_CONFIG = {
     "fixed_hoprate": 100.0,
 }
 
+# Joint derivative-NBS + offset training uses a broad hoprate replay without
+# changing the fixed-hoprate baseline defaults above.
+JOINT_OFFLINE_REPLAY_CONFIG = {
+    "num_step_transitions": 5000,
+    "default_path": "outputs/offline_replay/replay_5000_random_hoprate_v3.npz",
+    "hoprate_mode": "random",
+}
+
 # MBPO Reward-Model Configuration
 MBPO_CONFIG = {
     "num_networks": 5,
@@ -180,6 +188,7 @@ NBS_CONFIG = {
     "delta": 0.01,            # Confidence threshold, 0 < δ ≤ 1.
                                # Convergence when max weight ≥ 1 − δ.
     "hoprate_step": 10.0,     # Discretisation step (Hz). Matches _apply_hoprate quantisation.
+    "derivative_threshold": -0.005,
 }
 
 # Training Loop Configuration
