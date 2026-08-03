@@ -146,11 +146,13 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --output_dir outputs/baseli
 D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 ```
 
+训练结束后，baseline 会在 `--output_dir` 下保存 `sac_inference.pt`。该文件只包含 actor 推理权重、环境维度和配置元数据，不包含 optimizer、replay 或 RNG 状态。
+
 ## MBPO 奖励模型
 
 [train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，为每个 block 输出 Logistic-Normal 潜变量的位置与方差；潜变量经 sigmoid 映射到由 `BER∈[0,0.5]`、hoprate 和奖励公式共同确定的 reward 区间。模型不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
 
-默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此计算成本较高。
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每个成员复用与 SAC 相同的三层 CNN、两层 hoprate MLP 和两层 PSD-hoprate fusion 结构，再通过三层 SiLU state-action fusion 预测 reward 分布。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此计算成本较高。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help
@@ -332,7 +334,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `loss.png`：actor/critic loss 曲线（offset/MBPO 训练）。
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
 - `model_holdout.png`、`model_disagreement.png`、`model_target_saturation_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和训练目标触及物理边界的比例。
-- `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态；SAC 使用 GroupNorm 架构的 v2 格式，旧 BatchNorm v1 checkpoint 会被明确拒绝。
+- `sac_inference.pt`、`reward_model_inference.pt`：推理 checkpoint，不含 optimizer、replay 或 RNG 状态。baseline、联合训练和 MBPO 均保存 SAC v3；MBPO 另保存 reward v2。旧 SAC v1/v2 和 reward v1 架构会被明确拒绝，必须重新训练。
 - `hoprate.png`、`ber_vs_hoprate.png`、`derivative.png`、`nbs_weights.png`：NBS 搜索及联合训练诊断图。
 - `nbs_distribution.npz`：最终候选权重以及逐 step hoprate、BER、导数、MAP/加权估计和收敛状态。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。
@@ -456,12 +458,13 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - **不再输入 block index**：hoprate 按环境上下界归一化到 `[-10,10]`，十个固定位置的输出头分别对应 block 0～9。
 - **actor 只返回 raw logits**：`take_action()` 单次返回十维整数动作；训练采样用 `Categorical(logits=...)`，确定性推理使用逐头 `argmax`。
 - **共享温度系数**：十头共用一个 alpha，actor、critic 和 entropy loss 都对 batch/head 维取平均。
-- **卷积编码器使用 GroupNorm**：16/32 通道分别使用 4/8 组，不维护 batch running stats；同一权重与输入在 train/eval 模式下输出一致，消除了单样本执行与 batch 训练的归一化偏差。
+- **深层 PSD 编码器**：使用 `Conv 1→16 → Conv 16→32 → Pool → Conv 32→64 → Pool → FC512`；三层卷积分别使用 4/8/16 组 GroupNorm 和 ReLU，不维护 batch running stats。100×100 PSD 下单编码器约 2097 万参数。
+- **深层 hoprate 与融合 MLP**：hoprate 归一化到 `[-10,10]` 后经过 `1→64→128`；与 512 维 PSD 特征拼接后经过 `640→512→256`，输出仍为 256 维，因此 actor/Q heads 保持直接 `256→n_actions`。
 - **online 网络不再临时切换模式**：`take_action()`、TD target 和 actor loss 路径都保持调用前的网络模式；正常 `update()` 中 actor 与两个 online critic 的所有 forward 均处于 train 模式。
 - **目标网络固定为 eval 模式只表示角色**：`target_critic_1/2` 不参与优化；GroupNorm 在 train/eval 下数值一致，因此不会再引入目标值分布差异。
 - **Lazy target 延迟初始化**：首次 TD target 计算前先按 online critic 当前模式物化网络并完整复制参数，后续做 soft update。
 - **`calc_target` 在 `torch.no_grad()` 下计算**，不为 actor 或 target critics 构建梯度图。
-- **SAC 推理 checkpoint 升级为 v2**：写入 `groupnorm_v2` 架构标识；旧 BatchNorm v1 checkpoint 不做静默迁移，必须重新训练。
+- **SAC 推理 checkpoint 升级为 v3**：写入 `cnn3_groupnorm_hop_mlp2_fusion_mlp2_v3` 架构标识；旧 BatchNorm v1、浅层 GroupNorm v2 或其他架构不做静默迁移，必须重新训练。
 - **step-level replay**：一条经验保存十维动作、十维 block reward、仅用于诊断的均值 step reward，以及真实下一环境状态。
 
 ## 通信环境设计取舍
@@ -483,5 +486,5 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - MBPO 是 reward-only 一步增强，不是完整 dynamics MBPO；其 next-state 复用依赖环境 observation transition 与 offsets 无关。
 - MBPO 默认每个在线 step 都用完整真实 replay 继续训练 5 个独立 CNN，计算成本高；需要快速实验时应调大 `model_train_freq` 或降低 `model_max_epochs`。
 - NBS 跳速搜索依赖 BER-vs-hoprate 的可辨识趋势；若同时启用多种强干扰或随机 offset 方差很大，可能需要增加步数、调大 `p` 或做多次重复评估。
-- v1/v2 block-level replay 和 SAC BatchNorm inference checkpoint v1 与当前实现不兼容，必须重新生成数据并重新训练。
+- v1/v2 block-level replay 仍与当前 step-level v3 replay 不兼容；SAC inference v1/v2 和 reward-model v1 checkpoint 也不能加载到新网络，模型必须重新训练，但现有 v3 replay 无需重新生成。
 - 若后续要进一步规范工程结构，可以再做第二阶段重构：拆分 `env/`、`algos/`、`train/` 子包。

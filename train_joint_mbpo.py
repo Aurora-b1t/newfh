@@ -29,12 +29,11 @@ from r_predict_model.mbpo_adapter import (
     train_reward_model_from_replay,
 )
 import settings
-from SAC import ReplayBuffer
+from SAC import ReplayBuffer, save_sac_inference_checkpoint
 from train_mbpo import (
     _validate_args,
     reward_model_ready,
     save_plots,
-    save_sac_inference_checkpoint,
     should_train_reward_model,
 )
 from train_offsets import (

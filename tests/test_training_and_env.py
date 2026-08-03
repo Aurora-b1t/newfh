@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -8,6 +9,7 @@ import numpy as np
 from gymnasium import spaces
 
 import settings
+import train_offsets
 from fh_env import FHSSQPSKEnv, compute_block_rewards
 from SAC import ReplayBuffer
 from train_mbpo import _validate_args, parse_args as parse_mbpo_args
@@ -39,6 +41,91 @@ class TrainingHelperTests(unittest.TestCase):
             args = parse_mbpo_args()
         self.assertIsNone(args.offline_replay_path)
         _validate_args(args)
+
+    def test_baseline_entrypoint_saves_inference_checkpoint_with_metadata(self):
+        class FakeEnv:
+            num_blocks = 3
+            num_channels = 4
+            hoprate_min = 10.0
+            hoprate_max = 1000.0
+
+            def reset(self):
+                return np.zeros((8, 8), dtype=np.float32), {}
+
+            def step(self, action):
+                self.last_action = action
+                block_rewards = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+                return (
+                    np.ones((8, 8), dtype=np.float32),
+                    float(block_rewards.mean()),
+                    True,
+                    False,
+                    {
+                        "ber_blocks": [0.1, 0.2, 0.3],
+                        "block_rewards": block_rewards,
+                        "hoprate_used": float(action["hoprate"]),
+                        "hop_sequences": [[0], [1], [2]],
+                    },
+                )
+
+        class FakeAgent:
+            n_actions = 4
+            num_heads = 3
+
+            def take_action(self, state_img, hoprate):
+                return np.array([0, 1, 2], dtype=np.int64)
+
+        env = FakeEnv()
+        agent = FakeAgent()
+        buffer = ReplayBuffer(4, num_heads=3, n_actions=4)
+        logger = mock.Mock()
+        hop_logger = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as output_dir, mock.patch.object(
+            train_offsets,
+            "build_agent_and_env",
+            return_value=(env, agent, buffer, "cpu", env.num_channels),
+        ), mock.patch.object(
+            train_offsets,
+            "setup_logger",
+            return_value=(logger, hop_logger),
+        ), mock.patch.object(
+            train_offsets,
+            "save_sac_inference_checkpoint",
+        ) as save_checkpoint, mock.patch.dict(
+            settings.PLOT_CONFIG,
+            {"figure_save_steps": []},
+        ):
+            args = SimpleNamespace(
+                output_dir=output_dir,
+                log_file="training_log.txt",
+                offline_replay_path=None,
+                steps_per_episode=1,
+                batch_size=2,
+                update_iters_per_step=1,
+            )
+            train_offsets.train(args)
+
+            save_checkpoint.assert_called_once()
+            call_args = save_checkpoint.call_args.args
+            self.assertIs(agent, call_args[0])
+            self.assertEqual(
+                os.path.join(output_dir, "sac_inference.pt"),
+                call_args[1],
+            )
+            self.assertEqual((8, 8), call_args[2])
+            self.assertEqual(env.hoprate_min, call_args[3])
+            self.assertEqual(env.hoprate_max, call_args[4])
+            metadata = call_args[5]
+            self.assertEqual(env.num_channels, metadata["num_actions"])
+            self.assertEqual(env.num_blocks, metadata["num_blocks"])
+            self.assertEqual(
+                settings.TRAIN_CONFIG["fixed_hoprate"],
+                metadata["fixed_hoprate"],
+            )
+            self.assertIn("env_config", metadata)
+            self.assertIn("jammer_config", metadata)
+            self.assertIn("reward_config", metadata)
 
 
 class EnvironmentInterfaceTests(unittest.TestCase):

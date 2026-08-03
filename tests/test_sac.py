@@ -5,7 +5,17 @@ import numpy as np
 import torch
 from torch import nn
 
-from SAC import PolicyNet, SAC, ValueNet, normalize_hoprate
+from SAC import (
+    FUSION_HIDDEN_DIM,
+    HOPRATE_FEATURE_DIM,
+    PSD_FEATURE_DIM,
+    STATE_FEATURE_DIM,
+    PolicyNet,
+    SAC,
+    StateEncoder,
+    ValueNet,
+    normalize_hoprate,
+)
 
 
 class FixedActor(nn.Module):
@@ -102,7 +112,69 @@ class MultiHeadNetworkTests(unittest.TestCase):
                 for module in modules
             )
         )
-        self.assertEqual(4, sum(isinstance(module, nn.GroupNorm) for module in modules))
+        self.assertFalse(any(isinstance(module, nn.Dropout) for module in modules))
+        self.assertEqual(6, sum(isinstance(module, nn.GroupNorm) for module in modules))
+
+    def test_state_encoder_has_requested_deep_architecture(self):
+        encoder = StateEncoder(10.0, 1000.0)
+
+        self.assertEqual((16, 32, 64), (
+            encoder.conv1.out_channels,
+            encoder.conv2.out_channels,
+            encoder.conv3.out_channels,
+        ))
+        self.assertEqual((4, 8, 16), (
+            encoder.norm1.num_groups,
+            encoder.norm2.num_groups,
+            encoder.norm3.num_groups,
+        ))
+        self.assertEqual(PSD_FEATURE_DIM, encoder.conv_fc.out_features)
+
+        hoprate_linears = [
+            module
+            for module in encoder.hoprate_embedding
+            if isinstance(module, nn.Linear)
+        ]
+        self.assertEqual([(1, 64), (64, HOPRATE_FEATURE_DIM)], [
+            (module.in_features, module.out_features)
+            for module in hoprate_linears
+        ])
+        fusion_linears = [
+            module for module in encoder.fusion if isinstance(module, nn.Linear)
+        ]
+        self.assertEqual(
+            [
+                (PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, FUSION_HIDDEN_DIM),
+                (FUSION_HIDDEN_DIM, STATE_FEATURE_DIM),
+            ],
+            [(module.in_features, module.out_features) for module in fusion_linears],
+        )
+
+        pool_calls = []
+        handle = encoder.pool.register_forward_hook(
+            lambda _module, _inputs, output: pool_calls.append(tuple(output.shape))
+        )
+        try:
+            output = encoder(torch.randn(2, 1, 16, 16), torch.full((2, 1), 100.0))
+        finally:
+            handle.remove()
+        self.assertEqual((2, STATE_FEATURE_DIM), tuple(output.shape))
+        self.assertEqual([(2, 32, 8, 8), (2, 64, 4, 4)], pool_calls)
+
+    def test_state_encoder_supports_test_and_production_psd_sizes(self):
+        for size in (8, 16, 100):
+            with self.subTest(size=size):
+                encoder = StateEncoder(10.0, 1000.0)
+                output = encoder(
+                    torch.zeros(1, 1, size, size),
+                    torch.full((1, 1), 100.0),
+                )
+                self.assertEqual((1, STATE_FEATURE_DIM), tuple(output.shape))
+                if size == 100:
+                    self.assertEqual(
+                        20_972_000,
+                        sum(parameter.numel() for parameter in encoder.parameters()),
+                    )
 
     def test_train_and_eval_outputs_are_identical(self):
         images = torch.randn(3, 1, 16, 16)

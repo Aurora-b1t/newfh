@@ -49,6 +49,8 @@ dones            [B]
 - fusion MLP；
 - 十维 Logistic-Normal latent mean/log-variance 输出。
 
+共享 state encoder 的固定结构为：PSD 分支 `Conv 1→16 + GN4 + ReLU → Conv 16→32 + GN8 + ReLU → Pool → Conv 32→64 + GN16 + ReLU → Pool → FC512 + ReLU`；连续 hoprate 归一化后经过 `1→64→128` 两层 ReLU MLP；两者拼接后经过 `640→512→256` 两层 ReLU fusion。随后完整 offsets one-hot 先编码到 `hidden_size`，再与 256 维 state 特征进入三层同宽 SiLU state-action fusion。100×100 PSD 下单个 state encoder 约 2097 万参数。
+
 成员之间不共享 CNN 或其他权重。实现按成员顺序训练和推理，以控制 100×100 PSD 在 GPU 上的峰值显存。
 
 每个成员在潜变量空间输出对角高斯分布。训练 reward 先按每条样本的 hoprate 和 `BER∈[0,0.5]` 推导边界，超界目标仅在奖励模型内部饱和，再归一化、避开 sigmoid 端点并做 logit 变换。训练损失为 latent Gaussian NLL；holdout 排名则在真实 reward 单位下比较 sigmoid 有界预测与有界目标的平均 MSE。
@@ -178,7 +180,7 @@ reward_model_inference.pt
 figures/
 ```
 
-`sac_inference.pt` 保存 actor 权重和网络/环境维度；其格式升级为 v2，并写入 `groupnorm_v2` 架构标识。旧 SAC v1 使用 BatchNorm，训练与单样本推理的统计口径不同，加载器会明确拒绝，必须重新训练。`reward_model_inference.pt` 保存全部 ensemble 权重、elite 索引、reward 配置、BER 边界、logit epsilon 和元数据，其独立 checkpoint 格式仍为 v1；旧的单一无界输出头与新的 latent mean/log-variance 双头权重不兼容，不提供迁移。两类 checkpoint 都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。
+`sac_inference.pt` 保存 actor 权重和网络/环境维度；其格式升级为 v3，并写入 `cnn3_groupnorm_hop_mlp2_fusion_mlp2_v3` 架构标识。旧 SAC v1 BatchNorm、v2 浅层 GroupNorm 或其他架构会被明确拒绝。`reward_model_inference.pt` 保存全部 ensemble 权重、elite 索引、reward 配置、BER 边界、logit epsilon 和元数据；其格式升级为 v2，并写入 `cnn3_groupnorm_hop_mlp2_state_action_fusion3_v2`。旧 reward v1 不做部分迁移。两类 checkpoint 都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。
 
 若纯在线运行始终未达到奖励模型 warm-up 门槛，只保存 SAC checkpoint，并在日志中明确说明奖励模型尚未拟合。
 
@@ -190,5 +192,5 @@ figures/
 4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且各成员遍历同一训练集合；holdout 与分歧可能偏乐观。
 5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
 6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。
-7. v1/v2 block-level replay、SAC BatchNorm checkpoint v1 与旧的无界奖励模型 checkpoint 均不兼容，必须重新生成数据和训练模型。
+7. v1/v2 block-level replay、SAC inference v1/v2 与 reward-model v1 checkpoint 均不兼容；旧模型必须重新训练，但现有 step-level v3 replay 可继续使用。
 8. 持续 FIFO 会在奖励模型版本切换后保留一段旧合成经验；若模型非平稳性很强，需要结合容量、rollout 频率和 `real_ratio` 调节其滞后程度。

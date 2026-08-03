@@ -6,6 +6,7 @@ image/hoprate encoder inside each network.
 """
 
 import collections
+import os
 import random
 
 import numpy as np
@@ -16,7 +17,12 @@ from torch.nn.parameter import UninitializedParameter
 
 
 HOPRATE_INPUT_SCALE = 10.0
-SAC_POLICY_ARCHITECTURE = "groupnorm_v2"
+PSD_FEATURE_DIM = 512
+HOPRATE_FEATURE_DIM = 128
+FUSION_HIDDEN_DIM = 512
+STATE_FEATURE_DIM = 256
+SAC_CHECKPOINT_FORMAT_VERSION = 3
+SAC_POLICY_ARCHITECTURE = "cnn3_groupnorm_hop_mlp2_fusion_mlp2_v3"
 
 
 def normalize_hoprate(hoprate, hoprate_min, hoprate_max):
@@ -211,15 +217,21 @@ class StateEncoder(nn.Module):
         self.norm1 = nn.GroupNorm(4, 16)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.norm2 = nn.GroupNorm(8, 32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.norm3 = nn.GroupNorm(16, 64)
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.flatten = nn.Flatten()
-        self.conv_fc = nn.LazyLinear(256)
+        self.conv_fc = nn.LazyLinear(PSD_FEATURE_DIM)
         self.hoprate_embedding = nn.Sequential(
             nn.Linear(1, 64),
             nn.ReLU(),
+            nn.Linear(64, HOPRATE_FEATURE_DIM),
+            nn.ReLU(),
         )
         self.fusion = nn.Sequential(
-            nn.LazyLinear(256),
+            nn.Linear(PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, FUSION_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(FUSION_HIDDEN_DIM, STATE_FEATURE_DIM),
             nn.ReLU(),
         )
         self.apply(_init_weights)
@@ -230,6 +242,8 @@ class StateEncoder(nn.Module):
         )
         image_features = F.relu(self.norm1(self.conv1(img)))
         image_features = F.relu(self.norm2(self.conv2(image_features)))
+        image_features = self.pool(image_features)
+        image_features = F.relu(self.norm3(self.conv3(image_features)))
         image_features = self.pool(image_features)
         image_features = self.flatten(image_features)
         image_features = F.relu(self.conv_fc(image_features))
@@ -244,7 +258,8 @@ class PolicyNet(nn.Module):
         self.num_heads = int(num_heads)
         self.encoder = StateEncoder(hoprate_min, hoprate_max)
         self.action_heads = nn.ModuleList(
-            nn.Linear(256, self.n_actions) for _ in range(self.num_heads)
+            nn.Linear(STATE_FEATURE_DIM, self.n_actions)
+            for _ in range(self.num_heads)
         )
         for head in self.action_heads:
             nn.init.uniform_(head.weight, -0.003, 0.003)
@@ -262,13 +277,131 @@ class ValueNet(nn.Module):
         self.num_heads = int(num_heads)
         self.encoder = StateEncoder(hoprate_min, hoprate_max)
         self.q_heads = nn.ModuleList(
-            nn.Linear(256, self.n_actions) for _ in range(self.num_heads)
+            nn.Linear(STATE_FEATURE_DIM, self.n_actions)
+            for _ in range(self.num_heads)
         )
         self.q_heads.apply(_init_weights)
 
     def forward(self, img, hoprate):
         features = self.encoder(img, hoprate)
         return torch.stack([head(features) for head in self.q_heads], dim=1)
+
+
+def _checkpoint_images(observation_shape, device):
+    shape = tuple(int(value) for value in observation_shape)
+    if len(shape) == 2:
+        return torch.zeros((1, 1, *shape), dtype=torch.float32, device=device)
+    if len(shape) == 3:
+        return torch.zeros((1, *shape), dtype=torch.float32, device=device)
+    raise ValueError("observation_shape must have two or three axes.")
+
+
+def save_sac_inference_checkpoint(
+    agent,
+    path,
+    observation_shape,
+    hoprate_min,
+    hoprate_max,
+    metadata=None,
+):
+    """Save the policy-only portion of SAC for deterministic inference."""
+    output_dir = os.path.dirname(os.path.abspath(path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    midpoint_hoprate = (float(hoprate_min) + float(hoprate_max)) / 2.0
+    with torch.no_grad():
+        agent.actor(
+            _checkpoint_images(observation_shape, agent.device),
+            torch.full(
+                (1, 1),
+                midpoint_hoprate,
+                dtype=torch.float32,
+                device=agent.device,
+            ),
+        )
+
+    torch.save(
+        {
+            "format_version": SAC_CHECKPOINT_FORMAT_VERSION,
+            "model_type": "MultiHeadSACPolicy",
+            "architecture": SAC_POLICY_ARCHITECTURE,
+            "config": {
+                "n_actions": agent.n_actions,
+                "num_heads": agent.num_heads,
+                "hoprate_min": float(hoprate_min),
+                "hoprate_max": float(hoprate_max),
+            },
+            "observation_shape": list(observation_shape),
+            "actor_state_dict": agent.actor.state_dict(),
+            "metadata": dict(metadata or {}),
+        },
+        path,
+    )
+
+
+def load_sac_inference_checkpoint(
+    path,
+    device="cpu",
+    expected_num_heads=None,
+    expected_n_actions=None,
+    expected_observation_shape=None,
+):
+    """Load a policy checkpoint and validate its architecture and dimensions."""
+    payload = torch.load(path, map_location=device, weights_only=True)
+    format_version = payload.get("format_version")
+    if format_version == 1:
+        raise ValueError(
+            "SAC inference checkpoint format v1 uses the old BatchNorm policy "
+            "architecture and cannot be loaded safely; retrain SAC to create a "
+            "v3 checkpoint."
+        )
+    if format_version == 2:
+        raise ValueError(
+            "SAC inference checkpoint format v2 uses the old shallow GroupNorm "
+            "policy architecture; retrain SAC to create a v3 checkpoint."
+        )
+    if format_version != SAC_CHECKPOINT_FORMAT_VERSION:
+        raise ValueError("Unsupported SAC inference checkpoint format.")
+    if payload.get("model_type") != "MultiHeadSACPolicy":
+        raise ValueError("Checkpoint does not contain a multi-head SAC policy.")
+    if payload.get("architecture") != SAC_POLICY_ARCHITECTURE:
+        raise ValueError(
+            "SAC checkpoint policy architecture does not match "
+            f"{SAC_POLICY_ARCHITECTURE!r}; retrain SAC with the current architecture."
+        )
+
+    config = dict(payload["config"])
+    observation_shape = tuple(payload["observation_shape"])
+    if expected_num_heads is not None and int(expected_num_heads) != int(
+        config["num_heads"]
+    ):
+        raise ValueError("SAC checkpoint block count does not match.")
+    if expected_n_actions is not None and int(expected_n_actions) != int(
+        config["n_actions"]
+    ):
+        raise ValueError("SAC checkpoint action count does not match.")
+    if (
+        expected_observation_shape is not None
+        and tuple(expected_observation_shape) != observation_shape
+    ):
+        raise ValueError("SAC checkpoint observation shape does not match.")
+
+    policy = PolicyNet(**config).to(device)
+    policy.eval()
+    with torch.no_grad():
+        policy(
+            _checkpoint_images(observation_shape, device),
+            torch.full(
+                (1, 1),
+                (config["hoprate_min"] + config["hoprate_max"]) / 2.0,
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+    policy.load_state_dict(payload["actor_state_dict"])
+    policy.eval()
+    return policy, dict(payload.get("metadata", {}))
 
 
 class SAC:

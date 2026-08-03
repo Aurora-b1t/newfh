@@ -18,10 +18,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from SAC import StateEncoder
+from SAC import STATE_FEATURE_DIM, StateEncoder
 
 
-CHECKPOINT_FORMAT_VERSION = 1
+REWARD_CHECKPOINT_FORMAT_VERSION = 2
+REWARD_MODEL_ARCHITECTURE = (
+    "cnn3_groupnorm_hop_mlp2_state_action_fusion3_v2"
+)
 DEFAULT_BER_MIN = 0.0
 DEFAULT_BER_MAX = 0.5
 DEFAULT_LOGIT_EPSILON = 1e-4
@@ -109,7 +112,9 @@ class StepRewardMember(nn.Module):
             nn.ReLU(),
         )
         self.fusion = nn.Sequential(
-            nn.Linear(256 + hidden_size, hidden_size),
+            nn.Linear(STATE_FEATURE_DIM + hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
@@ -663,8 +668,9 @@ class StepRewardEnsemble(nn.Module):
             os.makedirs(output_dir, exist_ok=True)
         torch.save(
             {
-                "format_version": CHECKPOINT_FORMAT_VERSION,
+                "format_version": REWARD_CHECKPOINT_FORMAT_VERSION,
                 "model_type": "StepRewardEnsemble",
+                "architecture": REWARD_MODEL_ARCHITECTURE,
                 "config": self._config(),
                 "observation_shape": list(self.observation_shape),
                 "elite_model_idxes": list(self.elite_model_idxes),
@@ -702,10 +708,22 @@ class StepRewardEnsemble(nn.Module):
         expected_observation_shape=None,
     ):
         payload = torch.load(path, map_location=device, weights_only=True)
-        if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        format_version = payload.get("format_version")
+        if format_version == 1:
+            raise ValueError(
+                "Reward-model checkpoint format v1 uses the old shallow state "
+                "encoder and two-layer state-action fusion; retrain the reward "
+                "model to create a v2 checkpoint."
+            )
+        if format_version != REWARD_CHECKPOINT_FORMAT_VERSION:
             raise ValueError("Unsupported reward-model checkpoint format.")
         if payload.get("model_type") != "StepRewardEnsemble":
             raise ValueError("Checkpoint does not contain a StepRewardEnsemble.")
+        if payload.get("architecture") != REWARD_MODEL_ARCHITECTURE:
+            raise ValueError(
+                "Reward-model checkpoint architecture does not match "
+                f"{REWARD_MODEL_ARCHITECTURE!r}; retrain with the current architecture."
+            )
         config = dict(payload["config"])
         if expected_num_heads is not None and int(expected_num_heads) != int(
             config["num_heads"]

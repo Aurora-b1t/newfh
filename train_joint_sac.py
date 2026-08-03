@@ -7,6 +7,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+from SAC import save_sac_inference_checkpoint
 from fh_env import save_waterfall_figure
 from joint_training import (
     add_derivative_nbs_args,
@@ -24,7 +25,6 @@ from joint_training import (
 )
 from offline_replay import environment_metadata
 import settings
-from train_mbpo import save_sac_inference_checkpoint
 from train_offsets import (
     build_agent_and_env,
     parse_optional_replay_path,

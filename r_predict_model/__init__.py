@@ -1,5 +1,13 @@
 """Public exports for the FHSS step-level MBPO reward model."""
 
-from .model import StepRewardEnsemble
+from .model import (
+    REWARD_CHECKPOINT_FORMAT_VERSION,
+    REWARD_MODEL_ARCHITECTURE,
+    StepRewardEnsemble,
+)
 
-__all__ = ["StepRewardEnsemble"]
+__all__ = [
+    "REWARD_CHECKPOINT_FORMAT_VERSION",
+    "REWARD_MODEL_ARCHITECTURE",
+    "StepRewardEnsemble",
+]

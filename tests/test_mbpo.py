@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 from SAC import ReplayBuffer, SAC, SAC_POLICY_ARCHITECTURE
-from r_predict_model import StepRewardEnsemble
+from r_predict_model import (
+    REWARD_CHECKPOINT_FORMAT_VERSION,
+    REWARD_MODEL_ARCHITECTURE,
+    StepRewardEnsemble,
+)
 from r_predict_model.mbpo_adapter import (
     reward_bounds,
     rollout_reward_model,
@@ -103,6 +107,27 @@ class StepRewardEnsembleTests(unittest.TestCase):
             model.members[1].state_encoder.conv1.weight,
         )
 
+    def test_reward_member_uses_three_layer_state_action_fusion(self):
+        member = self.make_model().members[0]
+        linears = [
+            module for module in member.fusion if isinstance(module, torch.nn.Linear)
+        ]
+        activations = [
+            module for module in member.fusion if isinstance(module, torch.nn.SiLU)
+        ]
+        self.assertEqual(3, len(linears))
+        self.assertEqual(3, len(activations))
+        self.assertEqual((256 + 16, 16), (
+            linears[0].in_features,
+            linears[0].out_features,
+        ))
+        self.assertTrue(
+            all(
+                (layer.in_features, layer.out_features) == (16, 16)
+                for layer in linears[1:]
+            )
+        )
+
     def test_fit_predict_and_sample_dynamic_heads(self):
         model = self.make_model()
         stats = model.fit(
@@ -168,6 +193,12 @@ class StepRewardEnsembleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "reward.pt")
             model.save_checkpoint(path, {"experiment": "test"})
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(
+                REWARD_CHECKPOINT_FORMAT_VERSION,
+                payload["format_version"],
+            )
+            self.assertEqual(REWARD_MODEL_ARCHITECTURE, payload["architecture"])
             loaded, metadata = StepRewardEnsemble.load_checkpoint(
                 path,
                 device="cpu",
@@ -187,6 +218,31 @@ class StepRewardEnsembleTests(unittest.TestCase):
         self.assertEqual(0.0, loaded.ber_min)
         self.assertEqual(0.5, loaded.ber_max)
         self.assertEqual(1e-4, loaded.logit_epsilon)
+
+    def test_reward_checkpoint_rejects_legacy_v1_and_wrong_architecture(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            legacy_path = os.path.join(tempdir, "legacy_reward.pt")
+            torch.save(
+                {
+                    "format_version": 1,
+                    "model_type": "StepRewardEnsemble",
+                },
+                legacy_path,
+            )
+            with self.assertRaisesRegex(ValueError, "old shallow.*retrain"):
+                StepRewardEnsemble.load_checkpoint(legacy_path, device="cpu")
+
+            wrong_arch_path = os.path.join(tempdir, "wrong_arch_reward.pt")
+            torch.save(
+                {
+                    "format_version": REWARD_CHECKPOINT_FORMAT_VERSION,
+                    "model_type": "StepRewardEnsemble",
+                    "architecture": "unexpected",
+                },
+                wrong_arch_path,
+            )
+            with self.assertRaisesRegex(ValueError, "architecture.*retrain"):
+                StepRewardEnsemble.load_checkpoint(wrong_arch_path, device="cpu")
 
     def test_one_elite_is_used_for_each_complete_reward_vector(self):
         model = self.make_model()
@@ -539,6 +595,31 @@ class TrainingAndCheckpointTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "BatchNorm.*retrain"):
                 load_sac_inference_checkpoint(path, device="cpu")
+
+    def test_sac_policy_checkpoint_rejects_v2_and_wrong_architecture(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            v2_path = os.path.join(tempdir, "legacy_sac_v2.pt")
+            torch.save(
+                {
+                    "format_version": 2,
+                    "model_type": "MultiHeadSACPolicy",
+                },
+                v2_path,
+            )
+            with self.assertRaisesRegex(ValueError, "shallow GroupNorm.*retrain"):
+                load_sac_inference_checkpoint(v2_path, device="cpu")
+
+            wrong_arch_path = os.path.join(tempdir, "wrong_arch_sac.pt")
+            torch.save(
+                {
+                    "format_version": SAC_CHECKPOINT_FORMAT_VERSION,
+                    "model_type": "MultiHeadSACPolicy",
+                    "architecture": "unexpected",
+                },
+                wrong_arch_path,
+            )
+            with self.assertRaisesRegex(ValueError, "architecture.*retrain"):
+                load_sac_inference_checkpoint(wrong_arch_path, device="cpu")
 
 
 if __name__ == "__main__":

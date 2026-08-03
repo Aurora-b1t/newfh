@@ -9,7 +9,7 @@ import logging
 import matplotlib.pyplot as plt
 
 from fh_env import FHSSQPSKEnv, save_waterfall_figure
-from SAC import SAC, ReplayBuffer
+from SAC import SAC, ReplayBuffer, save_sac_inference_checkpoint
 from offline_replay import (
     environment_metadata,
     load_replay_into_buffer,
@@ -363,6 +363,29 @@ def train(args):
         
     except Exception as e:
         logger.error(f"Plotting failed: {e}")
+
+    checkpoint_metadata = environment_metadata(
+        settings.ENV_CONFIG,
+        settings.JAMMER_CONFIG,
+        settings.REWARD_CONFIG,
+    )
+    checkpoint_metadata.update(
+        {
+            "num_actions": n_actions,
+            "num_blocks": env.num_blocks,
+            "fixed_hoprate": float(fixed_hoprate),
+        }
+    )
+    checkpoint_path = os.path.join(args.output_dir, "sac_inference.pt")
+    save_sac_inference_checkpoint(
+        agent,
+        checkpoint_path,
+        np.asarray(state_img).shape,
+        env.hoprate_min,
+        env.hoprate_max,
+        checkpoint_metadata,
+    )
+    logger.info("Saved SAC inference checkpoint to %s", checkpoint_path)
 
     total_duration = time.time() - start_time
     logger.info(f"Total Time: {total_duration:.2f}s | Mean Ep Reward: {mean_ep_reward:.4f}")
