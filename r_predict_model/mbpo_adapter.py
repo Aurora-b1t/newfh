@@ -120,12 +120,13 @@ def rollout_reward_model(
     reward_config,
     deterministic_model=False,
 ):
-    """Generate one-step synthetic transitions in the v3 SAC schema."""
+    """Append one-step synthetic transitions to the persistent FIFO replay."""
     if real_buffer.size() == 0:
         raise ValueError("Cannot roll out from an empty real replay buffer.")
     rollout_size = min(int(batch_size), real_buffer.size())
     if rollout_size <= 0:
         raise ValueError("rollout batch_size must be positive.")
+    model_buffer_size_before = model_buffer.size()
 
     starts = real_buffer.sample(rollout_size)
     state_imgs = starts["state_imgs"]
@@ -182,11 +183,20 @@ def rollout_reward_model(
             bool(starts["dones"][index]),
         )
 
+    model_buffer_size_after = model_buffer.size()
+    fifo_evicted = max(
+        0,
+        model_buffer_size_before + rollout_size - model_buffer_size_after,
+    )
     disagreement = np.asarray(
         prediction_stats["disagreement"], dtype=np.float32
     )
     return {
         "generated": rollout_size,
+        "model_buffer_size_before": model_buffer_size_before,
+        "model_buffer_size_after": model_buffer_size_after,
+        "model_buffer_capacity": model_buffer.capacity,
+        "fifo_evicted": fifo_evicted,
         "reward_mean": float(np.mean(predicted_rewards)),
         "reward_std": float(np.std(predicted_rewards)),
         "disagreement_mean": float(np.mean(disagreement)),

@@ -150,7 +150,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 
 [train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，为每个 block 输出 Logistic-Normal 潜变量的位置与方差；潜变量经 sigmoid 映射到由 `BER∈[0,0.5]`、hoprate 和奖励公式共同确定的 reward 区间。模型不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
 
-默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后会清空并重建 model replay。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此计算成本较高。
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每个真实环境 step 后使用当前全部真实 replay 继续拟合，因此计算成本较高。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help
@@ -332,7 +332,7 @@ D:\Anaconda\envs\rl_fhss\python.exe validate_psd.py
 - `loss.png`：actor/critic loss 曲线（offset/MBPO 训练）。
 - `model_reward.png`：奖励模型预测曲线（MBPO 训练）。
 - `model_holdout.png`、`model_disagreement.png`、`model_target_saturation_fraction.png`：MBPO 奖励模型拟合质量、elite 分歧和训练目标触及物理边界的比例。
-- `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态。
+- `sac_inference.pt`、`reward_model_inference.pt`：MBPO 推理 checkpoint，不含 optimizer、replay 或 RNG 状态；SAC 使用 GroupNorm 架构的 v2 格式，旧 BatchNorm v1 checkpoint 会被明确拒绝。
 - `hoprate.png`、`ber_vs_hoprate.png`、`derivative.png`、`nbs_weights.png`：NBS 搜索及联合训练诊断图。
 - `nbs_distribution.npz`：最终候选权重以及逐 step hoprate、BER、导数、MAP/加权估计和收敛状态。
 - `hoprate_sweep.csv`、`hoprate_sweep.npz`：sweep 评估数据。
@@ -450,17 +450,18 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 
 ## SAC 实现要点
 
-当前 [SAC.py](SAC.py) / [SAC_test.py](special_hopping_test/SAC_test.py) 的实现要点（近期已修复若干问题）：
+当前 [SAC.py](SAC.py) 的实现要点（近期已修复若干问题）：
 
 - **actor、两个 online critic 与两个 target critic 参数完全独立**；它们只复用 `StateEncoder` 类定义，不共享权重。
 - **不再输入 block index**：hoprate 按环境上下界归一化到 `[-10,10]`，十个固定位置的输出头分别对应 block 0～9。
 - **actor 只返回 raw logits**：`take_action()` 单次返回十维整数动作；训练采样用 `Categorical(logits=...)`，确定性推理使用逐头 `argmax`。
 - **共享温度系数**：十头共用一个 alpha，actor、critic 和 entropy loss 都对 batch/head 维取平均。
-- **目标网络固定为 eval 模式**：`target_critic_1/2` 始终用 BatchNorm running stats，不随 batch 抖动。
-- **Lazy target 延迟初始化**：首次 TD target 计算前先物化 online critics，再完整复制参数和 BatchNorm buffers；后续只做 soft update。
-- **`soft_update` 同步 BatchNorm buffers**（running_mean/running_var/num_batches_tracked）到目标网络。
-- **`calc_target` 在 `torch.no_grad()` 下、actor 切 eval** 计算 next-state 目标，避免建图/污染 BN stats。
-- **actor loss 计算时 critic 切 eval**，事后恢复 train，让策略梯度基于稳定的 running stats。
+- **卷积编码器使用 GroupNorm**：16/32 通道分别使用 4/8 组，不维护 batch running stats；同一权重与输入在 train/eval 模式下输出一致，消除了单样本执行与 batch 训练的归一化偏差。
+- **online 网络不再临时切换模式**：`take_action()`、TD target 和 actor loss 路径都保持调用前的网络模式；正常 `update()` 中 actor 与两个 online critic 的所有 forward 均处于 train 模式。
+- **目标网络固定为 eval 模式只表示角色**：`target_critic_1/2` 不参与优化；GroupNorm 在 train/eval 下数值一致，因此不会再引入目标值分布差异。
+- **Lazy target 延迟初始化**：首次 TD target 计算前先按 online critic 当前模式物化网络并完整复制参数，后续做 soft update。
+- **`calc_target` 在 `torch.no_grad()` 下计算**，不为 actor 或 target critics 构建梯度图。
+- **SAC 推理 checkpoint 升级为 v2**：写入 `groupnorm_v2` 架构标识；旧 BatchNorm v1 checkpoint 不做静默迁移，必须重新训练。
 - **step-level replay**：一条经验保存十维动作、十维 block reward、仅用于诊断的均值 step reward，以及真实下一环境状态。
 
 ## 通信环境设计取舍
@@ -482,5 +483,5 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - MBPO 是 reward-only 一步增强，不是完整 dynamics MBPO；其 next-state 复用依赖环境 observation transition 与 offsets 无关。
 - MBPO 默认每个在线 step 都用完整真实 replay 继续训练 5 个独立 CNN，计算成本高；需要快速实验时应调大 `model_train_freq` 或降低 `model_max_epochs`。
 - NBS 跳速搜索依赖 BER-vs-hoprate 的可辨识趋势；若同时启用多种强干扰或随机 offset 方差很大，可能需要增加步数、调大 `p` 或做多次重复评估。
-- v1/v2 block-level replay 和旧 SAC checkpoint 与当前网络拓扑不兼容，必须重新生成数据并重新训练。
+- v1/v2 block-level replay 和 SAC BatchNorm inference checkpoint v1 与当前实现不兼容，必须重新生成数据并重新训练。
 - 若后续要进一步规范工程结构，可以再做第二阶段重构：拆分 `env/`、`algos/`、`train/` 子包。

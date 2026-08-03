@@ -147,6 +147,10 @@ def train(args):
         args.pred_hidden_size,
         args.model_train_freq,
     )
+    logger.info(
+        "Model replay uses persistent FIFO retention with capacity=%d.",
+        model_buffer.capacity,
+    )
 
     start_time = time.time()
     for step_idx in range(1, args.steps_per_episode + 1):
@@ -194,7 +198,6 @@ def train(args):
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
             )
-            model_buffer.clear()
             last_rollout_stats = rollout_reward_model(
                 reward_model,
                 agent,
@@ -207,12 +210,17 @@ def train(args):
             model_fit_time = time.time() - model_start
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
-                "rollout=%d | disagreement=%.6f(p95=%.6f) | "
+                "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
+                "disagreement=%.6f(p95=%.6f) | "
                 "target_sat=%.2f%% | T=%.2fs",
                 last_model_stats["holdout_loss_mean"],
                 last_model_stats["elite_model_idxes"],
                 last_model_stats["epochs"],
                 last_rollout_stats["generated"],
+                last_rollout_stats["model_buffer_size_before"],
+                last_rollout_stats["model_buffer_size_after"],
+                last_rollout_stats["model_buffer_capacity"],
+                last_rollout_stats["fifo_evicted"],
                 last_rollout_stats["disagreement_mean"],
                 last_rollout_stats["disagreement_p95"],
                 100.0 * last_model_stats["target_saturation_fraction"],

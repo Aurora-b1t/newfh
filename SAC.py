@@ -16,6 +16,7 @@ from torch.nn.parameter import UninitializedParameter
 
 
 HOPRATE_INPUT_SCALE = 10.0
+SAC_POLICY_ARCHITECTURE = "groupnorm_v2"
 
 
 def normalize_hoprate(hoprate, hoprate_min, hoprate_max):
@@ -207,9 +208,9 @@ class StateEncoder(nn.Module):
         self.conv1 = nn.LazyConv2d(
             out_channels=16, kernel_size=3, stride=1, padding=1
         )
-        self.bn1 = nn.BatchNorm2d(16)
+        self.norm1 = nn.GroupNorm(4, 16)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
+        self.norm2 = nn.GroupNorm(8, 32)
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.flatten = nn.Flatten()
         self.conv_fc = nn.LazyLinear(256)
@@ -227,8 +228,8 @@ class StateEncoder(nn.Module):
         hoprate = normalize_hoprate(
             hoprate, self.hoprate_min, self.hoprate_max
         )
-        image_features = F.relu(self.bn1(self.conv1(img)))
-        image_features = F.relu(self.bn2(self.conv2(image_features)))
+        image_features = F.relu(self.norm1(self.conv1(img)))
+        image_features = F.relu(self.norm2(self.conv2(image_features)))
         image_features = self.pool(image_features)
         image_features = self.flatten(image_features)
         image_features = F.relu(self.conv_fc(image_features))
@@ -343,15 +344,12 @@ class SAC:
             [[float(hoprate)]], dtype=torch.float32, device=self.device
         )
 
-        was_training = self.actor.training
-        self.actor.eval()
         with torch.no_grad():
             logits = self.actor(img, hoprate_tensor)
             if deterministic:
                 actions = logits.argmax(dim=-1)
             else:
                 actions = torch.distributions.Categorical(logits=logits).sample()
-        self.actor.train(was_training)
         return actions.squeeze(0).cpu().numpy().astype(np.int64, copy=False)
 
     def _batch_images(self, images):
@@ -374,16 +372,9 @@ class SAC:
         if self._target_critics_initialized:
             return
 
-        critic_modes = (self.critic_1.training, self.critic_2.training)
-        self.critic_1.eval()
-        self.critic_2.eval()
-        try:
-            with torch.no_grad():
-                self.critic_1(imgs[:1], hoprates[:1])
-                self.critic_2(imgs[:1], hoprates[:1])
-        finally:
-            self.critic_1.train(critic_modes[0])
-            self.critic_2.train(critic_modes[1])
+        with torch.no_grad():
+            self.critic_1(imgs[:1], hoprates[:1])
+            self.critic_2(imgs[:1], hoprates[:1])
 
         self.target_critic_1.load_state_dict(self.critic_1.state_dict())
         self.target_critic_2.load_state_dict(self.critic_2.state_dict())
@@ -393,8 +384,6 @@ class SAC:
 
     def calc_target(self, block_rewards, next_imgs, next_hoprates, dones):
         self._ensure_target_critics_initialized(next_imgs, next_hoprates)
-        actor_was_training = self.actor.training
-        self.actor.eval()
         with torch.no_grad():
             next_logits = self.actor(next_imgs, next_hoprates)
             next_log_probs = F.log_softmax(next_logits, dim=-1)
@@ -407,7 +396,6 @@ class SAC:
                 dim=-1,
             )
             global_next_value = head_values.mean(dim=1, keepdim=True)
-        self.actor.train(actor_was_training)
         return block_rewards + self.gamma * global_next_value * (1.0 - dones)
 
     def soft_update(self, net, target_net):
@@ -475,9 +463,6 @@ class SAC:
         probs = log_probs.exp()
         entropy = -torch.sum(probs * log_probs, dim=-1)
 
-        critic_modes = (self.critic_1.training, self.critic_2.training)
-        self.critic_1.eval()
-        self.critic_2.eval()
         with torch.no_grad():
             min_q = torch.minimum(
                 self.critic_1(imgs, hoprates),
@@ -491,8 +476,6 @@ class SAC:
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-        self.critic_1.train(critic_modes[0])
-        self.critic_2.train(critic_modes[1])
 
         alpha_loss = (
             self.log_alpha * (entropy.detach() - self.target_entropy)

@@ -52,6 +52,24 @@ def make_agent(n_actions=5, gamma=0.95):
     )
 
 
+def make_transition_batch(batch_size=4, n_actions=5, seed=7):
+    rng = np.random.default_rng(seed)
+    states = rng.normal(size=(batch_size, 16, 16)).astype(np.float32)
+    block_rewards = rng.normal(size=(batch_size, 10)).astype(np.float32)
+    return {
+        "state_imgs": states,
+        "hoprates": np.full(batch_size, 100.0, dtype=np.float32),
+        "actions": rng.integers(
+            0, n_actions, size=(batch_size, 10), dtype=np.int64
+        ),
+        "block_rewards": block_rewards,
+        "step_rewards": block_rewards.mean(axis=1),
+        "next_state_imgs": states + 0.1,
+        "next_hoprates": np.full(batch_size, 110.0, dtype=np.float32),
+        "dones": np.zeros(batch_size, dtype=np.float32),
+    }
+
+
 class MultiHeadNetworkTests(unittest.TestCase):
     def test_hoprate_normalization_keeps_requested_scale(self):
         values = torch.tensor([[10.0], [505.0], [1000.0], [2000.0]])
@@ -74,6 +92,33 @@ class MultiHeadNetworkTests(unittest.TestCase):
         self.assertIsNot(actor.action_heads[0].weight, actor.action_heads[1].weight)
         self.assertIsNot(critic.q_heads[0].weight, critic.q_heads[1].weight)
 
+    def test_actor_and_critic_use_group_norm_without_batch_norm(self):
+        networks = (PolicyNet(5, num_heads=10), ValueNet(5, num_heads=10))
+        modules = [module for network in networks for module in network.modules()]
+
+        self.assertFalse(
+            any(
+                isinstance(module, nn.modules.batchnorm._BatchNorm)
+                for module in modules
+            )
+        )
+        self.assertEqual(4, sum(isinstance(module, nn.GroupNorm) for module in modules))
+
+    def test_train_and_eval_outputs_are_identical(self):
+        images = torch.randn(3, 1, 16, 16)
+        hoprates = torch.full((3, 1), 100.0)
+
+        for network in (PolicyNet(5, num_heads=10), ValueNet(5, num_heads=10)):
+            network.train()
+            with torch.no_grad():
+                training_output = network(images, hoprates)
+            network.eval()
+            with torch.no_grad():
+                inference_output = network(images, hoprates)
+            torch.testing.assert_close(
+                training_output, inference_output, rtol=0.0, atol=0.0
+            )
+
     def test_take_action_returns_ten_valid_offsets(self):
         agent = make_agent()
         state = np.random.randn(16, 16).astype(np.float32)
@@ -86,6 +131,23 @@ class MultiHeadNetworkTests(unittest.TestCase):
         self.assertEqual(np.int64, sampled.dtype)
         self.assertTrue(np.all((sampled >= 0) & (sampled < 5)))
         self.assertTrue(np.all((deterministic >= 0) & (deterministic < 5)))
+
+    def test_take_action_does_not_temporarily_flip_actor_mode(self):
+        agent = make_agent()
+        state = np.random.randn(16, 16).astype(np.float32)
+        for requested_mode in (True, False):
+            forward_modes = []
+            handle = agent.actor.register_forward_pre_hook(
+                lambda module, _inputs: forward_modes.append(module.training)
+            )
+            try:
+                agent.actor.train(requested_mode)
+                agent.take_action(state, 100.0, deterministic=True)
+            finally:
+                handle.remove()
+
+            self.assertEqual([requested_mode], forward_modes)
+            self.assertEqual(requested_mode, agent.actor.training)
 
 
 class MultiHeadSACTests(unittest.TestCase):
@@ -108,23 +170,8 @@ class MultiHeadSACTests(unittest.TestCase):
         )
 
     def test_update_returns_finite_stats(self):
-        rng = np.random.default_rng(7)
         agent = make_agent()
-        batch_size = 4
-        states = rng.normal(size=(batch_size, 16, 16)).astype(np.float32)
-        block_rewards = rng.normal(size=(batch_size, 10)).astype(np.float32)
-        batch = {
-            "state_imgs": states,
-            "hoprates": np.full(batch_size, 100.0, dtype=np.float32),
-            "actions": rng.integers(0, 5, size=(batch_size, 10), dtype=np.int64),
-            "block_rewards": block_rewards,
-            "step_rewards": block_rewards.mean(axis=1),
-            "next_state_imgs": states + 0.1,
-            "next_hoprates": np.full(batch_size, 110.0, dtype=np.float32),
-            "dones": np.zeros(batch_size, dtype=np.float32),
-        }
-
-        stats = agent.update(batch)
+        stats = agent.update(make_transition_batch())
 
         for key in (
             "critic1_loss",
@@ -137,6 +184,29 @@ class MultiHeadSACTests(unittest.TestCase):
             self.assertTrue(np.isfinite(stats[key]), key)
         self.assertEqual(0, agent.log_alpha.ndim)
         self.assertTrue(agent._target_critics_initialized)
+
+    def test_update_keeps_online_network_forwards_in_training_mode(self):
+        agent = make_agent()
+        observed_modes = {"actor": [], "critic_1": [], "critic_2": []}
+        handles = []
+        for name in observed_modes:
+            network = getattr(agent, name)
+            handles.append(
+                network.register_forward_pre_hook(
+                    lambda module, _inputs, key=name: observed_modes[key].append(
+                        module.training
+                    )
+                )
+            )
+        try:
+            agent.update(make_transition_batch(seed=9))
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        for name, modes in observed_modes.items():
+            self.assertTrue(modes, name)
+            self.assertTrue(all(modes), f"{name} modes: {modes}")
 
 
 if __name__ == "__main__":

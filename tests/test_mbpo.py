@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from SAC import ReplayBuffer, SAC
+from SAC import ReplayBuffer, SAC, SAC_POLICY_ARCHITECTURE
 from r_predict_model import StepRewardEnsemble
 from r_predict_model.mbpo_adapter import (
     reward_bounds,
@@ -17,6 +17,7 @@ from r_predict_model.mbpo_adapter import (
     train_reward_model_from_replay,
 )
 from train_mbpo import (
+    SAC_CHECKPOINT_FORMAT_VERSION,
     load_sac_inference_checkpoint,
     reward_model_ready,
     save_sac_inference_checkpoint,
@@ -375,11 +376,11 @@ class AdapterTests(unittest.TestCase):
                 reward_config=TEST_REWARD_CONFIG,
             )
 
-    def test_model_replay_can_be_cleared_before_rebuild(self):
+    def test_model_replay_accumulates_and_evicts_oldest_entries_fifo(self):
         real_buffer = make_buffer(count=2)
-        model_buffer = ReplayBuffer(2, num_heads=3, n_actions=4)
-        rollout_reward_model(
-            FixedRewardModel([0.0, 0.5, 1.0]),
+        model_buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
+        first_stats = rollout_reward_model(
+            FixedRewardModel([0.0, 0.25, 0.5]),
             FixedAgent([0, 1, 2]),
             real_buffer,
             model_buffer,
@@ -387,11 +388,12 @@ class AdapterTests(unittest.TestCase):
             reward_config=TEST_REWARD_CONFIG,
         )
         self.assertEqual(2, model_buffer.size())
-        model_buffer.clear()
-        self.assertEqual(0, model_buffer.size())
-        self.assertIsNone(model_buffer.observation_shape)
-        rollout_reward_model(
-            FixedRewardModel([1.0, 0.5, 0.0]),
+        self.assertEqual(0, first_stats["model_buffer_size_before"])
+        self.assertEqual(2, first_stats["model_buffer_size_after"])
+        self.assertEqual(0, first_stats["fifo_evicted"])
+
+        second_stats = rollout_reward_model(
+            FixedRewardModel([1.0, 0.75, 0.5]),
             FixedAgent([0, 1, 2]),
             real_buffer,
             model_buffer,
@@ -399,8 +401,20 @@ class AdapterTests(unittest.TestCase):
             reward_config=TEST_REWARD_CONFIG,
         )
         generated = model_buffer.get_all()
+        self.assertEqual(2, second_stats["model_buffer_size_before"])
+        self.assertEqual(3, second_stats["model_buffer_size_after"])
+        self.assertEqual(3, second_stats["model_buffer_capacity"])
+        self.assertEqual(1, second_stats["fifo_evicted"])
         np.testing.assert_allclose(
-            generated["block_rewards"], np.tile([1.0, 0.5, 0.0], (2, 1))
+            generated["block_rewards"],
+            np.asarray(
+                [
+                    [0.0, 0.25, 0.5],
+                    [1.0, 0.75, 0.5],
+                    [1.0, 0.75, 0.5],
+                ],
+                dtype=np.float32,
+            ),
         )
 
     def test_reward_bounds_support_penalty_signs(self):
@@ -487,7 +501,7 @@ class TrainingAndCheckpointTests(unittest.TestCase):
         agent.take_action(state, 100.0, deterministic=True)
         images = torch.from_numpy(state).view(1, 1, 8, 8)
         hoprates = torch.tensor([[100.0]])
-        agent.actor.eval()
+        agent.actor.train()
         with torch.no_grad():
             before = agent.actor(images, hoprates).numpy()
 
@@ -496,6 +510,11 @@ class TrainingAndCheckpointTests(unittest.TestCase):
             save_sac_inference_checkpoint(
                 agent, path, (8, 8), 10.0, 1000.0, {"experiment": "test"}
             )
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(
+                SAC_CHECKPOINT_FORMAT_VERSION, payload["format_version"]
+            )
+            self.assertEqual(SAC_POLICY_ARCHITECTURE, payload["architecture"])
             loaded, metadata = load_sac_inference_checkpoint(
                 path,
                 device="cpu",
@@ -507,6 +526,19 @@ class TrainingAndCheckpointTests(unittest.TestCase):
                 after = loaded(images, hoprates).numpy()
         np.testing.assert_allclose(before, after, rtol=1e-6, atol=1e-6)
         self.assertEqual("test", metadata["experiment"])
+
+    def test_sac_policy_checkpoint_rejects_legacy_batchnorm_v1(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "legacy_sac.pt")
+            torch.save(
+                {
+                    "format_version": 1,
+                    "model_type": "MultiHeadSACPolicy",
+                },
+                path,
+            )
+            with self.assertRaisesRegex(ValueError, "BatchNorm.*retrain"):
+                load_sac_inference_checkpoint(path, device="cpu")
 
 
 if __name__ == "__main__":

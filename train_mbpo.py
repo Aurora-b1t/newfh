@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from SAC import PolicyNet, ReplayBuffer
+from SAC import PolicyNet, ReplayBuffer, SAC_POLICY_ARCHITECTURE
 from fh_env import save_waterfall_figure
 from offline_replay import environment_metadata, load_replay_into_buffer
 from r_predict_model import StepRewardEnsemble
@@ -27,7 +27,7 @@ from train_offsets import (
 )
 
 
-SAC_CHECKPOINT_FORMAT_VERSION = 1
+SAC_CHECKPOINT_FORMAT_VERSION = 2
 
 
 def _checkpoint_images(observation_shape, device):
@@ -55,6 +55,7 @@ def save_sac_inference_checkpoint(
         {
             "format_version": SAC_CHECKPOINT_FORMAT_VERSION,
             "model_type": "MultiHeadSACPolicy",
+            "architecture": SAC_POLICY_ARCHITECTURE,
             "config": {
                 "n_actions": agent.n_actions,
                 "num_heads": agent.num_heads,
@@ -78,10 +79,22 @@ def load_sac_inference_checkpoint(
 ):
     """Load a policy checkpoint and validate its environment-facing shape."""
     payload = torch.load(path, map_location=device, weights_only=True)
-    if payload.get("format_version") != SAC_CHECKPOINT_FORMAT_VERSION:
+    format_version = payload.get("format_version")
+    if format_version == 1:
+        raise ValueError(
+            "SAC inference checkpoint format v1 uses the old BatchNorm policy "
+            "architecture and cannot be loaded safely; retrain SAC to create a "
+            "GroupNorm v2 checkpoint."
+        )
+    if format_version != SAC_CHECKPOINT_FORMAT_VERSION:
         raise ValueError("Unsupported SAC inference checkpoint format.")
     if payload.get("model_type") != "MultiHeadSACPolicy":
         raise ValueError("Checkpoint does not contain a multi-head SAC policy.")
+    if payload.get("architecture") != SAC_POLICY_ARCHITECTURE:
+        raise ValueError(
+            "SAC checkpoint policy architecture does not match "
+            f"{SAC_POLICY_ARCHITECTURE!r}."
+        )
     config = dict(payload["config"])
     observation_shape = tuple(payload["observation_shape"])
     if expected_num_heads is not None and int(expected_num_heads) != int(
@@ -267,6 +280,10 @@ def train(args):
         args.model_train_freq,
     )
     logger.info(
+        "Model replay uses persistent FIFO retention with capacity=%d.",
+        model_buffer.capacity,
+    )
+    logger.info(
         "Start MBPO+SAC training for %d environment steps at hoprate %.1f.",
         args.steps_per_episode,
         fixed_hoprate,
@@ -346,7 +363,6 @@ def train(args):
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
             )
-            model_buffer.clear()
             last_rollout_stats = rollout_reward_model(
                 reward_model,
                 agent,
@@ -359,12 +375,17 @@ def train(args):
             model_fit_time = time.time() - model_start
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
-                "rollout=%d | disagreement=%.6f(p95=%.6f) | "
+                "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
+                "disagreement=%.6f(p95=%.6f) | "
                 "target_sat=%.2f%% | T=%.2fs",
                 last_model_stats["holdout_loss_mean"],
                 last_model_stats["elite_model_idxes"],
                 last_model_stats["epochs"],
                 last_rollout_stats["generated"],
+                last_rollout_stats["model_buffer_size_before"],
+                last_rollout_stats["model_buffer_size_after"],
+                last_rollout_stats["model_buffer_capacity"],
+                last_rollout_stats["fifo_evicted"],
                 last_rollout_stats["disagreement_mean"],
                 last_rollout_stats["disagreement_p95"],
                 100.0 * last_model_stats["target_saturation_fraction"],
