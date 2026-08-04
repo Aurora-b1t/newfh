@@ -205,6 +205,8 @@ def train(args):
     }
     holdout_curve_steps = []
     holdout_curve_history = []
+    train_curve_steps = []
+    train_curve_history = []
     last_model_stats = {}
     last_rollout_stats = {}
 
@@ -282,6 +284,11 @@ def train(args):
             _save_holdout_curves_figure(
                 args.output_dir, step_idx, last_model_stats["holdout_curves"]
             )
+            train_curve_steps.append(step_idx)
+            train_curve_history.append(last_model_stats["train_curves"])
+            _save_train_curves_figure(
+                args.output_dir, step_idx, last_model_stats["train_curves"]
+            )
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
                 "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
@@ -358,6 +365,9 @@ def train(args):
     save_plots(args.output_dir, metrics, logger)
     _save_holdout_curves_npz(
         args.output_dir, holdout_curve_steps, holdout_curve_history, logger
+    )
+    _save_train_curves_npz(
+        args.output_dir, train_curve_steps, train_curve_history, logger
     )
     checkpoint_metadata = dict(current_metadata)
     checkpoint_metadata.update(
@@ -446,6 +456,56 @@ def _save_holdout_curves_npz(output_dir, fit_steps, holdout_curve_history, logge
         )
     except Exception as exc:
         logger.error("Saving holdout curves failed: %s", exc)
+
+
+def _save_train_curves_figure(output_dir, step_idx, train_curves):
+    """Save one per-epoch training-loss figure for a single reward-model fit."""
+    curves_dir = os.path.join(output_dir, "train_curves")
+    os.makedirs(curves_dir, exist_ok=True)
+    plt.figure()
+    for member_idx, curve in enumerate(train_curves):
+        plt.plot(
+            range(1, len(curve) + 1),
+            curve,
+            marker=".",
+            label=f"Member {member_idx}",
+        )
+    plt.title(f"Reward-Model Train NLL (Step {step_idx})")
+    plt.xlabel("Epoch")
+    plt.ylabel("Train NLL")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(curves_dir, f"train_step_{step_idx:04d}.png"))
+    plt.close()
+
+
+def _save_train_curves_npz(output_dir, fit_steps, train_curve_history, logger):
+    """Persist all per-fit training curves with NaN padding for ragged epochs."""
+    if not train_curve_history:
+        logger.info("No reward-model fits ran; train_curves.npz was not saved.")
+        return
+    try:
+        num_fits = len(train_curve_history)
+        num_members = len(train_curve_history[0])
+        max_len = max(
+            len(curve) for curves in train_curve_history for curve in curves
+        )
+        padded = np.full((num_fits, num_members, max_len), np.nan, dtype=np.float64)
+        for fit_idx, curves in enumerate(train_curve_history):
+            for member_idx, curve in enumerate(curves):
+                padded[fit_idx, member_idx, : len(curve)] = curve
+        np.savez(
+            os.path.join(output_dir, "train_curves.npz"),
+            train_curves=padded,
+            fit_steps=np.asarray(fit_steps, dtype=np.int64),
+        )
+        logger.info(
+            "Saved %d per-fit training curves to %s.",
+            num_fits,
+            os.path.join(output_dir, "train_curves.npz"),
+        )
+    except Exception as exc:
+        logger.error("Saving training curves failed: %s", exc)
 
 
 def _save_curve(output_dir, values, filename, title, ylabel, color=None):

@@ -25,6 +25,8 @@ from train_mbpo import (
     SAC_CHECKPOINT_FORMAT_VERSION,
     _save_holdout_curves_figure,
     _save_holdout_curves_npz,
+    _save_train_curves_figure,
+    _save_train_curves_npz,
     load_sac_inference_checkpoint,
     reward_model_ready,
     save_sac_inference_checkpoint,
@@ -397,6 +399,24 @@ class StepRewardEnsembleTests(unittest.TestCase):
             self.assertEqual(epochs_run + 1, len(curve))
             self.assertTrue(all(np.isfinite(curve)))
 
+    def test_fit_records_per_member_train_curves(self):
+        model = self.make_model()
+        stats = model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            self.rewards,
+            batch_size=2,
+            max_epochs=3,
+            patience=10,
+        )
+
+        self.assertEqual(2, len(stats["train_curves"]))
+        for curve, epochs_run in zip(stats["train_curves"], stats["epochs"]):
+            self.assertEqual(3, epochs_run)
+            self.assertEqual(epochs_run, len(curve))
+            self.assertTrue(all(np.isfinite(curve)))
+
     def test_fit_retrains_from_scratch_each_call(self):
         model = self.make_model()
         model.fit(
@@ -626,6 +646,30 @@ class HoldoutCurveOutputTests(unittest.TestCase):
                     payload["holdout_curves"][0, 1, :2], [0.6, 0.55]
                 )
                 self.assertTrue(np.isnan(payload["holdout_curves"][0, 1, 2]))
+
+
+class TrainCurveOutputTests(unittest.TestCase):
+    def test_per_fit_figure_and_npz_outputs(self):
+        logger = logging.getLogger("test_train_curve_outputs")
+        curves = [[0.5, 0.4, 0.3], [0.6, 0.55]]
+        with tempfile.TemporaryDirectory() as tempdir:
+            _save_train_curves_figure(tempdir, 3, curves)
+            figure_path = os.path.join(
+                tempdir, "train_curves", "train_step_0003.png"
+            )
+            self.assertTrue(os.path.exists(figure_path))
+
+            _save_train_curves_npz(tempdir, [3], [curves], logger)
+            with np.load(os.path.join(tempdir, "train_curves.npz")) as payload:
+                self.assertEqual((1, 2, 3), payload["train_curves"].shape)
+                np.testing.assert_array_equal(payload["fit_steps"], [3])
+                np.testing.assert_allclose(
+                    payload["train_curves"][0, 0], [0.5, 0.4, 0.3]
+                )
+                np.testing.assert_allclose(
+                    payload["train_curves"][0, 1, :2], [0.6, 0.55]
+                )
+                self.assertTrue(np.isnan(payload["train_curves"][0, 1, 2]))
 
 
 class TrainingAndCheckpointTests(unittest.TestCase):

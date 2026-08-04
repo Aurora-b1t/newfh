@@ -456,6 +456,7 @@ class StepRewardEnsemble(nn.Module):
         train_indices = permutation[holdout_size:]
         epoch_counts = []
         holdout_curves = []
+        train_curves = []
 
         for member, optimizer in zip(self.members, self.optimizers):
             best_loss = self._evaluate_member(
@@ -464,6 +465,7 @@ class StepRewardEnsemble(nn.Module):
             if not np.isfinite(best_loss):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
             member_curve = [float(best_loss)]
+            member_train_curve = []
             best_state = copy.deepcopy(member.state_dict())
             best_optimizer_state = copy.deepcopy(optimizer.state_dict())
             stale_epochs = 0
@@ -472,6 +474,7 @@ class StepRewardEnsemble(nn.Module):
             for epoch in range(max_epochs):
                 member.train()
                 shuffled_indices = np.random.permutation(train_indices)
+                epoch_batch_losses = []
                 for start in range(0, len(shuffled_indices), batch_size):
                     batch_indices = shuffled_indices[start : start + batch_size]
                     images_t, hoprates_t, actions_t, rewards_t = self._batch_tensors(
@@ -489,7 +492,9 @@ class StepRewardEnsemble(nn.Module):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                    epoch_batch_losses.append(float(loss.item()))
 
+                member_train_curve.append(float(np.mean(epoch_batch_losses)))
                 holdout_loss = self._evaluate_member(
                     member, dataset, holdout_indices, batch_size
                 )
@@ -515,6 +520,7 @@ class StepRewardEnsemble(nn.Module):
             member.eval()
             epoch_counts.append(epochs_run)
             holdout_curves.append(member_curve)
+            train_curves.append(member_train_curve)
 
         holdout_losses = np.asarray(
             [
@@ -530,6 +536,7 @@ class StepRewardEnsemble(nn.Module):
         self.last_train_stats = {
             "epochs": epoch_counts,
             "holdout_curves": holdout_curves,
+            "train_curves": train_curves,
             "holdout_losses": holdout_losses,
             "holdout_loss_mean": float(np.mean(holdout_losses)),
             "elite_model_idxes": list(self.elite_model_idxes),
