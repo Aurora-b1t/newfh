@@ -240,6 +240,16 @@ class StepRewardEnsemble(nn.Module):
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        self.members = nn.ModuleList()
+        self.optimizers = []
+        self._reset_members_and_optimizers()
+        self.elite_model_idxes = list(range(self.elite_size))
+        self.observation_shape = None
+        self.is_fitted = False
+        self.last_train_stats = {}
+
+    def _reset_members_and_optimizers(self):
+        """Re-initialize every member network and Adam optimizer from scratch."""
         self.members = nn.ModuleList(
             StepRewardMember(
                 self.num_heads,
@@ -259,10 +269,6 @@ class StepRewardEnsemble(nn.Module):
             )
             for member in self.members
         ]
-        self.elite_model_idxes = list(range(self.elite_size))
-        self.observation_shape = None
-        self.is_fitted = False
-        self.last_train_stats = {}
 
     def reward_bounds(self, hoprates):
         return reward_bounds_from_config(
@@ -413,7 +419,11 @@ class StepRewardEnsemble(nn.Module):
         max_epochs=100,
         min_improvement=0.01,
     ):
-        """Fit every member on the full current real-replay training split."""
+        """Retrain every member from scratch on the current real-replay split.
+
+        All member weights and Adam optimizer states are re-initialized at the
+        start of every call; training never continues from a previous fit.
+        """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
         if not 0.0 < holdout_ratio < 1.0:
@@ -437,6 +447,7 @@ class StepRewardEnsemble(nn.Module):
             hoprates, block_rewards
         )
 
+        self._reset_members_and_optimizers()
         permutation = np.random.permutation(dataset.size)
         holdout_size = min(
             max(1, int(dataset.size * holdout_ratio)), dataset.size - 1
@@ -444,6 +455,7 @@ class StepRewardEnsemble(nn.Module):
         holdout_indices = permutation[:holdout_size]
         train_indices = permutation[holdout_size:]
         epoch_counts = []
+        holdout_curves = []
 
         for member, optimizer in zip(self.members, self.optimizers):
             best_loss = self._evaluate_member(
@@ -451,6 +463,7 @@ class StepRewardEnsemble(nn.Module):
             )
             if not np.isfinite(best_loss):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
+            member_curve = [float(best_loss)]
             best_state = copy.deepcopy(member.state_dict())
             best_optimizer_state = copy.deepcopy(optimizer.state_dict())
             stale_epochs = 0
@@ -482,6 +495,7 @@ class StepRewardEnsemble(nn.Module):
                 )
                 if not np.isfinite(holdout_loss):
                     raise RuntimeError("Reward-model holdout loss became non-finite.")
+                member_curve.append(float(holdout_loss))
                 relative_improvement = (
                     (best_loss - holdout_loss) / max(abs(best_loss), 1e-12)
                 )
@@ -500,6 +514,7 @@ class StepRewardEnsemble(nn.Module):
             optimizer.load_state_dict(best_optimizer_state)
             member.eval()
             epoch_counts.append(epochs_run)
+            holdout_curves.append(member_curve)
 
         holdout_losses = np.asarray(
             [
@@ -514,6 +529,7 @@ class StepRewardEnsemble(nn.Module):
         self.is_fitted = True
         self.last_train_stats = {
             "epochs": epoch_counts,
+            "holdout_curves": holdout_curves,
             "holdout_losses": holdout_losses,
             "holdout_loss_mean": float(np.mean(holdout_losses)),
             "elite_model_idxes": list(self.elite_model_idxes),

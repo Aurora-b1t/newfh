@@ -200,10 +200,11 @@ def train(args):
         "actor_losses": [],
         "critic_losses": [],
         "model_rewards": [],
-        "holdout_losses": [],
         "disagreements": [],
         "target_saturation_fractions": [],
     }
+    holdout_curve_steps = []
+    holdout_curve_history = []
     last_model_stats = {}
     last_rollout_stats = {}
 
@@ -276,6 +277,11 @@ def train(args):
                 deterministic_model=args.deterministic_model_rollout,
             )
             model_fit_time = time.time() - model_start
+            holdout_curve_steps.append(step_idx)
+            holdout_curve_history.append(last_model_stats["holdout_curves"])
+            _save_holdout_curves_figure(
+                args.output_dir, step_idx, last_model_stats["holdout_curves"]
+            )
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
                 "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
@@ -312,9 +318,6 @@ def train(args):
         metrics["critic_losses"].append(train_stats.get("critic1_loss", np.nan))
         metrics["model_rewards"].append(
             last_rollout_stats.get("reward_mean", np.nan)
-        )
-        metrics["holdout_losses"].append(
-            last_model_stats.get("holdout_loss_mean", np.nan)
         )
         metrics["disagreements"].append(
             last_rollout_stats.get("disagreement_mean", np.nan)
@@ -353,6 +356,9 @@ def train(args):
             break
 
     save_plots(args.output_dir, metrics, logger)
+    _save_holdout_curves_npz(
+        args.output_dir, holdout_curve_steps, holdout_curve_history, logger
+    )
     checkpoint_metadata = dict(current_metadata)
     checkpoint_metadata.update(
         {
@@ -392,6 +398,56 @@ def train(args):
     )
 
 
+def _save_holdout_curves_figure(output_dir, step_idx, holdout_curves):
+    """Save one per-epoch holdout-loss figure for a single reward-model fit."""
+    curves_dir = os.path.join(output_dir, "holdout_curves")
+    os.makedirs(curves_dir, exist_ok=True)
+    plt.figure()
+    for member_idx, curve in enumerate(holdout_curves):
+        plt.plot(
+            range(len(curve)),
+            curve,
+            marker=".",
+            label=f"Member {member_idx}",
+        )
+    plt.title(f"Reward-Model Holdout MSE (Step {step_idx})")
+    plt.xlabel("Epoch")
+    plt.ylabel("Holdout MSE")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(curves_dir, f"holdout_step_{step_idx:04d}.png"))
+    plt.close()
+
+
+def _save_holdout_curves_npz(output_dir, fit_steps, holdout_curve_history, logger):
+    """Persist all per-fit holdout curves with NaN padding for ragged epochs."""
+    if not holdout_curve_history:
+        logger.info("No reward-model fits ran; holdout_curves.npz was not saved.")
+        return
+    try:
+        num_fits = len(holdout_curve_history)
+        num_members = len(holdout_curve_history[0])
+        max_len = max(
+            len(curve) for curves in holdout_curve_history for curve in curves
+        )
+        padded = np.full((num_fits, num_members, max_len), np.nan, dtype=np.float64)
+        for fit_idx, curves in enumerate(holdout_curve_history):
+            for member_idx, curve in enumerate(curves):
+                padded[fit_idx, member_idx, : len(curve)] = curve
+        np.savez(
+            os.path.join(output_dir, "holdout_curves.npz"),
+            holdout_curves=padded,
+            fit_steps=np.asarray(fit_steps, dtype=np.int64),
+        )
+        logger.info(
+            "Saved %d per-fit holdout curves to %s.",
+            num_fits,
+            os.path.join(output_dir, "holdout_curves.npz"),
+        )
+    except Exception as exc:
+        logger.error("Saving holdout curves failed: %s", exc)
+
+
 def _save_curve(output_dir, values, filename, title, ylabel, color=None):
     plt.figure()
     plt.plot(values, color=color)
@@ -427,13 +483,6 @@ def save_plots(output_dir, metrics, logger):
             "model_reward.png",
             "Synthetic Reward Mean",
             "Reward",
-        )
-        _save_curve(
-            output_dir,
-            metrics["holdout_losses"],
-            "model_holdout.png",
-            "Reward Model Holdout MSE",
-            "MSE",
         )
         _save_curve(
             output_dir,

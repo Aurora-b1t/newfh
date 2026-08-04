@@ -1,4 +1,5 @@
 import copy
+import logging
 import math
 import os
 import tempfile
@@ -22,6 +23,8 @@ from r_predict_model.mbpo_adapter import (
 )
 from train_mbpo import (
     SAC_CHECKPOINT_FORMAT_VERSION,
+    _save_holdout_curves_figure,
+    _save_holdout_curves_npz,
     load_sac_inference_checkpoint,
     reward_model_ready,
     save_sac_inference_checkpoint,
@@ -376,6 +379,79 @@ class StepRewardEnsembleTests(unittest.TestCase):
                 else:
                     self.assertEqual(actual_state[key], expected)
 
+    def test_fit_records_per_member_holdout_curves(self):
+        model = self.make_model()
+        stats = model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            self.rewards,
+            batch_size=2,
+            max_epochs=3,
+            patience=10,
+        )
+
+        self.assertEqual(2, len(stats["holdout_curves"]))
+        for curve, epochs_run in zip(stats["holdout_curves"], stats["epochs"]):
+            self.assertEqual(3, epochs_run)
+            self.assertEqual(epochs_run + 1, len(curve))
+            self.assertTrue(all(np.isfinite(curve)))
+
+    def test_fit_retrains_from_scratch_each_call(self):
+        model = self.make_model()
+        model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            self.rewards,
+            batch_size=2,
+            max_epochs=2,
+            patience=2,
+        )
+        trained_state = copy.deepcopy(model.members[0].state_dict())
+
+        captured = {}
+        real_evaluate = model._evaluate_member
+
+        def capture_first_eval(member, dataset, indices, batch_size):
+            result = real_evaluate(member, dataset, indices, batch_size)
+            if "weights" not in captured:
+                # Capture after the first forward pass so lazy layers of the
+                # freshly rebuilt member have materialized their parameters.
+                captured["weights"] = copy.deepcopy(member.state_dict())
+                captured["optimizer_state"] = copy.deepcopy(
+                    model.optimizers[0].state_dict()
+                )
+            return result
+
+        with mock.patch.object(
+            model, "_evaluate_member", side_effect=capture_first_eval
+        ):
+            stats = model.fit(
+                self.states,
+                self.hoprates,
+                self.actions,
+                self.rewards,
+                batch_size=2,
+                max_epochs=1,
+                patience=0,
+            )
+
+        weights_differ = any(
+            not torch.equal(captured["weights"][key], trained_state[key])
+            for key in trained_state
+        )
+        self.assertTrue(
+            weights_differ,
+            "Second fit must start from freshly initialized member weights.",
+        )
+        self.assertEqual(
+            0,
+            len(captured["optimizer_state"]["state"]),
+            "Second fit must start from a fresh Adam optimizer state.",
+        )
+        self.assertEqual(2, len(stats["holdout_curves"][0]))
+
 
 class AdapterTests(unittest.TestCase):
     def test_mixed_batch_is_complete_and_respects_ratio(self):
@@ -526,6 +602,30 @@ class AdapterTests(unittest.TestCase):
             patience=0,
         )
         self.assertEqual(4, stats["train_size"] + stats["holdout_size"])
+
+
+class HoldoutCurveOutputTests(unittest.TestCase):
+    def test_per_fit_figure_and_npz_outputs(self):
+        logger = logging.getLogger("test_holdout_curve_outputs")
+        curves = [[0.5, 0.4, 0.3], [0.6, 0.55]]
+        with tempfile.TemporaryDirectory() as tempdir:
+            _save_holdout_curves_figure(tempdir, 3, curves)
+            figure_path = os.path.join(
+                tempdir, "holdout_curves", "holdout_step_0003.png"
+            )
+            self.assertTrue(os.path.exists(figure_path))
+
+            _save_holdout_curves_npz(tempdir, [3], [curves], logger)
+            with np.load(os.path.join(tempdir, "holdout_curves.npz")) as payload:
+                self.assertEqual((1, 2, 3), payload["holdout_curves"].shape)
+                np.testing.assert_array_equal(payload["fit_steps"], [3])
+                np.testing.assert_allclose(
+                    payload["holdout_curves"][0, 0], [0.5, 0.4, 0.3]
+                )
+                np.testing.assert_allclose(
+                    payload["holdout_curves"][0, 1, :2], [0.6, 0.55]
+                )
+                self.assertTrue(np.isnan(payload["holdout_curves"][0, 1, 2]))
 
 
 class TrainingAndCheckpointTests(unittest.TestCase):

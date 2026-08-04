@@ -63,9 +63,10 @@ dones            [B]
 2. 当真实 replay 数量至少达到 `model_train_batch_size` 时，按 `model_train_freq` 判断是否拟合。
 3. 对当前 real buffer 中全部 transition 做一次随机 train/holdout 划分。
 4. 公共 holdout 默认占 20%；各成员遍历完整 train split，但使用独立随机顺序。
-5. 网络参数在不同环境 step 之间连续训练，不重新初始化。
+5. 每次拟合都从头重新训练：拟合开始时重新随机初始化全部成员权重并重建 Adam 优化器，不在上一版本模型基础上继续训练。
 6. holdout 连续 5 个 epoch 没有至少 1% 改善时早停，最多 100 epoch。
 7. 恢复各成员本次拟合期间的最佳权重及对应 Adam 状态，再选择 holdout MSE 最低的 elite。
+8. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；每次拟合保存一张独立 PNG（`holdout_curves/holdout_step_XXXX.png`），并将全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。不再生成跨 step 的 holdout 汇总曲线。
 
 即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=1`，因此每个在线 step 后都会遍历当时完整的真实 replay。对 5,000 条 100×100 transition 而言仍有较高成本；需要更快实验时应显式调大训练间隔或降低 epoch 上限。
 
@@ -172,9 +173,10 @@ reward.png
 ber.png
 loss.png
 model_reward.png
-model_holdout.png
 model_disagreement.png
 model_target_saturation_fraction.png
+holdout_curves/
+holdout_curves.npz
 sac_inference.pt
 reward_model_inference.pt
 figures/
@@ -188,7 +190,7 @@ figures/
 
 1. 这不是完整 dynamics MBPO，无法在模型内部递推 PSD 状态。
 2. 合成 next state 来自真实 replay，依赖 observation transition 与 action 无关的环境假设。
-3. 默认每 step 全量训练独立 CNN ensemble，计算成本很高。
+3. 默认每 step 从头全量训练独立 CNN ensemble，计算成本很高。
 4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且各成员遍历同一训练集合；holdout 与分歧可能偏乐观。
 5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
 6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。
