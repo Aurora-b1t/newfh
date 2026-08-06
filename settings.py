@@ -16,6 +16,12 @@ CPU_ONLY = False # Set to True to force CPU usage
 # Global Random Seed for full reproducibility
 RANDOM_SEED = 42
 
+# Timing Profiling Switch
+# When True, MBPO reward-model training measures per-epoch wall-clock times
+# and rollout (experience generation) per-stage times, and the training logs
+# include them. Set to False to disable all timing measurements.
+TIMING_ENABLED = True
+
 
 def set_random_seeds(seed=None):
     """

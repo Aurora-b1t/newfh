@@ -92,6 +92,36 @@ def reward_model_ready(real_buffer, model_train_batch_size):
     return real_buffer.size() >= max(2, int(model_train_batch_size))
 
 
+def mbpo_timing_suffix(model_stats, rollout_stats):
+    """Return a timing summary string for reward-model fit/rollout stages.
+
+    Returns an empty string when settings.TIMING_ENABLED is False.
+    """
+    if not settings.TIMING_ENABLED:
+        return ""
+    parts = []
+    epoch_times = model_stats.get("epoch_times", [])
+    if epoch_times:
+        epoch_times = [float(value) for value in epoch_times]
+        parts.append(
+            f"epoch_avg={np.mean(epoch_times):.3f}s"
+            f"(min={np.min(epoch_times):.3f},max={np.max(epoch_times):.3f},"
+            f"n={len(epoch_times)})"
+        )
+    fit_time = model_stats.get("fit_time_sec")
+    if fit_time is not None:
+        parts.append(f"fit={float(fit_time):.2f}s")
+    timing = rollout_stats.get("timing")
+    if timing:
+        parts.append(
+            f"rollout sample={timing['sample_s']:.3f}s "
+            f"policy={timing['policy_s']:.3f}s "
+            f"predict={timing['predict_s']:.3f}s "
+            f"add={timing['add_s']:.3f}s total={timing['total_s']:.3f}s"
+        )
+    return " | " + " | ".join(parts) if parts else ""
+
+
 def should_train_reward_model(
     step_idx, real_buffer, model_train_batch_size, model_train_freq
 ):
@@ -293,7 +323,7 @@ def train(args):
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
                 "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
                 "disagreement=%.6f(p95=%.6f) | "
-                "target_sat=%.2f%% | T=%.2fs",
+                "target_sat=%.2f%% | T=%.2fs%s",
                 last_model_stats["holdout_loss_mean"],
                 last_model_stats["elite_model_idxes"],
                 last_model_stats["epochs"],
@@ -306,6 +336,7 @@ def train(args):
                 last_rollout_stats["disagreement_p95"],
                 100.0 * last_model_stats["target_saturation_fraction"],
                 model_fit_time,
+                mbpo_timing_suffix(last_model_stats, last_rollout_stats),
             )
 
         train_stats = {}

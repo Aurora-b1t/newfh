@@ -1,7 +1,10 @@
 """Adapters between step-level SAC replay and the MBPO reward ensemble."""
 
+import time
+
 import numpy as np
 
+import settings
 from .model import (
     DEFAULT_BER_MAX,
     DEFAULT_BER_MIN,
@@ -127,8 +130,14 @@ def rollout_reward_model(
     if rollout_size <= 0:
         raise ValueError("rollout batch_size must be positive.")
     model_buffer_size_before = model_buffer.size()
+    timing_enabled = bool(settings.TIMING_ENABLED)
+    timing = {"sample_s": 0.0, "policy_s": 0.0, "predict_s": 0.0, "add_s": 0.0}
+    stage_start = time.time() if timing_enabled else None
 
     starts = real_buffer.sample(rollout_size)
+    if timing_enabled:
+        timing["sample_s"] = time.time() - stage_start
+        stage_start = time.time()
     state_imgs = starts["state_imgs"]
     hoprates = np.asarray(starts["hoprates"], dtype=np.float32)
     actions = np.stack(
@@ -140,6 +149,9 @@ def rollout_reward_model(
             for index in range(rollout_size)
         ]
     )
+    if timing_enabled:
+        timing["policy_s"] = time.time() - stage_start
+        stage_start = time.time()
     expected_shape = (rollout_size, reward_model.num_heads)
     if actions.shape != expected_shape:
         raise ValueError(
@@ -155,6 +167,9 @@ def rollout_reward_model(
         actions,
         deterministic=deterministic_model,
     )
+    if timing_enabled:
+        timing["predict_s"] = time.time() - stage_start
+        stage_start = time.time()
     if predicted_rewards.shape != expected_shape or not np.all(
         np.isfinite(predicted_rewards)
     ):
@@ -182,6 +197,9 @@ def rollout_reward_model(
             float(starts["next_hoprates"][index]),
             bool(starts["dones"][index]),
         )
+    if timing_enabled:
+        timing["add_s"] = time.time() - stage_start
+        timing["total_s"] = sum(timing.values())
 
     model_buffer_size_after = model_buffer.size()
     fifo_evicted = max(
@@ -201,4 +219,5 @@ def rollout_reward_model(
         "reward_std": float(np.std(predicted_rewards)),
         "disagreement_mean": float(np.mean(disagreement)),
         "disagreement_p95": float(np.percentile(disagreement, 95)),
+        "timing": (timing if timing_enabled else None),
     }

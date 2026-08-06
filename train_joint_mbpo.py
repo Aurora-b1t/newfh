@@ -32,6 +32,7 @@ import settings
 from SAC import ReplayBuffer, save_sac_inference_checkpoint
 from train_mbpo import (
     _validate_args,
+    mbpo_timing_suffix,
     reward_model_ready,
     save_plots,
     should_train_reward_model,
@@ -211,7 +212,7 @@ def train(args):
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
                 "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
                 "disagreement=%.6f(p95=%.6f) | "
-                "target_sat=%.2f%% | T=%.2fs",
+                "target_sat=%.2f%% | T=%.2fs%s",
                 last_model_stats["holdout_loss_mean"],
                 last_model_stats["elite_model_idxes"],
                 last_model_stats["epochs"],
@@ -224,6 +225,7 @@ def train(args):
                 last_rollout_stats["disagreement_p95"],
                 100.0 * last_model_stats["target_saturation_fraction"],
                 model_fit_time,
+                mbpo_timing_suffix(last_model_stats, last_rollout_stats),
             )
 
         train_stats = {}

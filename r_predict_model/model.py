@@ -15,12 +15,14 @@ predictions with the exogenous next observation stored in real replay.
 
 import copy
 import os
+import time
 
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+import settings
 from SAC import (
     HOPRATE_FEATURE_DIM,
     PSD_FEATURE_DIM,
@@ -643,6 +645,9 @@ class StepRewardEnsemble(nn.Module):
         train_indices = permutation[holdout_size:]
         holdout_curves = []
         train_curves = []
+        timing_enabled = bool(settings.TIMING_ENABLED)
+        epoch_times = []
+        fit_start = time.time()
 
         initial_holdout = self._evaluate_ensemble(
             dataset, holdout_indices, batch_size
@@ -659,6 +664,7 @@ class StepRewardEnsemble(nn.Module):
         train_curves = [[] for _ in range(self.network_size)]
 
         for epoch in range(max_epochs):
+            epoch_start = time.time() if timing_enabled else None
             self.member.train()
             shuffled_indices = np.random.permutation(train_indices)
             epoch_batch_losses = []
@@ -704,6 +710,8 @@ class StepRewardEnsemble(nn.Module):
             else:
                 stale_epochs += 1
             epochs_run = epoch + 1
+            if timing_enabled:
+                epoch_times.append(time.time() - epoch_start)
             if stale_epochs >= patience:
                 break
 
@@ -728,6 +736,8 @@ class StepRewardEnsemble(nn.Module):
             "train_size": int(len(train_indices)),
             "holdout_size": int(len(holdout_indices)),
             "target_saturation_fraction": target_saturation_fraction,
+            "epoch_times": epoch_times,
+            "fit_time_sec": (time.time() - fit_start) if timing_enabled else None,
         }
         return self.last_train_stats
 
