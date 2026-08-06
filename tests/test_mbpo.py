@@ -101,37 +101,51 @@ class StepRewardEnsembleTests(unittest.TestCase):
             device="cpu",
         )
 
-    def test_members_have_independent_cnn_parameters(self):
+    def test_matrix_members_have_independent_parameters_and_single_optimizer(self):
         model = self.make_model()
-        self.assertIsNot(
-            model.members[0].state_encoder,
-            model.members[1].state_encoder,
+        model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            self.rewards,
+            batch_size=2,
+            max_epochs=1,
+            patience=0,
         )
-        self.assertIsNot(
-            model.members[0].state_encoder.conv1.weight,
-            model.members[1].state_encoder.conv1.weight,
-        )
+        conv_weight = model.member.conv1.weight
+        self.assertEqual((2, 16, 1, 3, 3), tuple(conv_weight.shape))
+        self.assertFalse(torch.equal(conv_weight[0], conv_weight[1]))
+        self.assertIsInstance(model.optimizer, torch.optim.Adam)
+        self.assertEqual(1, len(model.optimizer.param_groups))
+        for module in (
+            model.member.conv1,
+            model.member.conv2,
+            model.member.conv_fc,
+            model.member.hoprate_embedding,
+            model.member.fusion,
+            model.member.action_encoder,
+            model.member.fusion_head,
+            model.member.latent_mean_head,
+            model.member.latent_logvar_head,
+        ):
+            self.assertEqual(2, module.weight.shape[0])
+        self.assertEqual((16,), tuple(model.member.norm1.norm.weight.shape))
 
-    def test_reward_member_uses_three_layer_state_action_fusion(self):
-        member = self.make_model().members[0]
-        linears = [
-            module for module in member.fusion if isinstance(module, torch.nn.Linear)
-        ]
-        activations = [
-            module for module in member.fusion if isinstance(module, torch.nn.SiLU)
-        ]
-        self.assertEqual(3, len(linears))
-        self.assertEqual(3, len(activations))
-        self.assertEqual((256 + 16, 16), (
-            linears[0].in_features,
-            linears[0].out_features,
-        ))
-        self.assertTrue(
-            all(
-                (layer.in_features, layer.out_features) == (16, 16)
-                for layer in linears[1:]
-            )
+    def test_reward_member_uses_two_layer_cnn_and_one_layer_fusion(self):
+        model = self.make_model()
+        model._materialize((8, 8))
+        member = model.member
+        self.assertEqual(16, member.conv1.out_channels)
+        self.assertEqual(32, member.conv2.out_channels)
+        self.assertFalse(hasattr(member, "conv3"))
+        self.assertEqual(64, member.hoprate_embedding.out_features)
+        self.assertEqual(
+            256 + 16,
+            member.fusion_head.in_features,
         )
+        self.assertEqual(16, member.fusion_head.out_features)
+        self.assertEqual(16, member.latent_mean_head.in_features)
+        self.assertEqual(3, member.latent_mean_head.out_features)
 
     def test_fit_predict_and_sample_dynamic_heads(self):
         model = self.make_model()
@@ -224,7 +238,7 @@ class StepRewardEnsembleTests(unittest.TestCase):
         self.assertEqual(0.5, loaded.ber_max)
         self.assertEqual(1e-4, loaded.logit_epsilon)
 
-    def test_reward_checkpoint_rejects_legacy_v1_and_wrong_architecture(self):
+    def test_reward_checkpoint_rejects_legacy_v1_v2_and_wrong_architecture(self):
         with tempfile.TemporaryDirectory() as tempdir:
             legacy_path = os.path.join(tempdir, "legacy_reward.pt")
             torch.save(
@@ -236,6 +250,17 @@ class StepRewardEnsembleTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "old shallow.*retrain"):
                 StepRewardEnsemble.load_checkpoint(legacy_path, device="cpu")
+
+            v2_path = os.path.join(tempdir, "legacy_reward_v2.pt")
+            torch.save(
+                {
+                    "format_version": 2,
+                    "model_type": "StepRewardEnsemble",
+                },
+                v2_path,
+            )
+            with self.assertRaisesRegex(ValueError, "three-layer CNN.*retrain"):
+                StepRewardEnsemble.load_checkpoint(v2_path, device="cpu")
 
             wrong_arch_path = os.path.join(tempdir, "wrong_arch_reward.pt")
             torch.save(
@@ -323,9 +348,9 @@ class StepRewardEnsembleTests(unittest.TestCase):
         )
         self.assertTrue(np.all((predictions >= 0.0) & (predictions <= 1.0)))
 
-    def test_early_stopping_restores_model_and_optimizer_state(self):
+    def test_global_early_stopping_restores_best_epoch_state(self):
         model = StepRewardEnsemble(
-            network_size=1,
+            network_size=2,
             elite_size=1,
             num_heads=3,
             n_actions=4,
@@ -336,22 +361,20 @@ class StepRewardEnsembleTests(unittest.TestCase):
         captured = {}
         evaluation_count = 0
 
-        def fake_evaluate(member, _dataset, _indices, _batch_size):
+        def fake_evaluate(_dataset, _indices, _batch_size):
             nonlocal evaluation_count
             evaluation_count += 1
             if evaluation_count == 1:
-                return 10.0
+                return np.asarray([10.0, 10.0])
             if evaluation_count == 2:
-                captured["model"] = copy.deepcopy(member.state_dict())
-                captured["optimizer"] = copy.deepcopy(
-                    model.optimizers[0].state_dict()
-                )
-                return 5.0
+                captured["member"] = copy.deepcopy(model.member.state_dict())
+                captured["optimizer"] = copy.deepcopy(model.optimizer.state_dict())
+                return np.asarray([5.0, 6.0])
             if evaluation_count == 3:
-                return 6.0
-            return 5.0
+                return np.asarray([6.0, 6.0])
+            return np.asarray([5.0, 6.0])
 
-        with mock.patch.object(model, "_evaluate_member", side_effect=fake_evaluate):
+        with mock.patch.object(model, "_evaluate_ensemble", side_effect=fake_evaluate):
             model.fit(
                 self.states,
                 self.hoprates,
@@ -364,11 +387,11 @@ class StepRewardEnsembleTests(unittest.TestCase):
                 min_improvement=0.0,
             )
 
-        restored_model = model.members[0].state_dict()
-        for key, expected in captured["model"].items():
-            torch.testing.assert_close(restored_model[key], expected)
+        restored_member = model.member.state_dict()
+        for key, expected in captured["member"].items():
+            torch.testing.assert_close(restored_member[key], expected)
 
-        restored_optimizer = model.optimizers[0].state_dict()
+        restored_optimizer = model.optimizer.state_dict()
         self.assertEqual(
             captured["optimizer"]["param_groups"],
             restored_optimizer["param_groups"],
@@ -394,8 +417,8 @@ class StepRewardEnsembleTests(unittest.TestCase):
         )
 
         self.assertEqual(2, len(stats["holdout_curves"]))
+        self.assertEqual([3, 3], stats["epochs"])
         for curve, epochs_run in zip(stats["holdout_curves"], stats["epochs"]):
-            self.assertEqual(3, epochs_run)
             self.assertEqual(epochs_run + 1, len(curve))
             self.assertTrue(all(np.isfinite(curve)))
 
@@ -412,8 +435,8 @@ class StepRewardEnsembleTests(unittest.TestCase):
         )
 
         self.assertEqual(2, len(stats["train_curves"]))
+        self.assertEqual([3, 3], stats["epochs"])
         for curve, epochs_run in zip(stats["train_curves"], stats["epochs"]):
-            self.assertEqual(3, epochs_run)
             self.assertEqual(epochs_run, len(curve))
             self.assertTrue(all(np.isfinite(curve)))
 
@@ -428,24 +451,24 @@ class StepRewardEnsembleTests(unittest.TestCase):
             max_epochs=2,
             patience=2,
         )
-        trained_state = copy.deepcopy(model.members[0].state_dict())
+        trained_state = copy.deepcopy(model.member.state_dict())
 
         captured = {}
-        real_evaluate = model._evaluate_member
+        real_evaluate = model._evaluate_ensemble
 
-        def capture_first_eval(member, dataset, indices, batch_size):
-            result = real_evaluate(member, dataset, indices, batch_size)
+        def capture_first_eval(dataset, indices, batch_size):
+            result = real_evaluate(dataset, indices, batch_size)
             if "weights" not in captured:
-                # Capture after the first forward pass so lazy layers of the
-                # freshly rebuilt member have materialized their parameters.
-                captured["weights"] = copy.deepcopy(member.state_dict())
+                # Capture after the first forward pass so the freshly rebuilt
+                # matrix member has materialized its lazy convolution weights.
+                captured["weights"] = copy.deepcopy(model.member.state_dict())
                 captured["optimizer_state"] = copy.deepcopy(
-                    model.optimizers[0].state_dict()
+                    model.optimizer.state_dict()
                 )
             return result
 
         with mock.patch.object(
-            model, "_evaluate_member", side_effect=capture_first_eval
+            model, "_evaluate_ensemble", side_effect=capture_first_eval
         ):
             stats = model.fit(
                 self.states,
@@ -752,6 +775,17 @@ class TrainingAndCheckpointTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "shallow GroupNorm.*retrain"):
                 load_sac_inference_checkpoint(v2_path, device="cpu")
+
+            v3_path = os.path.join(tempdir, "legacy_sac_v3.pt")
+            torch.save(
+                {
+                    "format_version": 3,
+                    "model_type": "MultiHeadSACPolicy",
+                },
+                v3_path,
+            )
+            with self.assertRaisesRegex(ValueError, "three-layer CNN.*retrain"):
+                load_sac_inference_checkpoint(v3_path, device="cpu")
 
             wrong_arch_path = os.path.join(tempdir, "wrong_arch_sac.pt")
             torch.save(

@@ -1,8 +1,11 @@
 """Step-level probabilistic reward ensemble for FHSS MBPO.
 
-Each ensemble member owns an independent convolutional state encoder.  The
-model consumes one complete SAC decision and predicts one reward per offset
-head:
+The ensemble is implemented as a single "matrix" network whose parameters
+carry a leading member dimension (every weight tensor has shape
+``[num_members, out, in]`` or ``[num_members, ...]``).  All members therefore
+run in one parallel forward/backward pass and are updated together by a single
+shared Adam optimizer.  The model consumes one complete SAC decision and
+predicts one reward per offset head:
 
     (PSD image, hoprate, offsets[num_heads]) -> block_rewards[num_heads]
 
@@ -18,12 +21,17 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from SAC import STATE_FEATURE_DIM, StateEncoder
+from SAC import (
+    HOPRATE_FEATURE_DIM,
+    PSD_FEATURE_DIM,
+    STATE_FEATURE_DIM,
+    normalize_hoprate,
+)
 
 
-REWARD_CHECKPOINT_FORMAT_VERSION = 2
+REWARD_CHECKPOINT_FORMAT_VERSION = 3
 REWARD_MODEL_ARCHITECTURE = (
-    "cnn3_groupnorm_hop_mlp2_state_action_fusion3_v2"
+    "cnn2_groupnorm_hop_mlp1_state_action_fusion1_matrix_v3"
 )
 DEFAULT_BER_MIN = 0.0
 DEFAULT_BER_MAX = 0.5
@@ -79,24 +87,123 @@ def _stable_sigmoid(values):
     return np.exp(-np.logaddexp(0.0, -values))
 
 
-def _init_linear(module):
-    if isinstance(module, nn.Linear):
-        std = 1.0 / (2.0 * np.sqrt(max(1, module.in_features)))
-        nn.init.trunc_normal_(
-            module.weight,
-            std=std,
-            a=-2.0 * std,
-            b=2.0 * std,
+class _MatrixConv2d(nn.Module):
+    """Grouped convolution whose weights carry a leading member dimension.
+
+    The input is replicated once per member along the channel axis and the
+    per-member kernels are placed into consecutive output-channel groups, so a
+    single ``F.conv2d`` call evaluates every member in parallel.
+    """
+
+    def __init__(self, num_members, out_channels, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.num_members = int(num_members)
+        self.out_channels = int(out_channels)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.in_channels = None
+        self.weight = None
+        self.bias = None
+
+    def _materialize(self, in_channels, device):
+        weight = torch.empty(
+            self.num_members,
+            self.out_channels,
+            in_channels,
+            self.kernel_size,
+            self.kernel_size,
+            device=device,
         )
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+        nn.init.normal_(weight, 0.0, 0.1)
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(
+            torch.zeros(self.num_members, self.out_channels, device=device)
+        )
+        self.in_channels = int(in_channels)
+
+    def forward(self, images):
+        if images.ndim == 5:
+            batch_size, members, channels, height, width = images.shape
+            if members != self.num_members:
+                raise ValueError(
+                    "Matrix conv input member count does not match the network."
+                )
+            repeated = images.reshape(
+                batch_size, members * channels, height, width
+            )
+        elif images.ndim == 4:
+            batch_size, channels, height, width = images.shape
+            repeated = images.repeat_interleave(self.num_members, dim=1)
+        else:
+            raise ValueError(
+                "Matrix conv input must have shape [B,C,H,W] or [B,M,C,H,W]."
+            )
+        if self.weight is None or self.in_channels != channels:
+            self._materialize(channels, images.device)
+        weight = self.weight.reshape(
+            self.num_members * self.out_channels,
+            self.in_channels,
+            self.kernel_size,
+            self.kernel_size,
+        )
+        convolved = F.conv2d(
+            repeated,
+            weight,
+            self.bias.reshape(-1),
+            stride=self.stride,
+            padding=self.padding,
+            groups=self.num_members,
+        )
+        return convolved.reshape(
+            batch_size, self.num_members, self.out_channels, height, width
+        )
 
 
-class StepRewardMember(nn.Module):
-    """One independent CNN member of the probabilistic reward ensemble."""
+class _MatrixGroupNorm(nn.Module):
+    """GroupNorm applied independently to every matrix member."""
+
+    def __init__(self, num_members, num_groups, num_channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(int(num_groups), int(num_channels))
+
+    def forward(self, features):
+        batch_size, members, channels, height, width = features.shape
+        reshaped = features.reshape(batch_size * members, channels, height, width)
+        normalized = self.norm(reshaped)
+        return normalized.reshape(batch_size, members, channels, height, width)
+
+
+class _MatrixLinear(nn.Module):
+    """Linear layer whose weight carries a leading member dimension."""
+
+    def __init__(self, num_members, in_features, out_features):
+        super().__init__()
+        self.num_members = int(num_members)
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        std = 1.0 / (2.0 * np.sqrt(max(1, self.in_features)))
+        weight = torch.empty(self.num_members, self.out_features, self.in_features)
+        nn.init.trunc_normal_(weight, std=std, a=-2.0 * std, b=2.0 * std)
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(torch.zeros(self.num_members, self.out_features))
+
+    def forward(self, features):
+        return torch.matmul(features, self.weight.transpose(1, 2)) + self.bias
+
+
+class MatrixStepRewardMember(nn.Module):
+    """Every ensemble member stored in one network with member-dim weights.
+
+    The state encoder uses a two-layer CNN (16 -> 32 channels with one max
+    pool), a single-layer hoprate embedding (1 -> ``HOPRATE_FEATURE_DIM``) and
+    a single-layer fusion to ``STATE_FEATURE_DIM``.  After the action encoder,
+    one hidden layer feeds the latent mean/log-variance output heads.
+    """
 
     def __init__(
         self,
+        num_members,
         num_heads,
         n_actions,
         hoprate_min,
@@ -104,29 +211,49 @@ class StepRewardMember(nn.Module):
         hidden_size=200,
     ):
         super().__init__()
+        self.num_members = int(num_members)
         self.num_heads = int(num_heads)
         self.n_actions = int(n_actions)
-        self.state_encoder = StateEncoder(hoprate_min, hoprate_max)
-        self.action_encoder = nn.Sequential(
-            nn.Linear(self.num_heads * self.n_actions, hidden_size),
-            nn.ReLU(),
+        self.hoprate_min = float(hoprate_min)
+        self.hoprate_max = float(hoprate_max)
+        self.hidden_size = int(hidden_size)
+
+        self.conv1 = _MatrixConv2d(self.num_members, 16)
+        self.norm1 = _MatrixGroupNorm(self.num_members, 4, 16)
+        self.conv2 = _MatrixConv2d(self.num_members, 32)
+        self.norm2 = _MatrixGroupNorm(self.num_members, 8, 32)
+        self.pool = nn.MaxPool2d(kernel_size=2)
+        self.conv_fc = None
+        self.hoprate_embedding = _MatrixLinear(
+            self.num_members, 1, HOPRATE_FEATURE_DIM
         )
-        self.fusion = nn.Sequential(
-            nn.Linear(STATE_FEATURE_DIM + hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
+        self.fusion = _MatrixLinear(
+            self.num_members, PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, STATE_FEATURE_DIM
         )
-        self.latent_mean_head = nn.Linear(hidden_size, self.num_heads)
-        self.latent_logvar_head = nn.Linear(hidden_size, self.num_heads)
-        self.register_buffer("max_logvar", torch.full((1, self.num_heads), 0.5))
-        self.register_buffer("min_logvar", torch.full((1, self.num_heads), -10.0))
-        self.action_encoder.apply(_init_linear)
-        self.fusion.apply(_init_linear)
-        self.latent_mean_head.apply(_init_linear)
-        self.latent_logvar_head.apply(_init_linear)
+        self.action_encoder = _MatrixLinear(
+            self.num_members, self.num_heads * self.n_actions, self.hidden_size
+        )
+        self.fusion_head = _MatrixLinear(
+            self.num_members, STATE_FEATURE_DIM + self.hidden_size, self.hidden_size
+        )
+        self.latent_mean_head = _MatrixLinear(
+            self.num_members, self.hidden_size, self.num_heads
+        )
+        self.latent_logvar_head = _MatrixLinear(
+            self.num_members, self.hidden_size, self.num_heads
+        )
+        self.register_buffer(
+            "max_logvar", torch.full((self.num_members, 1, self.num_heads), 0.5)
+        )
+        self.register_buffer(
+            "min_logvar", torch.full((self.num_members, 1, self.num_heads), -10.0)
+        )
+
+    def _ensure_conv_fc(self, feature_size, device):
+        if self.conv_fc is None or self.conv_fc.in_features != feature_size:
+            self.conv_fc = _MatrixLinear(
+                self.num_members, feature_size, PSD_FEATURE_DIM
+            ).to(device)
 
     def forward(self, images, hoprates, actions, return_logvar=False):
         if actions.ndim != 2 or actions.shape[1] != self.num_heads:
@@ -137,12 +264,47 @@ class StepRewardMember(nn.Module):
         if torch.any(actions < 0) or torch.any(actions >= self.n_actions):
             raise ValueError("actions are outside the configured action range.")
 
-        state_features = self.state_encoder(images, hoprates)
+        batch_size = images.shape[0]
+        image_features = F.relu(self.norm1(self.conv1(images)))
+        image_features = F.relu(self.norm2(self.conv2(image_features)))
+        members, channels, height, width = image_features.shape[1:]
+        image_features = image_features.reshape(
+            batch_size * members, channels, height, width
+        )
+        image_features = self.pool(image_features)
+        image_features = image_features.reshape(batch_size, members, -1)
+        self._ensure_conv_fc(image_features.shape[-1], images.device)
+        image_features = F.relu(
+            self.conv_fc(image_features.permute(1, 0, 2).contiguous())
+        )
+
+        normalized_hoprates = normalize_hoprate(
+            hoprates, self.hoprate_min, self.hoprate_max
+        )
+        hoprate_features = F.relu(
+            self.hoprate_embedding(
+                normalized_hoprates.unsqueeze(0).expand(
+                    self.num_members, -1, -1
+                )
+            )
+        )
+        state_features = F.relu(
+            self.fusion(torch.cat([image_features, hoprate_features], dim=2))
+        )
+
         one_hot_actions = F.one_hot(
             actions.long(), num_classes=self.n_actions
         ).to(dtype=images.dtype)
-        action_features = self.action_encoder(one_hot_actions.flatten(start_dim=1))
-        fused = self.fusion(torch.cat([state_features, action_features], dim=1))
+        action_features = F.relu(
+            self.action_encoder(
+                one_hot_actions.flatten(start_dim=1)
+                .unsqueeze(0)
+                .expand(self.num_members, -1, -1)
+            )
+        )
+        fused = F.silu(
+            self.fusion_head(torch.cat([state_features, action_features], dim=2))
+        )
         mean = self.latent_mean_head(fused)
         raw_logvar = self.latent_logvar_head(fused)
         logvar = self.max_logvar - F.softplus(self.max_logvar - raw_logvar)
@@ -189,7 +351,7 @@ class _RewardDataset:
 
 
 class StepRewardEnsemble(nn.Module):
-    """Independent CNN ensemble for complete FHSS step reward prediction."""
+    """Matrix CNN ensemble for complete FHSS step reward prediction."""
 
     def __init__(
         self,
@@ -240,35 +402,46 @@ class StepRewardEnsemble(nn.Module):
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.members = nn.ModuleList()
-        self.optimizers = []
-        self._reset_members_and_optimizers()
+        self.member = None
+        self.optimizer = None
         self.elite_model_idxes = list(range(self.elite_size))
         self.observation_shape = None
         self.is_fitted = False
         self.last_train_stats = {}
 
-    def _reset_members_and_optimizers(self):
-        """Re-initialize every member network and Adam optimizer from scratch."""
-        self.members = nn.ModuleList(
-            StepRewardMember(
-                self.num_heads,
-                self.n_actions,
-                self.hoprate_min,
-                self.hoprate_max,
-                self.hidden_size,
-            )
-            for _ in range(self.network_size)
+    def _dummy_tensors(self, observation_shape):
+        shape = tuple(int(value) for value in observation_shape)
+        if len(shape) == 2:
+            images = torch.zeros((1, 1, *shape), device=self.device)
+        elif len(shape) == 3:
+            images = torch.zeros((1, *shape), device=self.device)
+        else:
+            raise ValueError("observation_shape must have two or three axes.")
+        hoprates = torch.full(
+            (1, 1), (self.hoprate_min + self.hoprate_max) / 2.0, device=self.device
         )
-        self.to(self.device)
-        self.optimizers = [
-            torch.optim.Adam(
-                member.parameters(),
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay,
-            )
-            for member in self.members
-        ]
+        actions = torch.zeros(
+            (1, self.num_heads), dtype=torch.long, device=self.device
+        )
+        return images, hoprates, actions
+
+    def _rebuild_member_and_optimizer(self, observation_shape):
+        """Re-initialize the matrix member and its shared Adam optimizer."""
+        self.member = MatrixStepRewardMember(
+            self.network_size,
+            self.num_heads,
+            self.n_actions,
+            self.hoprate_min,
+            self.hoprate_max,
+            self.hidden_size,
+        ).to(self.device)
+        with torch.no_grad():
+            self.member(*self._dummy_tensors(observation_shape))
+        self.optimizer = torch.optim.Adam(
+            self.member.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
 
     def reward_bounds(self, hoprates):
         return reward_bounds_from_config(
@@ -382,17 +555,22 @@ class StepRewardEnsemble(nn.Module):
 
     @staticmethod
     def _probabilistic_loss(mean, logvar, targets):
-        return torch.mean(torch.square(mean - targets) * torch.exp(-logvar) + logvar)
+        return torch.mean(
+            torch.square(mean - targets.unsqueeze(0)) * torch.exp(-logvar) + logvar
+        )
 
-    def _evaluate_member(self, member, dataset, indices, batch_size):
-        member.eval()
-        squared_error = 0.0
+    def _evaluate_ensemble(self, dataset, indices, batch_size):
+        """Return the per-member holdout MSE with a single parallel pass."""
+        self.member.eval()
+        squared_error = torch.zeros(
+            self.network_size, dtype=torch.float32, device=self.device
+        )
         value_count = 0
         with torch.no_grad():
             for start in range(0, len(indices), batch_size):
                 batch_indices = indices[start : start + batch_size]
                 tensors = self._batch_tensors(dataset.batch(batch_indices))
-                latent_mean, _logvar = member(
+                latent_mean, _logvar = self.member(
                     *tensors[:3], return_logvar=True
                 )
                 reward_prediction = self._latent_to_rewards_tensor(
@@ -402,10 +580,11 @@ class StepRewardEnsemble(nn.Module):
                     tensors[3], tensors[1]
                 )
                 squared_error += torch.sum(
-                    torch.square(reward_prediction - bounded_targets)
-                ).item()
+                    torch.square(reward_prediction - bounded_targets.unsqueeze(0)),
+                    dim=(1, 2),
+                )
                 value_count += tensors[3].numel()
-        return squared_error / max(1, value_count)
+        return (squared_error / max(1, value_count)).cpu().numpy()
 
     def fit(
         self,
@@ -419,10 +598,15 @@ class StepRewardEnsemble(nn.Module):
         max_epochs=100,
         min_improvement=0.01,
     ):
-        """Retrain every member from scratch on the current real-replay split.
+        """Retrain every member in parallel on the current real-replay split.
 
-        All member weights and Adam optimizer states are re-initialized at the
-        start of every call; training never continues from a previous fit.
+        All matrix weights and the shared Adam optimizer are re-initialized at
+        the start of every call; training never continues from a previous fit.
+        Members share one train/holdout split and one data order per epoch and
+        are updated by a single optimizer step.  Global early stopping is
+        driven by the best member's holdout loss; when it stops improving for
+        ``patience`` epochs the whole ensemble stops and every member is
+        restored to its state at the global best epoch.
         """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
@@ -447,94 +631,92 @@ class StepRewardEnsemble(nn.Module):
             hoprates, block_rewards
         )
 
-        self._reset_members_and_optimizers()
+        self._rebuild_member_and_optimizer(observation_shape)
         permutation = np.random.permutation(dataset.size)
         holdout_size = min(
             max(1, int(dataset.size * holdout_ratio)), dataset.size - 1
         )
         holdout_indices = permutation[:holdout_size]
         train_indices = permutation[holdout_size:]
-        epoch_counts = []
         holdout_curves = []
         train_curves = []
 
-        for member, optimizer in zip(self.members, self.optimizers):
-            best_loss = self._evaluate_member(
-                member, dataset, holdout_indices, batch_size
+        initial_holdout = self._evaluate_ensemble(
+            dataset, holdout_indices, batch_size
+        )
+        if not np.all(np.isfinite(initial_holdout)):
+            raise RuntimeError("Reward-model holdout loss became non-finite.")
+        best_global_loss = float(np.min(initial_holdout))
+        best_state = copy.deepcopy(self.member.state_dict())
+        best_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        stale_epochs = 0
+        epochs_run = 0
+        for member_idx, value in enumerate(initial_holdout):
+            holdout_curves.append([float(value)])
+        train_curves = [[] for _ in range(self.network_size)]
+
+        for epoch in range(max_epochs):
+            self.member.train()
+            shuffled_indices = np.random.permutation(train_indices)
+            epoch_batch_losses = []
+            for start in range(0, len(shuffled_indices), batch_size):
+                batch_indices = shuffled_indices[start : start + batch_size]
+                images_t, hoprates_t, actions_t, rewards_t = self._batch_tensors(
+                    dataset.batch(batch_indices)
+                )
+                mean, logvar = self.member(
+                    images_t, hoprates_t, actions_t, return_logvar=True
+                )
+                latent_targets, _bounded_rewards = self._targets_to_latent(
+                    rewards_t, hoprates_t
+                )
+                loss = self._probabilistic_loss(mean, logvar, latent_targets)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                epoch_batch_losses.append(float(loss.item()))
+
+            mean_train_loss = float(np.mean(epoch_batch_losses))
+            for member_idx in range(self.network_size):
+                train_curves[member_idx].append(mean_train_loss)
+
+            epoch_holdout = self._evaluate_ensemble(
+                dataset, holdout_indices, batch_size
             )
-            if not np.isfinite(best_loss):
+            if not np.all(np.isfinite(epoch_holdout)):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
-            member_curve = [float(best_loss)]
-            member_train_curve = []
-            best_state = copy.deepcopy(member.state_dict())
-            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-            stale_epochs = 0
-            epochs_run = 0
+            for member_idx, value in enumerate(epoch_holdout):
+                holdout_curves[member_idx].append(float(value))
 
-            for epoch in range(max_epochs):
-                member.train()
-                shuffled_indices = np.random.permutation(train_indices)
-                epoch_batch_losses = []
-                for start in range(0, len(shuffled_indices), batch_size):
-                    batch_indices = shuffled_indices[start : start + batch_size]
-                    images_t, hoprates_t, actions_t, rewards_t = self._batch_tensors(
-                        dataset.batch(batch_indices)
-                    )
-                    mean, logvar = member(
-                        images_t, hoprates_t, actions_t, return_logvar=True
-                    )
-                    latent_targets, _bounded_rewards = self._targets_to_latent(
-                        rewards_t, hoprates_t
-                    )
-                    loss = self._probabilistic_loss(
-                        mean, logvar, latent_targets
-                    )
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    epoch_batch_losses.append(float(loss.item()))
+            epoch_best_loss = float(np.min(epoch_holdout))
+            relative_improvement = (
+                (best_global_loss - epoch_best_loss)
+                / max(abs(best_global_loss), 1e-12)
+            )
+            if relative_improvement > min_improvement:
+                best_global_loss = epoch_best_loss
+                best_state = copy.deepcopy(self.member.state_dict())
+                best_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            epochs_run = epoch + 1
+            if stale_epochs >= patience:
+                break
 
-                member_train_curve.append(float(np.mean(epoch_batch_losses)))
-                holdout_loss = self._evaluate_member(
-                    member, dataset, holdout_indices, batch_size
-                )
-                if not np.isfinite(holdout_loss):
-                    raise RuntimeError("Reward-model holdout loss became non-finite.")
-                member_curve.append(float(holdout_loss))
-                relative_improvement = (
-                    (best_loss - holdout_loss) / max(abs(best_loss), 1e-12)
-                )
-                if relative_improvement > min_improvement:
-                    best_loss = holdout_loss
-                    best_state = copy.deepcopy(member.state_dict())
-                    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-                    stale_epochs = 0
-                else:
-                    stale_epochs += 1
-                epochs_run = epoch + 1
-                if stale_epochs >= patience:
-                    break
+        self.member.load_state_dict(best_state)
+        self.optimizer.load_state_dict(best_optimizer_state)
+        self.member.eval()
 
-            member.load_state_dict(best_state)
-            optimizer.load_state_dict(best_optimizer_state)
-            member.eval()
-            epoch_counts.append(epochs_run)
-            holdout_curves.append(member_curve)
-            train_curves.append(member_train_curve)
-
-        holdout_losses = np.asarray(
-            [
-                self._evaluate_member(member, dataset, holdout_indices, batch_size)
-                for member in self.members
-            ],
-            dtype=np.float64,
+        holdout_losses = self._evaluate_ensemble(
+            dataset, holdout_indices, batch_size
         )
         self.elite_model_idxes = np.argsort(holdout_losses)[
             : self.elite_size
         ].tolist()
         self.is_fitted = True
         self.last_train_stats = {
-            "epochs": epoch_counts,
+            "epochs": [epochs_run] * self.network_size,
             "holdout_curves": holdout_curves,
             "train_curves": train_curves,
             "holdout_losses": holdout_losses,
@@ -575,31 +757,26 @@ class StepRewardEnsemble(nn.Module):
         state_imgs, hoprates, actions = self._validate_prediction_inputs(
             state_imgs, hoprates, actions
         )
+        self.member.eval()
         ensemble_means = []
         ensemble_variances = []
-        for member in self.members:
-            member.eval()
-            member_means = []
-            member_variances = []
-            with torch.no_grad():
-                for start in range(0, len(state_imgs), batch_size):
-                    stop = min(start + batch_size, len(state_imgs))
-                    tensors = self._batch_tensors(
-                        (
-                            state_imgs[start:stop],
-                            hoprates[start:stop],
-                            actions[start:stop],
-                        ),
-                        include_rewards=False,
-                    )
-                    means, variances = member(*tensors)
-                    member_means.append(means.cpu().numpy())
-                    member_variances.append(variances.cpu().numpy())
-            ensemble_means.append(np.concatenate(member_means, axis=0))
-            ensemble_variances.append(np.concatenate(member_variances, axis=0))
+        with torch.no_grad():
+            for start in range(0, len(state_imgs), batch_size):
+                stop = min(start + batch_size, len(state_imgs))
+                tensors = self._batch_tensors(
+                    (
+                        state_imgs[start:stop],
+                        hoprates[start:stop],
+                        actions[start:stop],
+                    ),
+                    include_rewards=False,
+                )
+                means, variances = self.member(*tensors)
+                ensemble_means.append(means.cpu().numpy())
+                ensemble_variances.append(variances.cpu().numpy())
         return (
-            np.stack(ensemble_means).astype(np.float32, copy=False),
-            np.stack(ensemble_variances).astype(np.float32, copy=False),
+            np.concatenate(ensemble_means, axis=1).astype(np.float32, copy=False),
+            np.concatenate(ensemble_variances, axis=1).astype(np.float32, copy=False),
         )
 
     def predict(self, state_imgs, hoprates, actions, batch_size=1024):
@@ -705,20 +882,18 @@ class StepRewardEnsemble(nn.Module):
 
     def _materialize(self, observation_shape):
         shape = tuple(int(value) for value in observation_shape)
-        if len(shape) == 2:
-            images = torch.zeros((1, 1, *shape), device=self.device)
-        elif len(shape) == 3:
-            images = torch.zeros((1, *shape), device=self.device)
-        else:
-            raise ValueError("Checkpoint observation_shape must have two or three axes.")
-        hoprates = torch.full(
-            (1, 1), (self.hoprate_min + self.hoprate_max) / 2.0, device=self.device
-        )
-        actions = torch.zeros((1, self.num_heads), dtype=torch.long, device=self.device)
-        for member in self.members:
-            member.eval()
-            with torch.no_grad():
-                member(images, hoprates, actions)
+        images, hoprates, actions = self._dummy_tensors(shape)
+        if self.member is None:
+            self.member = MatrixStepRewardMember(
+                self.network_size,
+                self.num_heads,
+                self.n_actions,
+                self.hoprate_min,
+                self.hoprate_max,
+                self.hidden_size,
+            ).to(self.device)
+        with torch.no_grad():
+            self.member(images, hoprates, actions)
         self.observation_shape = shape
 
     @classmethod
@@ -736,7 +911,13 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError(
                 "Reward-model checkpoint format v1 uses the old shallow state "
                 "encoder and two-layer state-action fusion; retrain the reward "
-                "model to create a v2 checkpoint."
+                "model to create a v3 checkpoint."
+            )
+        if format_version == 2:
+            raise ValueError(
+                "Reward-model checkpoint format v2 uses the old three-layer CNN, "
+                "two-layer hoprate MLP and per-member networks; retrain the "
+                "reward model to create a v3 checkpoint."
             )
         if format_version != REWARD_CHECKPOINT_FORMAT_VERSION:
             raise ValueError("Unsupported reward-model checkpoint format.")

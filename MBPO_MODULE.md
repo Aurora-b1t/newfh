@@ -37,23 +37,23 @@ dones            [B]
 
 不存在 `block_idx`、单 offset action 或人为构造的 block 间 transition。block 数量和离散 action 数量均从环境读取，不在 MBPO 中硬编码。
 
-## 3. 独立 CNN Ensemble
+## 3. 矩阵式 CNN Ensemble
 
 `r_predict_model/model.py` 提供 `StepRewardEnsemble`。默认包含 5 个模型并选择 3 个 elite。
 
+所有成员被组织进**单个矩阵网络** `MatrixStepRewardMember`：每个权重张量带成员领先维（Linear 权重 shape `[num_networks, out, in]`，CNN 权重 shape `[num_networks, C_out, C_in, k, k]`），成员之间不共享任何参数。CNN 部分用分组卷积技巧（输入沿通道维复制 `num_networks` 份，各组权重放入相邻输出通道组），一次 forward/backward 并行计算全部成员，并由**一个共享 Adam 优化器**一次 step 更新所有成员。
+
 每个成员拥有完全独立的：
 
-- CNN PSD 编码器；
-- hoprate embedding；
+- 两层 CNN PSD 编码器；
+- 单层 hoprate embedding；
 - 完整 offsets one-hot 编码器；
-- fusion MLP；
+- state fusion 与 state-action fusion（各一层）；
 - 十维 Logistic-Normal latent mean/log-variance 输出。
 
-共享 state encoder 的固定结构为：PSD 分支 `Conv 1→16 + GN4 + ReLU → Conv 16→32 + GN8 + ReLU → Pool → Conv 32→64 + GN16 + ReLU → Pool → FC512 + ReLU`；连续 hoprate 归一化后经过 `1→64→128` 两层 ReLU MLP；两者拼接后经过 `640→512→256` 两层 ReLU fusion。随后完整 offsets one-hot 先编码到 `hidden_size`，再与 256 维 state 特征进入三层同宽 SiLU state-action fusion。100×100 PSD 下单个 state encoder 约 2097 万参数。
+共享 state encoder 的固定结构为：PSD 分支 `Conv 1→16 + GN4 + ReLU → Conv 16→32 + GN8 + ReLU → Pool → FC512 + ReLU`；连续 hoprate 归一化后经过一层 `1→64` ReLU MLP；两者拼接后经过一层 `576→256` ReLU fusion。随后完整 offsets one-hot 先编码到 `hidden_size`，再与 256 维 state 特征进入一层同宽 SiLU state-action fusion，最后接 latent mean/log-variance 输出头。100×100 PSD 下单个成员约 2097 万参数（五成员矩阵共约 1.05 亿参数）。
 
-成员之间不共享 CNN 或其他权重。实现按成员顺序训练和推理，以控制 100×100 PSD 在 GPU 上的峰值显存。
-
-每个成员在潜变量空间输出对角高斯分布。训练 reward 先按每条样本的 hoprate 和 `BER∈[0,0.5]` 推导边界，超界目标仅在奖励模型内部饱和，再归一化、避开 sigmoid 端点并做 logit 变换。训练损失为 latent Gaussian NLL；holdout 排名则在真实 reward 单位下比较 sigmoid 有界预测与有界目标的平均 MSE。
+训练和推理都按成员维整体并行，不再逐成员循环。每个成员在潜变量空间输出对角高斯分布。训练 reward 先按每条样本的 hoprate 和 `BER∈[0,0.5]` 推导边界，超界目标仅在奖励模型内部饱和，再归一化、避开 sigmoid 端点并做 logit 变换。训练损失为全体成员的 latent Gaussian NLL 均值；holdout 排名则在真实 reward 单位下比较 sigmoid 有界预测与有界目标的平均 MSE。
 
 ## 4. 模型训练
 
@@ -61,12 +61,13 @@ dones            [B]
 
 1. 执行一个真实环境 step 并写入一条完整 transition。
 2. 当真实 replay 数量至少达到 `model_train_batch_size` 时，按 `model_train_freq` 判断是否拟合。
-3. 对当前 real buffer 中全部 transition 做一次随机 train/holdout 划分。
-4. 公共 holdout 默认占 20%；各成员遍历完整 train split，但使用独立随机顺序。
-5. 每次拟合都从头重新训练：拟合开始时重新随机初始化全部成员权重并重建 Adam 优化器，不在上一版本模型基础上继续训练。
-6. holdout 连续 5 个 epoch 没有至少 1% 改善时早停，最多 100 epoch。
-7. 恢复各成员本次拟合期间的最佳权重及对应 Adam 状态，再选择 holdout MSE 最低的 elite。
-8. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；每次拟合保存一张独立 PNG（`holdout_curves/holdout_step_XXXX.png`），并将全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。不再生成跨 step 的 holdout 汇总曲线。
+3. 对当前 real buffer 中全部 transition 做一次随机 train/holdout 划分，全部成员共用该划分。
+4. 公共 holdout 默认占 20%；每个 epoch 全体成员用同一批序并行训练，一次反向传播同时更新所有成员，最大 `max_epochs` 轮。
+5. 每次拟合都从头重新训练：拟合开始时重新随机初始化矩阵成员全部权重并重建共享 Adam 优化器，不在上一版本模型基础上继续训练。
+6. **全局早停**：每个 epoch 并行评估全体成员的 holdout MSE，以最优成员（holdout 最低者）为准；该成员连续 `patience` 个 epoch 没有至少 `min_improvement` 相对改善时，全体成员一起停止。
+7. 停止时全体成员恢复到全局最佳 epoch（最优成员达到最佳 holdout 的那个 epoch）的各自权重，共享优化器状态同步恢复。
+8. 按最终 holdout MSE 排序选择 elite。
+9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；每次拟合保存一张独立 PNG（`holdout_curves/holdout_step_XXXX.png`），并将全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
 
 即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=1`，因此每个在线 step 后都会遍历当时完整的真实 replay。对 5,000 条 100×100 transition 而言仍有较高成本；需要更快实验时应显式调大训练间隔或降低 epoch 上限。
 
@@ -133,9 +134,9 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `model_train_freq` | 1 | 每隔多少真实环境 step 全量继续拟合 |
 | `model_train_batch_size` | 256 | 模型训练 batch 及在线 warm-up 门槛 |
 | `holdout_ratio` | 0.2 | holdout 比例 |
-| `early_stop_patience` | 5 | 早停 patience |
+| `early_stop_patience` | 5 | 全局早停 patience（以最优成员为准） |
 | `max_epochs` | 100 | 单次全量拟合最大 epoch |
-| `min_improvement` | 0.01 | holdout 相对改善阈值 |
+| `min_improvement` | 0.01 | 最优成员 holdout 相对改善阈值 |
 | `rollout_batch_size` | 500 | 每次生成的最大合成 step 数 |
 | `rollout_length` | 1 | 固定为一步 |
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
@@ -182,7 +183,7 @@ reward_model_inference.pt
 figures/
 ```
 
-`sac_inference.pt` 保存 actor 权重和网络/环境维度；其格式升级为 v3，并写入 `cnn3_groupnorm_hop_mlp2_fusion_mlp2_v3` 架构标识。旧 SAC v1 BatchNorm、v2 浅层 GroupNorm 或其他架构会被明确拒绝。`reward_model_inference.pt` 保存全部 ensemble 权重、elite 索引、reward 配置、BER 边界、logit epsilon 和元数据；其格式升级为 v2，并写入 `cnn3_groupnorm_hop_mlp2_state_action_fusion3_v2`。旧 reward v1 不做部分迁移。两类 checkpoint 都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。
+`sac_inference.pt` 保存 actor 权重和网络/环境维度；其格式升级为 v4，并写入 `cnn2_groupnorm_hop_mlp1_fusion_mlp1_v4` 架构标识。旧 SAC v1 BatchNorm、v2 浅层 GroupNorm、v3 三层 CNN 或其他架构会被明确拒绝。`reward_model_inference.pt` 保存矩阵 ensemble 权重、elite 索引、reward 配置、BER 边界、logit epsilon 和元数据；其格式升级为 v3，并写入 `cnn2_groupnorm_hop_mlp1_state_action_fusion1_matrix_v3`。旧 reward v1/v2 不做部分迁移。两类 checkpoint 都不包含 optimizer、replay 或 RNG 状态，只用于推理和评估，不能精确恢复训练。
 
 若纯在线运行始终未达到奖励模型 warm-up 门槛，只保存 SAC checkpoint，并在日志中明确说明奖励模型尚未拟合。
 
@@ -190,8 +191,8 @@ figures/
 
 1. 这不是完整 dynamics MBPO，无法在模型内部递推 PSD 状态。
 2. 合成 next state 来自真实 replay，依赖 observation transition 与 action 无关的环境假设。
-3. 默认每 step 从头全量训练独立 CNN ensemble，计算成本很高。
-4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且各成员遍历同一训练集合；holdout 与分歧可能偏乐观。
+3. 默认每 step 从头全量训练矩阵 ensemble，计算成本很高；并行更新会同时持有全部成员的激活，峰值显存约为逐成员训练的 `num_networks` 倍。
+4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且全体成员遍历同一训练集和同一批序；holdout 与分歧可能偏乐观，成员多样性仅来自随机初始化。
 5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
 6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。
 7. v1/v2 block-level replay、SAC inference v1/v2 与 reward-model v1 checkpoint 均不兼容；旧模型必须重新训练，但现有 step-level v3 replay 可继续使用。

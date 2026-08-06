@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from SAC import (
-    FUSION_HIDDEN_DIM,
     HOPRATE_FEATURE_DIM,
     PSD_FEATURE_DIM,
     STATE_FEATURE_DIM,
@@ -113,21 +112,20 @@ class MultiHeadNetworkTests(unittest.TestCase):
             )
         )
         self.assertFalse(any(isinstance(module, nn.Dropout) for module in modules))
-        self.assertEqual(6, sum(isinstance(module, nn.GroupNorm) for module in modules))
+        self.assertEqual(4, sum(isinstance(module, nn.GroupNorm) for module in modules))
 
-    def test_state_encoder_has_requested_deep_architecture(self):
+    def test_state_encoder_has_requested_compact_architecture(self):
         encoder = StateEncoder(10.0, 1000.0)
 
-        self.assertEqual((16, 32, 64), (
+        self.assertEqual((16, 32), (
             encoder.conv1.out_channels,
             encoder.conv2.out_channels,
-            encoder.conv3.out_channels,
         ))
-        self.assertEqual((4, 8, 16), (
+        self.assertEqual((4, 8), (
             encoder.norm1.num_groups,
             encoder.norm2.num_groups,
-            encoder.norm3.num_groups,
         ))
+        self.assertFalse(hasattr(encoder, "conv3"))
         self.assertEqual(PSD_FEATURE_DIM, encoder.conv_fc.out_features)
 
         hoprate_linears = [
@@ -135,7 +133,7 @@ class MultiHeadNetworkTests(unittest.TestCase):
             for module in encoder.hoprate_embedding
             if isinstance(module, nn.Linear)
         ]
-        self.assertEqual([(1, 64), (64, HOPRATE_FEATURE_DIM)], [
+        self.assertEqual([(1, HOPRATE_FEATURE_DIM)], [
             (module.in_features, module.out_features)
             for module in hoprate_linears
         ])
@@ -144,8 +142,7 @@ class MultiHeadNetworkTests(unittest.TestCase):
         ]
         self.assertEqual(
             [
-                (PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, FUSION_HIDDEN_DIM),
-                (FUSION_HIDDEN_DIM, STATE_FEATURE_DIM),
+                (PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, STATE_FEATURE_DIM),
             ],
             [(module.in_features, module.out_features) for module in fusion_linears],
         )
@@ -159,7 +156,7 @@ class MultiHeadNetworkTests(unittest.TestCase):
         finally:
             handle.remove()
         self.assertEqual((2, STATE_FEATURE_DIM), tuple(output.shape))
-        self.assertEqual([(2, 32, 8, 8), (2, 64, 4, 4)], pool_calls)
+        self.assertEqual([(2, 32, 8, 8)], pool_calls)
 
     def test_state_encoder_supports_test_and_production_psd_sizes(self):
         for size in (8, 16, 100):
@@ -172,7 +169,7 @@ class MultiHeadNetworkTests(unittest.TestCase):
                 self.assertEqual((1, STATE_FEATURE_DIM), tuple(output.shape))
                 if size == 100:
                     self.assertEqual(
-                        20_972_000,
+                        41_113_248,
                         sum(parameter.numel() for parameter in encoder.parameters()),
                     )
 

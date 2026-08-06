@@ -18,11 +18,10 @@ from torch.nn.parameter import UninitializedParameter
 
 HOPRATE_INPUT_SCALE = 10.0
 PSD_FEATURE_DIM = 512
-HOPRATE_FEATURE_DIM = 128
-FUSION_HIDDEN_DIM = 512
+HOPRATE_FEATURE_DIM = 64
 STATE_FEATURE_DIM = 256
-SAC_CHECKPOINT_FORMAT_VERSION = 3
-SAC_POLICY_ARCHITECTURE = "cnn3_groupnorm_hop_mlp2_fusion_mlp2_v3"
+SAC_CHECKPOINT_FORMAT_VERSION = 4
+SAC_POLICY_ARCHITECTURE = "cnn2_groupnorm_hop_mlp1_fusion_mlp1_v4"
 
 
 def normalize_hoprate(hoprate, hoprate_min, hoprate_max):
@@ -217,21 +216,15 @@ class StateEncoder(nn.Module):
         self.norm1 = nn.GroupNorm(4, 16)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.norm2 = nn.GroupNorm(8, 32)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.norm3 = nn.GroupNorm(16, 64)
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.flatten = nn.Flatten()
         self.conv_fc = nn.LazyLinear(PSD_FEATURE_DIM)
         self.hoprate_embedding = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, HOPRATE_FEATURE_DIM),
+            nn.Linear(1, HOPRATE_FEATURE_DIM),
             nn.ReLU(),
         )
         self.fusion = nn.Sequential(
-            nn.Linear(PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, FUSION_HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(FUSION_HIDDEN_DIM, STATE_FEATURE_DIM),
+            nn.Linear(PSD_FEATURE_DIM + HOPRATE_FEATURE_DIM, STATE_FEATURE_DIM),
             nn.ReLU(),
         )
         self.apply(_init_weights)
@@ -242,8 +235,6 @@ class StateEncoder(nn.Module):
         )
         image_features = F.relu(self.norm1(self.conv1(img)))
         image_features = F.relu(self.norm2(self.conv2(image_features)))
-        image_features = self.pool(image_features)
-        image_features = F.relu(self.norm3(self.conv3(image_features)))
         image_features = self.pool(image_features)
         image_features = self.flatten(image_features)
         image_features = F.relu(self.conv_fc(image_features))
@@ -354,12 +345,17 @@ def load_sac_inference_checkpoint(
         raise ValueError(
             "SAC inference checkpoint format v1 uses the old BatchNorm policy "
             "architecture and cannot be loaded safely; retrain SAC to create a "
-            "v3 checkpoint."
+            "v4 checkpoint."
         )
     if format_version == 2:
         raise ValueError(
             "SAC inference checkpoint format v2 uses the old shallow GroupNorm "
-            "policy architecture; retrain SAC to create a v3 checkpoint."
+            "policy architecture; retrain SAC to create a v4 checkpoint."
+        )
+    if format_version == 3:
+        raise ValueError(
+            "SAC inference checkpoint format v3 uses the old three-layer CNN "
+            "policy architecture; retrain SAC to create a v4 checkpoint."
         )
     if format_version != SAC_CHECKPOINT_FORMAT_VERSION:
         raise ValueError("Unsupported SAC inference checkpoint format.")
