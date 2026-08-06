@@ -189,7 +189,10 @@ class _MatrixLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.num_members, self.out_features))
 
     def forward(self, features):
-        return torch.matmul(features, self.weight.transpose(1, 2)) + self.bias
+        return (
+            torch.matmul(features, self.weight.transpose(1, 2))
+            + self.bias.unsqueeze(1)
+        )
 
 
 class MatrixStepRewardMember(nn.Module):

@@ -147,6 +147,27 @@ class StepRewardEnsembleTests(unittest.TestCase):
         self.assertEqual(16, member.latent_mean_head.in_features)
         self.assertEqual(3, member.latent_mean_head.out_features)
 
+    def test_fit_supports_batch_sizes_different_from_member_count(self):
+        model = self.make_model()
+        states = self.rng.normal(size=(16, 8, 8)).astype(np.float32)
+        hoprates = np.linspace(100.0, 250.0, 16, dtype=np.float32)
+        actions = self.rng.integers(0, 4, size=(16, 3), dtype=np.int64)
+        rewards = self.rng.normal(size=(16, 3)).astype(np.float32)
+        model.fit(
+            states,
+            hoprates,
+            actions,
+            rewards,
+            batch_size=5,
+            max_epochs=1,
+            patience=0,
+        )
+        means, _variances = model.predict(
+            states[:3], hoprates[:3], actions[:3]
+        )
+        self.assertEqual((2, 3, 3), means.shape)
+        self.assertTrue(np.all(np.isfinite(means)))
+
     def test_fit_predict_and_sample_dynamic_heads(self):
         model = self.make_model()
         stats = model.fit(
