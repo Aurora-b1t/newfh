@@ -7,6 +7,7 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from SAC import (
     ReplayBuffer,
@@ -17,7 +18,7 @@ from SAC import (
 )
 from fh_env import save_waterfall_figure
 from offline_replay import environment_metadata, load_replay_into_buffer
-from r_predict_model import StepRewardEnsemble
+from r_predict_model import RewardReplayDataset, StepRewardEnsemble
 from r_predict_model.mbpo_adapter import (
     rollout_reward_model,
     sample_mixed_batch,
@@ -87,6 +88,16 @@ def _validate_args(args):
         raise ValueError("This reward-only MBPO implementation requires rollout_length=1.")
 
 
+def _configure_torch_runtime(args):
+    """Enable opt-in GPU math choices without changing training budgets."""
+    if not bool(getattr(args, "model_fast_math", False)) or not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+
 def reward_model_ready(real_buffer, model_train_batch_size):
     """Return whether real replay can support a train/holdout split."""
     return real_buffer.size() >= max(2, int(model_train_batch_size))
@@ -136,6 +147,7 @@ def should_train_reward_model(
 def train(args):
     """Train step-level SAC from a mixture of real and reward-model replay."""
     _validate_args(args)
+    _configure_torch_runtime(args)
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = os.path.join(args.output_dir, args.log_file)
     logger, hop_logger = setup_logger(log_path)
@@ -191,6 +203,12 @@ def train(args):
         learning_rate=args.model_lr,
         weight_decay=args.model_weight_decay,
         device=device,
+        precision=getattr(args, "model_precision", "float32"),
+        compile_model=getattr(args, "model_compile", False),
+    )
+    reward_dataset_cache = RewardReplayDataset(
+        device=device,
+        cache_on_device=args.cache_model_dataset,
     )
     fixed_hoprate = float(
         int(
@@ -211,6 +229,13 @@ def train(args):
         args.num_elites,
         args.pred_hidden_size,
         args.model_train_freq,
+    )
+    logger.info(
+        "Reward runtime: cache=%s precision=%s compile=%s fast_math=%s",
+        args.cache_model_dataset,
+        getattr(args, "model_precision", "float32"),
+        getattr(args, "model_compile", False),
+        getattr(args, "model_fast_math", False),
     )
     logger.info(
         "Model replay uses persistent FIFO retention with capacity=%d.",
@@ -299,6 +324,7 @@ def train(args):
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
                 cache_dataset_on_device=args.cache_model_dataset,
+                dataset_cache=reward_dataset_cache,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -714,6 +740,24 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=settings.MBPO_CONFIG["cache_dataset_on_device"],
         help="Keep the reward-model replay tensors on the training device.",
+    )
+    parser.add_argument(
+        "--model_precision",
+        choices=("float32", "bfloat16", "float16"),
+        default=settings.MBPO_CONFIG.get("model_precision", "float32"),
+        help="Reward-model autocast precision; does not change training budgets.",
+    )
+    parser.add_argument(
+        "--model_fast_math",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG.get("model_fast_math", False),
+        help="Enable TF32 and cuDNN autotuning on CUDA.",
+    )
+    parser.add_argument(
+        "--model_compile",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG.get("model_compile", False),
+        help="Compile the persistent reward-model graph with torch.compile.",
     )
     parser.add_argument(
         "--save_model_curve_figures",

@@ -13,6 +13,7 @@ from SAC import ReplayBuffer, SAC, SAC_POLICY_ARCHITECTURE
 from r_predict_model import (
     REWARD_CHECKPOINT_FORMAT_VERSION,
     REWARD_MODEL_ARCHITECTURE,
+    RewardReplayDataset,
     StepRewardEnsemble,
 )
 from r_predict_model.mbpo_adapter import (
@@ -533,6 +534,62 @@ class StepRewardEnsembleTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_reward_replay_dataset_updates_append_and_fifo_without_repacking(self):
+        buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
+        for index in range(2):
+            state = np.full((8, 8), index, dtype=np.float32)
+            buffer.add(
+                state,
+                100.0 + index,
+                [0, 1, 2],
+                [index, index, index],
+                state + 0.5,
+                100.0 + index,
+                False,
+            )
+
+        dataset = RewardReplayDataset(device="cpu", cache_on_device=False)
+        dataset.sync(buffer)
+        np.testing.assert_array_equal(
+            dataset.batch([0, 1])[0][:, 0, 0], [0.0, 1.0]
+        )
+
+        state = np.full((8, 8), 2, dtype=np.float32)
+        buffer.add(state, 102.0, [0, 1, 2], [2, 2, 2], state, 102.0, False)
+        dataset.sync(buffer)
+        np.testing.assert_array_equal(
+            dataset.batch([0, 1, 2])[0][:, 0, 0], [0.0, 1.0, 2.0]
+        )
+
+        state = np.full((8, 8), 3, dtype=np.float32)
+        buffer.add(state, 103.0, [0, 1, 2], [3, 3, 3], state, 103.0, False)
+        dataset.sync(buffer)
+        np.testing.assert_array_equal(
+            dataset.batch([0, 1, 2])[0][:, 0, 0], [1.0, 2.0, 3.0]
+        )
+        np.testing.assert_array_equal(dataset.first_state, np.full((8, 8), 1.0))
+
+    def test_reward_replay_dataset_can_drive_a_full_fit(self):
+        buffer = make_buffer(count=4)
+        dataset = RewardReplayDataset(device="cpu", cache_on_device=False)
+        dataset.sync(buffer)
+        model = StepRewardEnsemble(
+            1,
+            1,
+            3,
+            4,
+            reward_config=TEST_REWARD_CONFIG,
+            hidden_size=8,
+            device="cpu",
+        )
+        stats = model.fit(
+            dataset=dataset,
+            batch_size=2,
+            max_epochs=1,
+            patience=0,
+        )
+        self.assertEqual(4, stats["train_size"] + stats["holdout_size"])
+
     def test_mixed_batch_is_complete_and_respects_ratio(self):
         real_buffer = make_buffer(count=4, reward_value=0.0)
         model_buffer = make_buffer(count=4, reward_value=10.0)

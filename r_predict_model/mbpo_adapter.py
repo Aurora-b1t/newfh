@@ -8,6 +8,7 @@ import settings
 from .model import (
     DEFAULT_BER_MAX,
     DEFAULT_BER_MIN,
+    RewardReplayDataset,
     reward_bounds_from_config,
 )
 
@@ -95,8 +96,15 @@ def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
     return concat_transition_batches(batches, shuffle=False)
 
 
-def train_reward_model_from_replay(reward_model, replay_buffer, **fit_kwargs):
+def train_reward_model_from_replay(
+    reward_model, replay_buffer, dataset_cache=None, **fit_kwargs
+):
     """Continue fitting the ensemble on the full current real replay."""
+    if dataset_cache is not None:
+        if not isinstance(dataset_cache, RewardReplayDataset):
+            raise TypeError("dataset_cache must be a RewardReplayDataset.")
+        dataset_cache.sync(replay_buffer)
+        return reward_model.fit(dataset=dataset_cache, **fit_kwargs)
     fields = replay_fields_for_reward_model(replay_buffer)
     return reward_model.fit(**fields, **fit_kwargs)
 

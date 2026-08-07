@@ -188,6 +188,11 @@ MBPO_CONFIG = {
     # copies for every reward-model epoch. Use --no-cache_model_dataset when it
     # is not available.
     "cache_dataset_on_device": True,
+    # Runtime-only acceleration knobs. These do not change the reward-model
+    # architecture, optimizer budget, replay split, or early-stop settings.
+    "model_precision": "float32",
+    "model_fast_math": False,
+    "model_compile": False,
     # PNG generation is diagnostic I/O and is disabled during normal training.
     "save_curve_figures": True,
 }

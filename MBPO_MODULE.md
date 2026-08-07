@@ -63,13 +63,21 @@ dones            [B]
 2. 当真实 replay 数量至少达到 `model_train_batch_size` 时，按 `model_train_freq` 判断是否拟合。
 3. 对当前 real buffer 中全部 transition 做一次随机 train/holdout 划分，全部成员共用该划分。
 4. 公共 holdout 默认占 20%；每个 epoch 全体成员用同一批序并行训练，一次反向传播同时更新所有成员，最大 `max_epochs` 轮。
-5. 每次拟合都从头重新训练：拟合开始时重新随机初始化矩阵成员全部权重并重建共享 Adam 优化器，不在上一版本模型基础上继续训练。
+5. 每次拟合都从头重新训练：拟合开始时重新随机初始化矩阵成员全部权重并清空共享 Adam 状态，不在上一版本模型基础上继续训练；实现上可复用已物化的模块和优化器对象。
 6. **全局早停**：每个 epoch 并行评估全体成员的 holdout MSE，以最优成员（holdout 最低者）为准；该成员连续 `patience` 个 epoch 没有至少 `min_improvement` 相对改善时，全体成员一起停止。
 7. 停止时全体成员恢复到全局最佳 epoch（最优成员达到最佳 holdout 的那个 epoch）的各自权重，共享优化器状态同步恢复。
 8. 按最终 holdout MSE 排序选择 elite。
 9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。传入 `--save_model_curve_figures` 时才额外为每次拟合保存独立 PNG（`holdout_curves/holdout_step_XXXX.png`）。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
 
-即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=10`，因此每 10 个在线 step 才会遍历一次当时完整的真实 replay。对 20,000 条 100×100 transition 而言仍有较高成本；需要更快实验时可继续调大训练间隔、增大模型 batch 或降低 epoch 上限。GPU 训练默认把当前 fit 的 real replay 一次缓存到训练设备，避免每个 epoch 重复 CPU→GPU 拷贝；资源不足时可使用 `--no-cache_model_dataset`。
+即使预载了离线 replay，也不会在第一个在线 step 前单独初训。当前训练保持每个在线 step 全量重训。对 20,000 条 100×100 transition 而言仍有较高成本；GPU 训练路径会把 reward 字段放入持久化 ring cache，后续 fit 只更新新增或 FIFO 覆盖的 transition，避免重复构造和 CPU→GPU 拷贝；模型权重和 Adam 状态仍在每次 fit 开始时重新初始化。资源不足时可使用 `--no-cache_model_dataset`。
+
+在 CUDA 服务器上，`train_mbpo.py` 支持不改变训练预算的运行时优化选项：
+
+- `--model_compile`：复用 `torch.compile` 的矩阵 ensemble 图；首次 fit 有编译开销，后续 fit 更快。
+- `--model_precision bfloat16` 或 `float16`：启用 reward-model autocast；需要用 holdout 和最终策略结果验证数值容差。
+- `--model_fast_math`：启用 TF32 和 cuDNN autotuning；可能改变收敛轨迹，默认关闭。
+
+GPU cache 已开启时不使用 PyTorch `DataLoader`，因为数据已常驻设备且没有磁盘预处理瓶颈；`DataLoader` 只适合显式关闭设备缓存后的 CPU streaming fallback。
 
 ## 5. 一步合成 Rollout
 
@@ -131,8 +139,8 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `hidden_size` | 200 | action/fusion MLP 宽度 |
 | `learning_rate` | 1e-3 | 奖励模型学习率 |
 | `weight_decay` | 1e-5 | 奖励模型权重衰减 |
-| `model_train_freq` | 10 | 每隔多少真实环境 step 全量继续拟合 |
-| `model_train_batch_size` | 256 | 模型训练 batch 及在线 warm-up 门槛 |
+| `model_train_freq` | 1 | 每隔多少真实环境 step 全量继续拟合 |
+| `model_train_batch_size` | 512 | 模型训练 batch 及在线 warm-up 门槛 |
 | `holdout_ratio` | 0.2 | holdout 比例 |
 | `early_stop_patience` | 5 | 全局早停 patience（以最优成员为准） |
 | `max_epochs` | 100 | 单次全量拟合最大 epoch |
@@ -142,7 +150,10 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
 | `model_replay_size` | 4000 | 合成 replay FIFO 容量 |
 | `cache_dataset_on_device` | true | 是否把当前 reward-model 数据集缓存到训练设备 |
-| `save_curve_figures` | false | 是否每次拟合额外写入两张 PNG 曲线图 |
+| `model_precision` | float32 | reward-model 运行精度，不改变训练预算 |
+| `model_compile` | false | 是否复用 `torch.compile` 图 |
+| `model_fast_math` | false | 是否启用 TF32/cuDNN autotuning |
+| `save_curve_figures` | true | 是否每次拟合额外写入两张 PNG 曲线图 |
 
 所有训练预算参数均有对应 CLI 选项，可通过 `train_mbpo.py --help` 查看。
 
