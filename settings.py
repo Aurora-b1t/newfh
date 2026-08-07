@@ -145,14 +145,14 @@ SAC_CONFIG = {
 
 # Replay Buffer Configuration
 BUFFER_CONFIG = {
-    "capacity": 5000,
+    "capacity": 20000,
     "batch_size": 256,
 }
 
 # Offline real-environment replay configuration. Each transition represents one
 # complete environment step with ten offset actions and ten block rewards.
 OFFLINE_REPLAY_CONFIG = {
-    "num_step_transitions": 5000,
+    "num_step_transitions": 20000,
     "default_path": "outputs/offline_replay/replay_5000_100_hoprate_v3.npz",
     "hoprate_mode": "fixed",
     "fixed_hoprate": 100.0,
@@ -162,7 +162,7 @@ OFFLINE_REPLAY_CONFIG = {
 # changing the fixed-hoprate baseline defaults above.
 JOINT_OFFLINE_REPLAY_CONFIG = {
     "num_step_transitions": 5000,
-    "default_path": "outputs/offline_replay/replay_5000_random_hoprate_v3.npz",
+    "default_path": "outputs/offline_replay/replay_20000_random_hoprate_v3.npz",
     "hoprate_mode": "random",
 }
 
@@ -173,8 +173,9 @@ MBPO_CONFIG = {
     "hidden_size": 200,
     "learning_rate": 1e-3,
     "weight_decay": 1e-5,
+    # Refit the full real replay periodically instead of blocking every env step.
     "model_train_freq": 1,
-    "model_train_batch_size": 256,
+    "model_train_batch_size": 512,
     "holdout_ratio": 0.2,
     "early_stop_patience": 5,
     "max_epochs": 100,
@@ -183,6 +184,12 @@ MBPO_CONFIG = {
     "rollout_length": 1,
     "real_ratio": 0.2,
     "model_replay_size": 4000,
+    # The server training path has enough device memory to avoid repeated H2D
+    # copies for every reward-model epoch. Use --no-cache_model_dataset when it
+    # is not available.
+    "cache_dataset_on_device": True,
+    # PNG generation is diagnostic I/O and is disabled during normal training.
+    "save_curve_figures": True,
 }
 
 # Noisy Binary Search Configuration
@@ -199,7 +206,7 @@ NBS_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 200,       # Total environment steps per episode
+    "steps_per_episode": 80,       # Total environment steps per episode
     "update_iters_per_step": 10,      # Gradient updates per environment step
     "fixed_hoprate": 100.0,          # Fixed hopping rate for training
 }
@@ -211,7 +218,7 @@ TRAIN_CONFIG = {
 # Multiple steps may be listed; values outside [1, steps_per_episode] are
 # ignored with a warning. Empty list disables figure saving.
 PLOT_CONFIG = {
-    "figure_save_steps": [49, 50, 100, 101, 149, 150, 151, 198, 199],
+    "figure_save_steps": [49, 50],
 }
 
 # Reward Calculation Configuration

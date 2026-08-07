@@ -298,6 +298,7 @@ def train(args):
                 patience=args.model_patience,
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
+                cache_dataset_on_device=args.cache_model_dataset,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -311,14 +312,16 @@ def train(args):
             model_fit_time = time.time() - model_start
             holdout_curve_steps.append(step_idx)
             holdout_curve_history.append(last_model_stats["holdout_curves"])
-            _save_holdout_curves_figure(
-                args.output_dir, step_idx, last_model_stats["holdout_curves"]
-            )
+            if args.save_model_curve_figures:
+                _save_holdout_curves_figure(
+                    args.output_dir, step_idx, last_model_stats["holdout_curves"]
+                )
             train_curve_steps.append(step_idx)
             train_curve_history.append(last_model_stats["train_curves"])
-            _save_train_curves_figure(
-                args.output_dir, step_idx, last_model_stats["train_curves"]
-            )
+            if args.save_model_curve_figures:
+                _save_train_curves_figure(
+                    args.output_dir, step_idx, last_model_stats["train_curves"]
+                )
             logger.info(
                 "Reward model | holdout=%.6f | elites=%s | epochs=%s | "
                 "rollout=%d | model_buf=%d->%d/%d | fifo_evicted=%d | "
@@ -341,14 +344,18 @@ def train(args):
 
         train_stats = {}
         if replay_ready(real_buffer, args.batch_size):
-            for _ in range(args.update_iters_per_step):
+            last_update_index = args.update_iters_per_step - 1
+            for update_index in range(args.update_iters_per_step):
                 batch = sample_mixed_batch(
                     real_buffer,
                     model_buffer,
                     args.batch_size,
                     args.real_ratio,
                 )
-                train_stats = agent.update(batch)
+                train_stats = agent.update(
+                    batch,
+                    return_stats=update_index == last_update_index,
+                )
 
         metrics["rewards"].append(float(step_reward))
         metrics["bers"].append(mean_step_ber)
@@ -604,7 +611,7 @@ def parse_args():
         default=settings.TRAIN_CONFIG["steps_per_episode"],
     )
     parser.add_argument(
-        "--output_dir", type=str, default="outputs/mbpo/comb/pre50000"
+        "--output_dir", type=str, default="outputs/mbpo/comb/0"
     )
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
@@ -701,6 +708,18 @@ def parse_args():
         "--model_min_improvement",
         type=float,
         default=settings.MBPO_CONFIG["min_improvement"],
+    )
+    parser.add_argument(
+        "--cache_model_dataset",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG["cache_dataset_on_device"],
+        help="Keep the reward-model replay tensors on the training device.",
+    )
+    parser.add_argument(
+        "--save_model_curve_figures",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG["save_curve_figures"],
+        help="Write a PNG pair after every reward-model fit.",
     )
     parser.add_argument(
         "--deterministic_model_rollout", action="store_true"

@@ -201,6 +201,15 @@ class MultiHeadNetworkTests(unittest.TestCase):
         self.assertTrue(np.all((sampled >= 0) & (sampled < 5)))
         self.assertTrue(np.all((deterministic >= 0) & (deterministic < 5)))
 
+    def test_take_actions_returns_one_action_vector_per_state(self):
+        agent = make_agent()
+        states = np.random.randn(4, 16, 16).astype(np.float32)
+        actions = agent.take_actions(states, np.full(4, 100.0))
+
+        self.assertEqual((4, 10), actions.shape)
+        self.assertEqual(np.int64, actions.dtype)
+        self.assertTrue(np.all((actions >= 0) & (actions < 5)))
+
     def test_take_action_does_not_temporarily_flip_actor_mode(self):
         agent = make_agent()
         state = np.random.randn(16, 16).astype(np.float32)

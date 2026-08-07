@@ -197,6 +197,7 @@ def train(args):
                 patience=args.model_patience,
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
+                cache_dataset_on_device=args.cache_model_dataset,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -230,14 +231,18 @@ def train(args):
 
         train_stats = {}
         if replay_ready(real_buffer, args.batch_size):
-            for _ in range(args.update_iters_per_step):
+            last_update_index = args.update_iters_per_step - 1
+            for update_index in range(args.update_iters_per_step):
                 batch = sample_mixed_batch(
                     real_buffer,
                     model_buffer,
                     args.batch_size,
                     args.real_ratio,
                 )
-                train_stats = agent.update(batch)
+                train_stats = agent.update(
+                    batch,
+                    return_stats=update_index == last_update_index,
+                )
 
         metrics["rewards"].append(result.step_reward)
         metrics["bers"].append(result.mean_ber)
@@ -438,6 +443,12 @@ def parse_args(argv=None):
         "--model_min_improvement",
         type=float,
         default=settings.MBPO_CONFIG["min_improvement"],
+    )
+    parser.add_argument(
+        "--cache_model_dataset",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG["cache_dataset_on_device"],
+        help="Keep the reward-model replay tensors on the training device.",
     )
     parser.add_argument("--deterministic_model_rollout", action="store_true")
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)

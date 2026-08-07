@@ -516,6 +516,21 @@ class StepRewardEnsembleTests(unittest.TestCase):
         )
         self.assertEqual(2, len(stats["holdout_curves"][0]))
 
+    def test_fit_can_cache_dataset_on_training_device(self):
+        model = self.make_model()
+        stats = model.fit(
+            self.states,
+            self.hoprates,
+            self.actions,
+            self.rewards,
+            batch_size=2,
+            max_epochs=1,
+            patience=0,
+            cache_dataset_on_device=True,
+        )
+        self.assertTrue(model.is_fitted)
+        self.assertEqual(1, stats["epochs"][0])
+
 
 class AdapterTests(unittest.TestCase):
     def test_mixed_batch_is_complete_and_respects_ratio(self):
@@ -532,6 +547,26 @@ class AdapterTests(unittest.TestCase):
         model_buffer = ReplayBuffer(4, num_heads=3, n_actions=4)
         batch = sample_mixed_batch(real_buffer, model_buffer, 4, 0.2)
         self.assertEqual((4, 3), batch["block_rewards"].shape)
+
+    def test_replay_add_batch_matches_single_transition_schema(self):
+        buffer = ReplayBuffer(4, num_heads=3, n_actions=4)
+        states = np.stack(
+            [np.zeros((8, 8), dtype=np.float32), np.ones((8, 8), dtype=np.float32)]
+        )
+        buffer.add_batch(
+            states,
+            [100.0, 110.0],
+            [[0, 1, 2], [1, 2, 3]],
+            np.zeros((2, 3), dtype=np.float32),
+            states + 0.5,
+            [110.0, 120.0],
+            [False, True],
+        )
+
+        batch = buffer.get_all()
+        self.assertEqual(2, buffer.size())
+        self.assertEqual((2, 8, 8), batch["state_imgs"].shape)
+        np.testing.assert_array_equal(batch["actions"], [[0, 1, 2], [1, 2, 3]])
 
     def test_rollout_uses_bounded_rewards_and_copies_real_successors(self):
         real_buffer = make_buffer(count=2)
@@ -666,7 +701,6 @@ class AdapterTests(unittest.TestCase):
             patience=0,
         )
         self.assertEqual(4, stats["train_size"] + stats["holdout_size"])
-
 
 class HoldoutCurveOutputTests(unittest.TestCase):
     def test_per_fit_figure_and_npz_outputs(self):

@@ -260,13 +260,25 @@ class MatrixStepRewardMember(nn.Module):
                 self.num_members, feature_size, PSD_FEATURE_DIM
             ).to(device)
 
-    def forward(self, images, hoprates, actions, return_logvar=False):
+    def forward(
+        self,
+        images,
+        hoprates,
+        actions,
+        return_logvar=False,
+        validate_actions=True,
+        return_mean_only=False,
+    ):
         if actions.ndim != 2 or actions.shape[1] != self.num_heads:
             raise ValueError(
                 "actions must have shape [batch_size, "
                 f"{self.num_heads}], got {tuple(actions.shape)}."
             )
-        if torch.any(actions < 0) or torch.any(actions >= self.n_actions):
+        if return_mean_only and return_logvar:
+            raise ValueError("return_mean_only and return_logvar cannot both be true.")
+        if validate_actions and (
+            torch.any(actions < 0) or torch.any(actions >= self.n_actions)
+        ):
             raise ValueError("actions are outside the configured action range.")
 
         batch_size = images.shape[0]
@@ -311,6 +323,8 @@ class MatrixStepRewardMember(nn.Module):
             self.fusion_head(torch.cat([state_features, action_features], dim=2))
         )
         mean = self.latent_mean_head(fused)
+        if return_mean_only:
+            return mean
         raw_logvar = self.latent_logvar_head(fused)
         logvar = self.max_logvar - F.softplus(self.max_logvar - raw_logvar)
         logvar = self.min_logvar + F.softplus(logvar - self.min_logvar)
@@ -320,38 +334,100 @@ class MatrixStepRewardMember(nn.Module):
 
 
 class _RewardDataset:
-    """Reference-based dataset that avoids copying a full image replay."""
+    """Compact array-backed dataset used for repeated model epochs."""
 
     def __init__(self, state_imgs, hoprates, actions, block_rewards):
+        try:
+            self.state_imgs = np.asarray(state_imgs, dtype=np.float32)
+            self.hoprates = np.asarray(hoprates, dtype=np.float32).reshape(-1)
+            self.actions = np.asarray(actions)
+            self.block_rewards = np.asarray(block_rewards, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Reward-model fields must be rectangular arrays.") from exc
+
         lengths = {
-            len(state_imgs),
-            len(hoprates),
-            len(actions),
-            len(block_rewards),
+            len(self.state_imgs),
+            len(self.hoprates),
+            len(self.actions),
+            len(self.block_rewards),
         }
         if len(lengths) != 1:
             raise ValueError("Reward-model fields have inconsistent lengths.")
         self.size = lengths.pop()
         if self.size < 2:
             raise ValueError("Need at least two real transitions to fit the ensemble.")
-        self.state_imgs = state_imgs
-        self.hoprates = hoprates
-        self.actions = actions
-        self.block_rewards = block_rewards
+        self._tensor_cache = None
+        self._tensor_cache_device = None
+
+    def validate(self, num_heads, n_actions):
+        if self.state_imgs.ndim not in (3, 4):
+            raise ValueError("state_imgs must have shape [B,H,W] or [B,C,H,W].")
+        if self.hoprates.shape != (self.size,):
+            raise ValueError(f"hoprates must have shape ({self.size},).")
+        if not np.all(np.isfinite(self.hoprates)):
+            raise ValueError("hoprates must contain only finite values.")
+        if self.actions.shape != (self.size, int(num_heads)):
+            raise ValueError(
+                "actions must have shape "
+                f"({self.size}, {int(num_heads)}), got {self.actions.shape}."
+            )
+        if not np.all(np.isfinite(self.actions)):
+            raise ValueError("actions must contain only finite values.")
+        rounded_actions = np.rint(self.actions)
+        if not np.allclose(self.actions, rounded_actions):
+            raise ValueError("actions must be integer-valued.")
+        self.actions = rounded_actions.astype(np.int64, copy=False)
+        if np.any(self.actions < 0) or np.any(self.actions >= int(n_actions)):
+            raise ValueError("actions are outside the configured action range.")
+        expected_rewards_shape = (self.size, int(num_heads))
+        if self.block_rewards.shape != expected_rewards_shape:
+            raise ValueError(
+                "block_rewards must have shape "
+                f"{expected_rewards_shape}, got {self.block_rewards.shape}."
+            )
+        if not np.all(np.isfinite(self.block_rewards)):
+            raise ValueError("block_rewards must contain only finite values.")
+
+    def cache_on_device(self, device):
+        """Materialize the current real replay once on the training device."""
+        images = self.state_imgs
+        if images.ndim == 3:
+            images = images[:, np.newaxis, ...]
+        images = np.ascontiguousarray(images, dtype=np.float32)
+        self._tensor_cache = (
+            torch.as_tensor(images, dtype=torch.float32, device=device),
+            torch.as_tensor(self.hoprates, dtype=torch.float32, device=device).view(-1, 1),
+            torch.as_tensor(self.actions, dtype=torch.long, device=device),
+            torch.as_tensor(self.block_rewards, dtype=torch.float32, device=device),
+        )
+        self._tensor_cache_device = torch.device(device)
+        # The replay still owns the original per-transition arrays. Release the
+        # temporary contiguous image copy after its device transfer.
+        self.state_imgs = None
+
+    @property
+    def is_cached(self):
+        return self._tensor_cache is not None
+
+    def tensor_batch(self, indices):
+        if self._tensor_cache is None:
+            raise RuntimeError("Reward dataset has not been cached on a device.")
+        index_tensor = torch.as_tensor(
+            np.asarray(indices, dtype=np.int64),
+            dtype=torch.long,
+            device=self._tensor_cache_device,
+        )
+        return tuple(
+            values.index_select(0, index_tensor) for values in self._tensor_cache
+        )
 
     def batch(self, indices):
         indices = np.asarray(indices, dtype=np.int64)
         return (
-            np.stack([self.state_imgs[i] for i in indices]).astype(
-                np.float32, copy=False
-            ),
-            np.asarray([self.hoprates[i] for i in indices], dtype=np.float32),
-            np.stack([self.actions[i] for i in indices]).astype(
-                np.int64, copy=False
-            ),
-            np.stack([self.block_rewards[i] for i in indices]).astype(
-                np.float32, copy=False
-            ),
+            self.state_imgs[indices],
+            self.hoprates[indices],
+            self.actions[indices],
+            self.block_rewards[indices],
         )
 
 
@@ -542,7 +618,7 @@ class StepRewardEnsemble(nn.Module):
         actions_t = torch.as_tensor(
             rounded_actions, dtype=torch.long, device=self.device
         )
-        if torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions):
+        if np.any(rounded_actions < 0) or np.any(rounded_actions >= self.n_actions):
             raise ValueError("actions are outside the configured action range.")
         if not include_rewards:
             return images_t, hoprates_t, actions_t
@@ -574,9 +650,11 @@ class StepRewardEnsemble(nn.Module):
         with torch.no_grad():
             for start in range(0, len(indices), batch_size):
                 batch_indices = indices[start : start + batch_size]
-                tensors = self._batch_tensors(dataset.batch(batch_indices))
-                latent_mean, _logvar = self.member(
-                    *tensors[:3], return_logvar=True
+                tensors = self._dataset_batch_tensors(dataset, batch_indices)
+                latent_mean = self.member(
+                    *tensors[:3],
+                    validate_actions=False,
+                    return_mean_only=True,
                 )
                 reward_prediction = self._latent_to_rewards_tensor(
                     latent_mean, tensors[1]
@@ -591,6 +669,11 @@ class StepRewardEnsemble(nn.Module):
                 value_count += tensors[3].numel()
         return (squared_error / max(1, value_count)).cpu().numpy()
 
+    def _dataset_batch_tensors(self, dataset, indices):
+        if dataset.is_cached:
+            return dataset.tensor_batch(indices)
+        return self._batch_tensors(dataset.batch(indices))
+
     def fit(
         self,
         state_imgs,
@@ -602,6 +685,7 @@ class StepRewardEnsemble(nn.Module):
         patience=5,
         max_epochs=100,
         min_improvement=0.01,
+        cache_dataset_on_device=None,
     ):
         """Retrain every member in parallel on the current real-replay split.
 
@@ -621,6 +705,7 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("min_improvement must be non-negative.")
 
         dataset = _RewardDataset(state_imgs, hoprates, actions, block_rewards)
+        dataset.validate(self.num_heads, self.n_actions)
         first_state = np.asarray(state_imgs[0], dtype=np.float32)
         if first_state.ndim not in (2, 3):
             raise ValueError("Each state image must have shape [H,W] or [C,H,W].")
@@ -636,7 +721,14 @@ class StepRewardEnsemble(nn.Module):
             hoprates, block_rewards
         )
 
+        if cache_dataset_on_device is None:
+            cache_dataset_on_device = (
+                self.device.type == "cuda"
+                and bool(settings.MBPO_CONFIG.get("cache_dataset_on_device", True))
+            )
         self._rebuild_member_and_optimizer(observation_shape)
+        if cache_dataset_on_device:
+            dataset.cache_on_device(self.device)
         permutation = np.random.permutation(dataset.size)
         holdout_size = min(
             max(1, int(dataset.size * holdout_ratio)), dataset.size - 1
@@ -667,25 +759,38 @@ class StepRewardEnsemble(nn.Module):
             epoch_start = time.time() if timing_enabled else None
             self.member.train()
             shuffled_indices = np.random.permutation(train_indices)
-            epoch_batch_losses = []
+            epoch_loss_total = None
+            epoch_batch_count = 0
             for start in range(0, len(shuffled_indices), batch_size):
                 batch_indices = shuffled_indices[start : start + batch_size]
-                images_t, hoprates_t, actions_t, rewards_t = self._batch_tensors(
-                    dataset.batch(batch_indices)
+                images_t, hoprates_t, actions_t, rewards_t = self._dataset_batch_tensors(
+                    dataset, batch_indices
                 )
                 mean, logvar = self.member(
-                    images_t, hoprates_t, actions_t, return_logvar=True
+                    images_t,
+                    hoprates_t,
+                    actions_t,
+                    return_logvar=True,
+                    validate_actions=False,
                 )
                 latent_targets, _bounded_rewards = self._targets_to_latent(
                     rewards_t, hoprates_t
                 )
                 loss = self._probabilistic_loss(mean, logvar, latent_targets)
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()
-                epoch_batch_losses.append(float(loss.item()))
+                detached_loss = loss.detach()
+                epoch_loss_total = (
+                    detached_loss
+                    if epoch_loss_total is None
+                    else epoch_loss_total + detached_loss
+                )
+                epoch_batch_count += 1
 
-            mean_train_loss = float(np.mean(epoch_batch_losses))
+            mean_train_loss = float(
+                (epoch_loss_total / max(1, epoch_batch_count)).item()
+            )
             for member_idx in range(self.network_size):
                 train_curves[member_idx].append(mean_train_loss)
 
@@ -784,7 +889,10 @@ class StepRewardEnsemble(nn.Module):
                     ),
                     include_rewards=False,
                 )
-                means, variances = self.member(*tensors)
+                means, variances = self.member(
+                    *tensors,
+                    validate_actions=False,
+                )
                 ensemble_means.append(means.cpu().numpy())
                 ensemble_variances.append(variances.cpu().numpy())
         return (

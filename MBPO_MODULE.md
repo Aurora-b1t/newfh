@@ -67,9 +67,9 @@ dones            [B]
 6. **全局早停**：每个 epoch 并行评估全体成员的 holdout MSE，以最优成员（holdout 最低者）为准；该成员连续 `patience` 个 epoch 没有至少 `min_improvement` 相对改善时，全体成员一起停止。
 7. 停止时全体成员恢复到全局最佳 epoch（最优成员达到最佳 holdout 的那个 epoch）的各自权重，共享优化器状态同步恢复。
 8. 按最终 holdout MSE 排序选择 elite。
-9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；每次拟合保存一张独立 PNG（`holdout_curves/holdout_step_XXXX.png`），并将全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
+9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。传入 `--save_model_curve_figures` 时才额外为每次拟合保存独立 PNG（`holdout_curves/holdout_step_XXXX.png`）。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
 
-即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=1`，因此每个在线 step 后都会遍历当时完整的真实 replay。对 5,000 条 100×100 transition 而言仍有较高成本；需要更快实验时应显式调大训练间隔或降低 epoch 上限。
+即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认 `model_train_freq=10`，因此每 10 个在线 step 才会遍历一次当时完整的真实 replay。对 20,000 条 100×100 transition 而言仍有较高成本；需要更快实验时可继续调大训练间隔、增大模型 batch 或降低 epoch 上限。GPU 训练默认把当前 fit 的 real replay 一次缓存到训练设备，避免每个 epoch 重复 CPU→GPU 拷贝；资源不足时可使用 `--no-cache_model_dataset`。
 
 ## 5. 一步合成 Rollout
 
@@ -93,7 +93,7 @@ model replay 使用固定容量的持续 FIFO。它会保留旧奖励模型版�
 
 ## 6. SAC 混合更新
 
-默认 `real_ratio=0.2`。每个 SAC batch 按目标比例分别从真实和合成 replay 采样，然后合并并打乱。
+默认 `real_ratio=0.2`。每个 SAC batch 按目标比例分别从真实和合成 replay 采样，然后合并；两侧已经独立随机采样，因此不再做一次额外的整批 shuffle。
 
 - model replay 未就绪时，使用纯真实 batch。
 - 一侧样本不足时，由另一侧补齐。
@@ -131,7 +131,7 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `hidden_size` | 200 | action/fusion MLP 宽度 |
 | `learning_rate` | 1e-3 | 奖励模型学习率 |
 | `weight_decay` | 1e-5 | 奖励模型权重衰减 |
-| `model_train_freq` | 1 | 每隔多少真实环境 step 全量继续拟合 |
+| `model_train_freq` | 10 | 每隔多少真实环境 step 全量继续拟合 |
 | `model_train_batch_size` | 256 | 模型训练 batch 及在线 warm-up 门槛 |
 | `holdout_ratio` | 0.2 | holdout 比例 |
 | `early_stop_patience` | 5 | 全局早停 patience（以最优成员为准） |
@@ -141,6 +141,8 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `rollout_length` | 1 | 固定为一步 |
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
 | `model_replay_size` | 4000 | 合成 replay FIFO 容量 |
+| `cache_dataset_on_device` | true | 是否把当前 reward-model 数据集缓存到训练设备 |
+| `save_curve_figures` | false | 是否每次拟合额外写入两张 PNG 曲线图 |
 
 所有训练预算参数均有对应 CLI 选项，可通过 `train_mbpo.py --help` 查看。
 
@@ -166,7 +168,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --offline_replay_path none --s
 
 ## 10. 输出与 Checkpoint
 
-默认输出目录为 `outputs/mbpo/comb/pre50000`，包括：
+默认输出目录为 `outputs/mbpo/comb/0`，包括：
 
 ```text
 training_log.txt
@@ -176,8 +178,9 @@ loss.png
 model_reward.png
 model_disagreement.png
 model_target_saturation_fraction.png
-holdout_curves/
 holdout_curves.npz
+holdout_curves/             # 仅 --save_model_curve_figures 时生成
+train_curves/               # 仅 --save_model_curve_figures 时生成
 sac_inference.pt
 reward_model_inference.pt
 figures/
@@ -191,7 +194,7 @@ figures/
 
 1. 这不是完整 dynamics MBPO，无法在模型内部递推 PSD 状态。
 2. 合成 next state 来自真实 replay，依赖 observation transition 与 action 无关的环境假设。
-3. 默认每 step 从头全量训练矩阵 ensemble，计算成本很高；并行更新会同时持有全部成员的激活，峰值显存约为逐成员训练的 `num_networks` 倍。
+3. 每次 reward-model fit 仍然从头全量训练矩阵 ensemble，单次计算成本很高；默认仅每 10 个环境 step fit 一次，并行更新会同时持有全部成员的激活，峰值显存约为逐成员训练的 `num_networks` 倍。
 4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且全体成员遍历同一训练集和同一批序；holdout 与分歧可能偏乐观，成员多样性仅来自随机初始化。
 5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
 6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。

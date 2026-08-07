@@ -13,7 +13,7 @@ from .model import (
 
 
 def replay_fields_for_reward_model(replay_buffer):
-    """Return reward-model fields without copying every replay image."""
+    """Return replay-backed reward-model fields without an extraction copy."""
     transitions = tuple(replay_buffer.buffer)
     if not transitions:
         raise ValueError("Cannot train the reward model from an empty replay buffer.")
@@ -90,7 +90,9 @@ def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
         batches.append(real_buffer.sample(real_count))
     if model_count:
         batches.append(model_buffer.sample(model_count))
-    return concat_transition_batches(batches, shuffle=True)
+    # SAC uses GroupNorm rather than batch-statistics layers, so the two
+    # independently randomized samples do not need a second full-array shuffle.
+    return concat_transition_batches(batches, shuffle=False)
 
 
 def train_reward_model_from_replay(reward_model, replay_buffer, **fit_kwargs):
@@ -140,15 +142,24 @@ def rollout_reward_model(
         stage_start = time.time()
     state_imgs = starts["state_imgs"]
     hoprates = np.asarray(starts["hoprates"], dtype=np.float32)
-    actions = np.stack(
-        [
-            np.asarray(
-                agent.take_action(state_imgs[index], float(hoprates[index])),
-                dtype=np.int64,
-            )
-            for index in range(rollout_size)
-        ]
-    )
+    take_actions = getattr(agent, "take_actions", None)
+    if callable(take_actions):
+        actions = np.asarray(
+            take_actions(state_imgs, hoprates),
+            dtype=np.int64,
+        )
+    else:
+        # Keep lightweight test agents and external SAC-compatible agents that
+        # only expose the original single-state API working.
+        actions = np.stack(
+            [
+                np.asarray(
+                    agent.take_action(state_imgs[index], float(hoprates[index])),
+                    dtype=np.int64,
+                )
+                for index in range(rollout_size)
+            ]
+        )
     if timing_enabled:
         timing["policy_s"] = time.time() - stage_start
         stage_start = time.time()
@@ -187,16 +198,15 @@ def rollout_reward_model(
         raise RuntimeError("Reward ensemble returned a reward outside its bounds.")
     predicted_rewards = predicted_rewards.astype(np.float32, copy=False)
 
-    for index in range(rollout_size):
-        model_buffer.add(
-            state_imgs[index],
-            float(hoprates[index]),
-            actions[index],
-            predicted_rewards[index],
-            starts["next_state_imgs"][index],
-            float(starts["next_hoprates"][index]),
-            bool(starts["dones"][index]),
-        )
+    model_buffer.add_batch(
+        state_imgs,
+        hoprates,
+        actions,
+        predicted_rewards,
+        starts["next_state_imgs"],
+        starts["next_hoprates"],
+        starts["dones"],
+    )
     if timing_enabled:
         timing["add_s"] = time.time() - stage_start
         timing["total_s"] = sum(timing.values())

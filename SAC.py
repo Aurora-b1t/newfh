@@ -143,6 +143,102 @@ class ReplayBuffer:
             )
         )
 
+    def add_batch(
+        self,
+        state_imgs,
+        hoprates,
+        actions,
+        block_rewards,
+        next_state_imgs,
+        next_hoprates,
+        dones,
+    ):
+        """Append a batch of transitions with validation performed once."""
+        state_array = np.asarray(state_imgs, dtype=np.float32)
+        next_state_array = np.asarray(next_state_imgs, dtype=np.float32)
+        if state_array.ndim not in (3, 4) or next_state_array.ndim != state_array.ndim:
+            raise ValueError(
+                "state images must have shape [B,H,W] or [B,C,H,W]."
+            )
+        if state_array.shape != next_state_array.shape:
+            raise ValueError(
+                "state_imgs and next_state_imgs must have the same shape, got "
+                f"{state_array.shape} and {next_state_array.shape}."
+            )
+        batch_size = state_array.shape[0]
+        if batch_size == 0:
+            return
+        if state_array.size == 0 or not np.all(np.isfinite(state_array)) or not np.all(
+            np.isfinite(next_state_array)
+        ):
+            raise ValueError("state images must contain only finite values.")
+
+        if self.observation_shape is None:
+            self.observation_shape = state_array.shape[1:]
+        elif tuple(state_array.shape[1:]) != tuple(self.observation_shape):
+            raise ValueError(
+                "state image shape differs from existing replay data: "
+                f"expected {self.observation_shape}, got {state_array.shape[1:]}."
+            )
+
+        hoprate_array = np.asarray(hoprates, dtype=np.float32).reshape(-1)
+        next_hoprate_array = np.asarray(next_hoprates, dtype=np.float32).reshape(-1)
+        if hoprate_array.shape != (batch_size,) or next_hoprate_array.shape != (
+            batch_size,
+        ):
+            raise ValueError("hoprates must contain one value per transition.")
+        if not np.all(np.isfinite(hoprate_array)) or not np.all(
+            np.isfinite(next_hoprate_array)
+        ):
+            raise ValueError("hoprates must be finite.")
+
+        raw_actions = np.asarray(actions)
+        if raw_actions.shape != (batch_size, self.num_heads):
+            raise ValueError(
+                "actions must have shape "
+                f"({batch_size}, {self.num_heads}), got {raw_actions.shape}."
+            )
+        if not np.all(np.isfinite(raw_actions)):
+            raise ValueError("actions contains non-finite values.")
+        rounded_actions = np.rint(raw_actions)
+        if not np.allclose(raw_actions, rounded_actions):
+            raise ValueError("actions must contain integer-valued offsets.")
+        actions_array = rounded_actions.astype(np.int64)
+        if np.any(actions_array < 0):
+            raise ValueError("actions must be non-negative.")
+        if self.n_actions is not None and np.any(actions_array >= self.n_actions):
+            raise ValueError(
+                f"actions must be in [0, {self.n_actions - 1}]."
+            )
+
+        rewards_array = np.asarray(block_rewards, dtype=np.float32)
+        if rewards_array.shape != (batch_size, self.num_heads):
+            raise ValueError(
+                "block_rewards must have shape "
+                f"({batch_size}, {self.num_heads}), got {rewards_array.shape}."
+            )
+        if not np.all(np.isfinite(rewards_array)):
+            raise ValueError("block_rewards contains non-finite values.")
+
+        dones_array = np.asarray(dones).reshape(-1)
+        if dones_array.shape != (batch_size,):
+            raise ValueError("dones must contain one value per transition.")
+
+        step_rewards = np.mean(rewards_array, axis=1)
+        for index in range(batch_size):
+            self.buffer.append(
+                (
+                    state_array[index].copy(),
+                    float(hoprate_array[index]),
+                    actions_array[index].copy(),
+                    rewards_array[index].copy(),
+                    float(step_rewards[index]),
+                    next_state_array[index].copy(),
+                    float(next_hoprate_array[index]),
+                    bool(dones_array[index]),
+                )
+            )
+
     @staticmethod
     def _batch_from_transitions(transitions):
         (
@@ -468,18 +564,35 @@ class SAC:
         )
 
     def take_action(self, state_img, hoprate, deterministic=False):
-        img = self._single_image_tensor(state_img, self.device)
-        hoprate_tensor = torch.tensor(
-            [[float(hoprate)]], dtype=torch.float32, device=self.device
-        )
+        state_array = np.asarray(state_img)
+        if state_array.ndim not in (2, 3):
+            raise ValueError(
+                f"state_img must have shape [H,W] or [C,H,W], got {state_array.shape}."
+            )
+        return self.take_actions(
+            state_array[np.newaxis, ...],
+            np.asarray([float(hoprate)], dtype=np.float32),
+            deterministic=deterministic,
+        )[0]
 
+    def take_actions(self, state_imgs, hoprates, deterministic=False):
+        """Sample a complete batch of multi-head actions in one policy pass."""
+        imgs = self._batch_images(state_imgs)
+        hoprate_tensor = self._batch_hoprates(hoprates)
+        if imgs.shape[0] != hoprate_tensor.shape[0]:
+            raise ValueError(
+                "state_imgs and hoprates must contain the same number of samples."
+            )
+
+        # LazyConv2d may materialize parameters on this first call; no_grad
+        # keeps those parameters usable by the later autograd training pass.
         with torch.no_grad():
-            logits = self.actor(img, hoprate_tensor)
+            logits = self.actor(imgs, hoprate_tensor)
             if deterministic:
                 actions = logits.argmax(dim=-1)
             else:
                 actions = torch.distributions.Categorical(logits=logits).sample()
-        return actions.squeeze(0).cpu().numpy().astype(np.int64, copy=False)
+        return actions.cpu().numpy().astype(np.int64, copy=False)
 
     def _batch_images(self, images):
         tensor = torch.as_tensor(images, dtype=torch.float32, device=self.device)
@@ -535,7 +648,7 @@ class SAC:
         for target_buffer, buffer in zip(target_net.buffers(), net.buffers()):
             target_buffer.data.copy_(buffer.data)
 
-    def update(self, transition_dict):
+    def update(self, transition_dict, return_stats=True):
         imgs = self._batch_images(transition_dict["state_imgs"])
         next_imgs = self._batch_images(transition_dict["next_state_imgs"])
         hoprates = self._batch_hoprates(transition_dict["hoprates"])
@@ -543,8 +656,16 @@ class SAC:
             transition_dict["next_hoprates"]
         )
 
+        actions_array = np.asarray(transition_dict["actions"])
+        expected_shape = (imgs.shape[0], self.num_heads)
+        if tuple(actions_array.shape) != expected_shape:
+            raise ValueError(
+                f"actions must have shape {expected_shape}, got {actions_array.shape}."
+            )
+        if np.any(actions_array < 0) or np.any(actions_array >= self.n_actions):
+            raise ValueError("Replay actions are outside the configured action range.")
         actions = torch.as_tensor(
-            transition_dict["actions"], dtype=torch.long, device=self.device
+            actions_array, dtype=torch.long, device=self.device
         )
         block_rewards = torch.as_tensor(
             transition_dict["block_rewards"],
@@ -555,18 +676,11 @@ class SAC:
             transition_dict["dones"], dtype=torch.float32, device=self.device
         ).view(-1, 1)
 
-        expected_shape = (imgs.shape[0], self.num_heads)
-        if tuple(actions.shape) != expected_shape:
-            raise ValueError(
-                f"actions must have shape {expected_shape}, got {tuple(actions.shape)}."
-            )
         if tuple(block_rewards.shape) != expected_shape:
             raise ValueError(
                 "block_rewards must have shape "
                 f"{expected_shape}, got {tuple(block_rewards.shape)}."
             )
-        if torch.any(actions < 0) or torch.any(actions >= self.n_actions):
-            raise ValueError("Replay actions are outside the configured action range.")
 
         td_target = self.calc_target(
             block_rewards, next_imgs, next_hoprates, dones
@@ -580,10 +694,10 @@ class SAC:
         critic_1_loss = F.mse_loss(q1_pred, td_target)
         critic_2_loss = F.mse_loss(q2_pred, td_target)
 
-        self.critic_1_optimizer.zero_grad()
+        self.critic_1_optimizer.zero_grad(set_to_none=True)
         critic_1_loss.backward()
         self.critic_1_optimizer.step()
-        self.critic_2_optimizer.zero_grad()
+        self.critic_2_optimizer.zero_grad(set_to_none=True)
         critic_2_loss.backward()
         self.critic_2_optimizer.step()
 
@@ -602,19 +716,22 @@ class SAC:
             dim=-1,
         ).mean()
 
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
 
         alpha_loss = (
             self.log_alpha * (entropy.detach() - self.target_entropy)
         ).mean()
-        self.log_alpha_optimizer.zero_grad()
+        self.log_alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
 
         self.soft_update(self.critic_1, self.target_critic_1)
         self.soft_update(self.critic_2, self.target_critic_2)
+
+        if not return_stats:
+            return {}
 
         return {
             "critic1_loss": float(critic_1_loss.item()),
