@@ -761,6 +761,7 @@ class StepRewardEnsemble(nn.Module):
             shuffled_indices = np.random.permutation(train_indices)
             epoch_loss_total = None
             epoch_batch_count = 0
+            t1=time.time()
             for start in range(0, len(shuffled_indices), batch_size):
                 batch_indices = shuffled_indices[start : start + batch_size]
                 images_t, hoprates_t, actions_t, rewards_t = self._dataset_batch_tensors(
@@ -787,7 +788,8 @@ class StepRewardEnsemble(nn.Module):
                     else epoch_loss_total + detached_loss
                 )
                 epoch_batch_count += 1
-
+            t2=time.time()
+            print(f"Epoch {epoch+1}/{max_epochs} training time: {t2-t1:.2f} seconds")
             mean_train_loss = float(
                 (epoch_loss_total / max(1, epoch_batch_count)).item()
             )
