@@ -152,7 +152,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 
 [train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，为每个 block 输出 Logistic-Normal 潜变量的位置与方差；潜变量经 sigmoid 映射到由 `BER∈[0,0.5]`、hoprate 和奖励公式共同确定的 reward 区间。模型不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
 
-默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每个成员复用与 SAC 相同的三层 CNN、两层 hoprate MLP 和两层 PSD-hoprate fusion 结构，再通过三层 SiLU state-action fusion 预测 reward 分布。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每个真实环境 step 后使用当前全部真实 replay 从头重新拟合（成员权重与 Adam 优化器均重新初始化），并记录每次拟合内逐 epoch 的 holdout MSE 曲线，因此计算成本较高。
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每个成员复用与 SAC 相同的三层 CNN、两层 hoprate MLP 和两层 PSD-hoprate fusion 结构，再通过三层 SiLU state-action fusion 预测 reward 分布。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每 10 个真实环境 step 使用当前全部真实 replay 从头重新拟合（成员权重与 Adam 优化器均重新初始化），并记录每次拟合内逐 epoch 的 holdout MSE 曲线。独立 MBPO 入口使用 GPU 常驻 replay Dataset 和 PyTorch DataLoader 处理 reward-model 与 SAC batch，默认 batch size 为 2048，适合 A800 训练。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help
@@ -485,7 +485,7 @@ critic 同样输出十个离散 Q 头。每个头使用对应的即时 block rew
 - 十个动作头采用条件独立的因子化策略，无法直接表达 offset 之间的联合动作相关性；需要这类能力时应另行设计联合 critic 或自回归策略。
 - 训练效果对 reward 权重、alpha 初值、target entropy、batch size 等参数敏感。
 - MBPO 是 reward-only 一步增强，不是完整 dynamics MBPO；其 next-state 复用依赖环境 observation transition 与 offsets 无关。
-- MBPO 默认每个在线 step 都用完整真实 replay 继续训练 5 个独立 CNN，计算成本高；需要快速实验时应调大 `model_train_freq` 或降低 `model_max_epochs`。
+- MBPO 默认每 10 个在线 step 都用完整真实 replay 继续训练 5 个独立 CNN，计算成本高；需要快速实验时应继续调大 `model_train_freq` 或降低 `model_max_epochs`。
 - NBS 跳速搜索依赖 BER-vs-hoprate 的可辨识趋势；若同时启用多种强干扰或随机 offset 方差很大，可能需要增加步数、调大 `p` 或做多次重复评估。
 - v1/v2 block-level replay 仍与当前 step-level v3 replay 不兼容；SAC inference v1/v2 和 reward-model v1 checkpoint 也不能加载到新网络，模型必须重新训练，但现有 v3 replay 无需重新生成。
 - 若后续要进一步规范工程结构，可以再做第二阶段重构：拆分 `env/`、`algos/`、`train/` 子包。

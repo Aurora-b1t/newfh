@@ -595,7 +595,16 @@ class SAC:
         return actions.cpu().numpy().astype(np.int64, copy=False)
 
     def _batch_images(self, images):
-        tensor = torch.as_tensor(images, dtype=torch.float32, device=self.device)
+        if torch.is_tensor(images):
+            tensor = images.to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+        else:
+            tensor = torch.as_tensor(
+                images, dtype=torch.float32, device=self.device
+            )
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(1)
         if tensor.ndim != 4:
@@ -606,6 +615,12 @@ class SAC:
         return tensor
 
     def _batch_hoprates(self, hoprates):
+        if torch.is_tensor(hoprates):
+            return hoprates.to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ).view(-1, 1)
         return torch.as_tensor(
             hoprates, dtype=torch.float32, device=self.device
         ).view(-1, 1)
@@ -656,25 +671,57 @@ class SAC:
             transition_dict["next_hoprates"]
         )
 
-        actions_array = np.asarray(transition_dict["actions"])
         expected_shape = (imgs.shape[0], self.num_heads)
-        if tuple(actions_array.shape) != expected_shape:
-            raise ValueError(
-                f"actions must have shape {expected_shape}, got {actions_array.shape}."
+        raw_actions = transition_dict["actions"]
+        if torch.is_tensor(raw_actions):
+            actions = raw_actions.to(
+                device=self.device,
+                dtype=torch.long,
+                non_blocking=True,
             )
-        if np.any(actions_array < 0) or np.any(actions_array >= self.n_actions):
+            actions_shape = tuple(actions.shape)
+            invalid_actions = torch.any(actions < 0) or torch.any(
+                actions >= self.n_actions
+            )
+        else:
+            actions_array = np.asarray(raw_actions)
+            actions_shape = tuple(actions_array.shape)
+            invalid_actions = np.any(actions_array < 0) or np.any(
+                actions_array >= self.n_actions
+            )
+            actions = torch.as_tensor(
+                actions_array, dtype=torch.long, device=self.device
+            )
+        if actions_shape != expected_shape:
+            raise ValueError(
+                f"actions must have shape {expected_shape}, got {actions_shape}."
+            )
+        if invalid_actions:
             raise ValueError("Replay actions are outside the configured action range.")
-        actions = torch.as_tensor(
-            actions_array, dtype=torch.long, device=self.device
-        )
-        block_rewards = torch.as_tensor(
-            transition_dict["block_rewards"],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        dones = torch.as_tensor(
-            transition_dict["dones"], dtype=torch.float32, device=self.device
-        ).view(-1, 1)
+        raw_block_rewards = transition_dict["block_rewards"]
+        if torch.is_tensor(raw_block_rewards):
+            block_rewards = raw_block_rewards.to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+        else:
+            block_rewards = torch.as_tensor(
+                raw_block_rewards,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        raw_dones = transition_dict["dones"]
+        if torch.is_tensor(raw_dones):
+            dones = raw_dones.to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ).view(-1, 1)
+        else:
+            dones = torch.as_tensor(
+                raw_dones, dtype=torch.float32, device=self.device
+            ).view(-1, 1)
 
         if tuple(block_rewards.shape) != expected_shape:
             raise ValueError(

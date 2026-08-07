@@ -17,11 +17,14 @@ from SAC import (
     save_sac_inference_checkpoint,
 )
 from fh_env import save_waterfall_figure
+from mbpo_dataloader import (
+    ReplayBufferDataset,
+    build_mixed_replay_loader,
+)
 from offline_replay import environment_metadata, load_replay_into_buffer
 from r_predict_model import RewardReplayDataset, StepRewardEnsemble
 from r_predict_model.mbpo_adapter import (
     rollout_reward_model,
-    sample_mixed_batch,
     train_reward_model_from_replay,
 )
 import settings
@@ -74,6 +77,8 @@ def _validate_args(args):
     for name in positive_names:
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"{name} must be positive.")
+    if int(getattr(args, "data_loader_workers", 0)) < 0:
+        raise ValueError("data_loader_workers cannot be negative.")
     if args.num_elites > args.num_networks:
         raise ValueError("num_elites cannot exceed num_networks.")
     if not 0.0 <= args.real_ratio <= 1.0:
@@ -160,6 +165,16 @@ def train(args):
         num_heads=env.num_blocks,
         n_actions=n_actions,
     )
+    real_replay_dataset = ReplayBufferDataset(
+        real_buffer,
+        device=device,
+        cache_on_device=args.cache_replay_on_device,
+    )
+    model_replay_dataset = ReplayBufferDataset(
+        model_buffer,
+        device=device,
+        cache_on_device=args.cache_replay_on_device,
+    )
     save_steps, figures_dir = _figure_steps(args, env, logger)
     state_img, _reset_info = env.reset()
     current_metadata = environment_metadata(
@@ -190,6 +205,8 @@ def train(args):
             args.offline_replay_path,
             replay_metadata.get("hoprate_mode", "unknown"),
         )
+    if real_buffer.size():
+        real_replay_dataset.sync()
 
     reward_model = StepRewardEnsemble(
         network_size=args.num_networks,
@@ -236,6 +253,13 @@ def train(args):
         getattr(args, "model_precision", "float32"),
         getattr(args, "model_compile", False),
         getattr(args, "model_fast_math", False),
+    )
+    logger.info(
+        "Replay DataLoader: cache=%s workers=%d pin_memory=%s batch=%d",
+        args.cache_replay_on_device,
+        args.data_loader_workers,
+        args.data_loader_pin_memory,
+        args.batch_size,
     )
     logger.info(
         "Model replay uses persistent FIFO retention with capacity=%d.",
@@ -301,6 +325,7 @@ def train(args):
             fixed_hoprate,
             done,
         )
+        real_replay_dataset.sync()
         ep_block_rewards.extend(block_rewards.tolist())
         state_img = next_state_img
 
@@ -325,6 +350,8 @@ def train(args):
                 min_improvement=args.model_min_improvement,
                 cache_dataset_on_device=args.cache_model_dataset,
                 dataset_cache=reward_dataset_cache,
+                data_loader_workers=args.data_loader_workers,
+                data_loader_pin_memory=args.data_loader_pin_memory,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -335,6 +362,7 @@ def train(args):
                 settings.REWARD_CONFIG,
                 deterministic_model=args.deterministic_model_rollout,
             )
+            model_replay_dataset.sync()
             model_fit_time = time.time() - model_start
             holdout_curve_steps.append(step_idx)
             holdout_curve_history.append(last_model_stats["holdout_curves"])
@@ -370,14 +398,17 @@ def train(args):
 
         train_stats = {}
         if replay_ready(real_buffer, args.batch_size):
+            sac_loader = build_mixed_replay_loader(
+                real_replay_dataset,
+                model_replay_dataset,
+                args.batch_size,
+                args.real_ratio,
+                args.update_iters_per_step,
+                num_workers=args.data_loader_workers,
+                pin_memory=args.data_loader_pin_memory,
+            )
             last_update_index = args.update_iters_per_step - 1
-            for update_index in range(args.update_iters_per_step):
-                batch = sample_mixed_batch(
-                    real_buffer,
-                    model_buffer,
-                    args.batch_size,
-                    args.real_ratio,
-                )
+            for update_index, batch in enumerate(sac_loader):
                 train_stats = agent.update(
                     batch,
                     return_stats=update_index == last_update_index,
@@ -740,6 +771,24 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=settings.MBPO_CONFIG["cache_dataset_on_device"],
         help="Keep the reward-model replay tensors on the training device.",
+    )
+    parser.add_argument(
+        "--cache_replay_on_device",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG.get("cache_replay_on_device", True),
+        help="Keep SAC real/model replay tensors on the training device.",
+    )
+    parser.add_argument(
+        "--data_loader_workers",
+        type=int,
+        default=settings.MBPO_CONFIG.get("data_loader_workers", 0),
+        help="DataLoader workers; CUDA-resident datasets require zero.",
+    )
+    parser.add_argument(
+        "--data_loader_pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG.get("data_loader_pin_memory", False),
+        help="Pin CPU DataLoader batches before asynchronous H2D copies.",
     )
     parser.add_argument(
         "--model_precision",

@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data._utils.collate import default_collate
 
 import settings
 from SAC import (
@@ -39,6 +41,39 @@ REWARD_MODEL_ARCHITECTURE = (
 DEFAULT_BER_MIN = 0.0
 DEFAULT_BER_MAX = 0.5
 DEFAULT_LOGIT_EPSILON = 1e-4
+
+
+def _collate_reward_batch(batch):
+    """Collate vectorized reward batches without an extra stack/copy."""
+    if isinstance(batch, dict):
+        return {
+            key: value
+            if torch.is_tensor(value)
+            else torch.as_tensor(value)
+            for key, value in batch.items()
+        }
+    if isinstance(batch, list) and batch and isinstance(batch[0], dict):
+        return default_collate(batch)
+    return default_collate(batch)
+
+
+class _RewardIndexSampler(Sampler):
+    """Sampler for a fixed split that reshuffles only when iterated."""
+
+    def __init__(self, indices, shuffle):
+        self.indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        self.shuffle = bool(shuffle)
+
+    def __iter__(self):
+        indices = (
+            np.random.permutation(self.indices)
+            if self.shuffle
+            else self.indices
+        )
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return len(self.indices)
 
 
 def _canonical_reward_config(reward_config):
@@ -334,7 +369,7 @@ class MatrixStepRewardMember(nn.Module):
         return mean, torch.exp(logvar)
 
 
-class _RewardDataset:
+class _RewardDataset(Dataset):
     """Compact array-backed dataset used for repeated model epochs."""
 
     def __init__(self, state_imgs, hoprates, actions, block_rewards):
@@ -361,6 +396,9 @@ class _RewardDataset:
         self._tensor_cache_device = None
         self._latent_target_cache = None
         self._bounded_target_cache = None
+
+    def __len__(self):
+        return self.size
 
     def validate(self, num_heads, n_actions):
         if self.state_imgs.ndim not in (3, 4):
@@ -426,6 +464,31 @@ class _RewardDataset:
             values.index_select(0, index_tensor) for values in self._tensor_cache
         )
 
+    def _batch_dict(self, indices):
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if self.is_cached:
+            tensors = self.tensor_batch(indices)
+        else:
+            tensors = self.batch(indices)
+        batch = dict(
+            zip(
+                ("state_imgs", "hoprates", "actions", "block_rewards"),
+                tensors,
+            )
+        )
+        if self.has_prepared_targets:
+            latent_targets, bounded_targets = self.target_batch(indices)
+            batch["latent_targets"] = latent_targets
+            batch["bounded_targets"] = bounded_targets
+        return batch
+
+    def __getitem__(self, index):
+        batch = self._batch_dict([int(index)])
+        return {key: value[0] for key, value in batch.items()}
+
+    def __getitems__(self, indices):
+        return self._batch_dict(indices)
+
     @property
     def first_state(self):
         if self.state_imgs is None:
@@ -475,7 +538,7 @@ class _RewardDataset:
         )
 
 
-class RewardReplayDataset:
+class RewardReplayDataset(Dataset):
     """Mutation-aware ring cache for the reward fields of a replay buffer.
 
     The model is still retrained from scratch for every fit.  This class only
@@ -498,6 +561,9 @@ class RewardReplayDataset:
         self._reward_storage = None
         self._latent_target_cache = None
         self._bounded_target_cache = None
+
+    def __len__(self):
+        return self.size
 
     @staticmethod
     def _same_refs(left, right):
@@ -787,6 +853,31 @@ class RewardReplayDataset:
             self._reward_storage.index_select(0, physical),
         )
 
+    def _batch_dict(self, indices):
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if self.is_cached:
+            tensors = self.tensor_batch(indices)
+        else:
+            tensors = self.batch(indices)
+        batch = dict(
+            zip(
+                ("state_imgs", "hoprates", "actions", "block_rewards"),
+                tensors,
+            )
+        )
+        if self.has_prepared_targets:
+            latent_targets, bounded_targets = self.target_batch(indices)
+            batch["latent_targets"] = latent_targets
+            batch["bounded_targets"] = bounded_targets
+        return batch
+
+    def __getitem__(self, index):
+        batch = self._batch_dict([int(index)])
+        return {key: value[0] for key, value in batch.items()}
+
+    def __getitems__(self, indices):
+        return self._batch_dict(indices)
+
     def target_batch(self, indices):
         if not self.has_prepared_targets:
             raise RuntimeError("Reward targets have not been prepared.")
@@ -1033,8 +1124,17 @@ class StepRewardEnsemble(nn.Module):
         lower, upper = self.reward_bounds(hoprates)
         return float(np.mean((rewards < lower) | (rewards > upper)))
 
+    def _to_device_tensor(self, values, dtype):
+        if torch.is_tensor(values):
+            return values.to(
+                device=self.device,
+                dtype=dtype,
+                non_blocking=True,
+            )
+        return torch.as_tensor(values, dtype=dtype, device=self.device)
+
     def _images_tensor(self, images):
-        tensor = torch.as_tensor(images, dtype=torch.float32, device=self.device)
+        tensor = self._to_device_tensor(images, torch.float32)
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(1)
         if tensor.ndim != 4:
@@ -1083,42 +1183,127 @@ class StepRewardEnsemble(nn.Module):
         )
         return images_t, hoprates_t, actions_t, rewards_t
 
+    def _loader_batch_tensors(self, batch):
+        """Validate and move one DataLoader batch without NumPy round-trips."""
+        if not isinstance(batch, dict):
+            raise TypeError("Reward DataLoader batches must be dictionaries.")
+        images_t = self._images_tensor(batch["state_imgs"])
+        batch_size = images_t.shape[0]
+        hoprates_t = self._to_device_tensor(
+            batch["hoprates"], torch.float32
+        ).view(-1, 1)
+        if tuple(hoprates_t.shape) != (batch_size, 1):
+            raise ValueError(f"hoprates must have shape ({batch_size},).")
+        if not torch.all(torch.isfinite(hoprates_t)):
+            raise ValueError("hoprates must contain only finite values.")
+
+        actions_t = self._to_device_tensor(batch["actions"], torch.long)
+        expected_shape = (batch_size, self.num_heads)
+        if tuple(actions_t.shape) != expected_shape:
+            raise ValueError(
+                f"actions must have shape {expected_shape}, got {tuple(actions_t.shape)}."
+            )
+        if torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions):
+            raise ValueError("actions are outside the configured action range.")
+
+        rewards_t = self._to_device_tensor(batch["block_rewards"], torch.float32)
+        if tuple(rewards_t.shape) != expected_shape:
+            raise ValueError(
+                f"block_rewards must have shape {expected_shape}, "
+                f"got {tuple(rewards_t.shape)}."
+            )
+        latent_targets = batch.get("latent_targets")
+        bounded_targets = batch.get("bounded_targets")
+        if latent_targets is not None:
+            latent_targets = self._to_device_tensor(latent_targets, torch.float32)
+        if bounded_targets is not None:
+            bounded_targets = self._to_device_tensor(bounded_targets, torch.float32)
+        return (
+            images_t,
+            hoprates_t,
+            actions_t,
+            rewards_t,
+            latent_targets,
+            bounded_targets,
+        )
+
     @staticmethod
     def _probabilistic_loss(mean, logvar, targets):
         return torch.mean(
             torch.square(mean - targets.unsqueeze(0)) * torch.exp(-logvar) + logvar
         )
 
+    def _make_reward_loader(
+        self,
+        dataset,
+        indices,
+        batch_size,
+        shuffle,
+        num_workers=0,
+        pin_memory=None,
+    ):
+        num_workers = int(num_workers)
+        if num_workers < 0:
+            raise ValueError("data_loader_workers cannot be negative.")
+        if dataset.is_cached and num_workers:
+            raise ValueError("CUDA reward datasets require data_loader_workers=0.")
+        if pin_memory is None:
+            pin_memory = bool(self.device.type == "cuda" and not dataset.is_cached)
+        if dataset.is_cached:
+            pin_memory = False
+        return DataLoader(
+            dataset,
+            batch_size=int(batch_size),
+            sampler=_RewardIndexSampler(indices, shuffle=shuffle),
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=bool(pin_memory),
+            persistent_workers=bool(num_workers > 0),
+            collate_fn=_collate_reward_batch,
+        )
+
     def _evaluate_ensemble(self, dataset, indices, batch_size):
         """Return the per-member holdout MSE with a single parallel pass."""
+        loader = (
+            indices
+            if isinstance(indices, DataLoader)
+            else self._make_reward_loader(
+                dataset,
+                indices,
+                batch_size,
+                shuffle=False,
+            )
+        )
         self.member.eval()
         squared_error = torch.zeros(
             self.network_size, dtype=torch.float32, device=self.device
         )
         value_count = 0
         with torch.inference_mode():
-            for start in range(0, len(indices), batch_size):
-                batch_indices = indices[start : start + batch_size]
-                tensors = self._dataset_batch_tensors(dataset, batch_indices)
+            for batch in loader:
+                tensors = self._loader_batch_tensors(batch)
+                images_t, hoprates_t, actions_t, rewards_t, _, bounded_targets = tensors
                 with self._autocast_context():
                     latent_mean = self._compute_member()(
-                        *tensors[:3],
+                        images_t,
+                        hoprates_t,
+                        actions_t,
                         validate_actions=False,
                         return_mean_only=True,
                     )
                 reward_prediction = self._latent_to_rewards_tensor(
-                    latent_mean.float(), tensors[1].float()
+                    latent_mean.float(), hoprates_t.float()
                 )
                 bounded_targets = (
-                    tensors[5]
-                    if len(tensors) > 5
-                    else self._bound_rewards_tensor(tensors[3], tensors[1])
+                    bounded_targets
+                    if bounded_targets is not None
+                    else self._bound_rewards_tensor(rewards_t, hoprates_t)
                 )
                 squared_error += torch.sum(
                     torch.square(reward_prediction - bounded_targets.unsqueeze(0)),
                     dim=(1, 2),
                 )
-                value_count += tensors[3].numel()
+                value_count += rewards_t.numel()
         return (squared_error / max(1, value_count)).cpu().numpy()
 
     def _dataset_batch_tensors(self, dataset, indices):
@@ -1144,6 +1329,8 @@ class StepRewardEnsemble(nn.Module):
         min_improvement=0.01,
         cache_dataset_on_device=None,
         dataset=None,
+        data_loader_workers=0,
+        data_loader_pin_memory=None,
     ):
         """Retrain every member in parallel on the current real-replay split.
 
@@ -1161,6 +1348,8 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("holdout_ratio must be between zero and one.")
         if min_improvement < 0.0:
             raise ValueError("min_improvement must be non-negative.")
+        if int(data_loader_workers) < 0:
+            raise ValueError("data_loader_workers cannot be negative.")
 
         if dataset is None:
             if any(
@@ -1207,6 +1396,22 @@ class StepRewardEnsemble(nn.Module):
         )
         holdout_indices = permutation[:holdout_size]
         train_indices = permutation[holdout_size:]
+        train_loader = self._make_reward_loader(
+            dataset,
+            train_indices,
+            batch_size,
+            shuffle=True,
+            num_workers=data_loader_workers,
+            pin_memory=data_loader_pin_memory,
+        )
+        holdout_loader = self._make_reward_loader(
+            dataset,
+            holdout_indices,
+            batch_size,
+            shuffle=False,
+            num_workers=data_loader_workers,
+            pin_memory=data_loader_pin_memory,
+        )
         holdout_curves = []
         train_curves = []
         timing_enabled = bool(settings.TIMING_ENABLED)
@@ -1215,7 +1420,7 @@ class StepRewardEnsemble(nn.Module):
         grad_scaler = self._new_grad_scaler()
 
         initial_holdout = self._evaluate_ensemble(
-            dataset, holdout_indices, batch_size
+            dataset, holdout_loader, batch_size
         )
         if not np.all(np.isfinite(initial_holdout)):
             raise RuntimeError("Reward-model holdout loss became non-finite.")
@@ -1231,14 +1436,17 @@ class StepRewardEnsemble(nn.Module):
         for epoch in range(max_epochs):
             epoch_start = time.time() if timing_enabled else None
             self.member.train()
-            shuffled_indices = np.random.permutation(train_indices)
             epoch_loss_total = None
             epoch_batch_count = 0
-            t1=time.time()
-            for start in range(0, len(shuffled_indices), batch_size):
-                batch_indices = shuffled_indices[start : start + batch_size]
-                batch_tensors = self._dataset_batch_tensors(dataset, batch_indices)
-                images_t, hoprates_t, actions_t, rewards_t = batch_tensors[:4]
+            for batch in train_loader:
+                (
+                    images_t,
+                    hoprates_t,
+                    actions_t,
+                    rewards_t,
+                    latent_targets,
+                    _bounded_targets,
+                ) = self._loader_batch_tensors(batch)
                 with self._autocast_context():
                     mean, logvar = self._compute_member()(
                         images_t,
@@ -1247,11 +1455,10 @@ class StepRewardEnsemble(nn.Module):
                         return_logvar=True,
                         validate_actions=False,
                     )
-                latent_targets = (
-                    batch_tensors[4]
-                    if len(batch_tensors) > 5
-                    else self._targets_to_latent(rewards_t, hoprates_t)[0]
-                )
+                if latent_targets is None:
+                    latent_targets = self._targets_to_latent(
+                        rewards_t, hoprates_t
+                    )[0]
                 loss = self._probabilistic_loss(
                     mean.float(), logvar.float(), latent_targets.float()
                 )
@@ -1270,8 +1477,6 @@ class StepRewardEnsemble(nn.Module):
                     else epoch_loss_total + detached_loss
                 )
                 epoch_batch_count += 1
-            t2=time.time()
-            print(f"Epoch {epoch+1}/{max_epochs} training time: {t2-t1:.2f} seconds")
             mean_train_loss = float(
                 (epoch_loss_total / max(1, epoch_batch_count)).item()
             )
@@ -1279,7 +1484,7 @@ class StepRewardEnsemble(nn.Module):
                 train_curves[member_idx].append(mean_train_loss)
 
             epoch_holdout = self._evaluate_ensemble(
-                dataset, holdout_indices, batch_size
+                dataset, holdout_loader, batch_size
             )
             if not np.all(np.isfinite(epoch_holdout)):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
@@ -1309,7 +1514,7 @@ class StepRewardEnsemble(nn.Module):
         self.member.eval()
 
         holdout_losses = self._evaluate_ensemble(
-            dataset, holdout_indices, batch_size
+            dataset, holdout_loader, batch_size
         )
         self.elite_model_idxes = np.argsort(holdout_losses)[
             : self.elite_size

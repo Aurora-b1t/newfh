@@ -10,6 +10,11 @@ import numpy as np
 import torch
 
 from SAC import ReplayBuffer, SAC, SAC_POLICY_ARCHITECTURE
+from mbpo_dataloader import (
+    ReplayBufferDataset,
+    build_mixed_replay_loader,
+    build_replay_loader,
+)
 from r_predict_model import (
     REWARD_CHECKPOINT_FORMAT_VERSION,
     REWARD_MODEL_ARCHITECTURE,
@@ -534,6 +539,95 @@ class StepRewardEnsembleTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_replay_dataloader_returns_vectorized_batches(self):
+        buffer = make_buffer(count=4, num_heads=3, n_actions=4)
+        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
+        dataset.sync()
+
+        loader = build_replay_loader(dataset, batch_size=3)
+        batch = next(iter(loader))
+
+        self.assertIsInstance(batch["state_imgs"], torch.Tensor)
+        self.assertEqual((3, 1, 8, 8), tuple(batch["state_imgs"].shape))
+        self.assertEqual((3, 3), tuple(batch["actions"].shape))
+        self.assertEqual((3, 3), tuple(batch["block_rewards"].shape))
+
+    def test_replay_dataloader_tracks_fifo_eviction(self):
+        buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
+        for index in range(3):
+            state = np.full((8, 8), index, dtype=np.float32)
+            buffer.add(
+                state,
+                100.0,
+                [0, 1, 2],
+                [index, index, index],
+                state + 0.5,
+                100.0,
+                False,
+            )
+        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
+        dataset.sync()
+
+        state = np.full((8, 8), 3, dtype=np.float32)
+        buffer.add(state, 100.0, [0, 1, 2], [3, 3, 3], state, 100.0, False)
+        dataset.sync()
+        batch = dataset.__getitems__([0, 1, 2])
+
+        np.testing.assert_array_equal(
+            batch["state_imgs"][:, 0, 0, 0], [1.0, 2.0, 3.0]
+        )
+
+    def test_mixed_replay_dataloader_preserves_ratio_and_batch_count(self):
+        real_buffer = make_buffer(count=4, num_heads=3, n_actions=4)
+        model_buffer = make_buffer(
+            count=4, num_heads=3, n_actions=4, reward_value=10.0
+        )
+        real_dataset = ReplayBufferDataset(
+            real_buffer, device="cpu", cache_on_device=False
+        )
+        model_dataset = ReplayBufferDataset(
+            model_buffer, device="cpu", cache_on_device=False
+        )
+        real_dataset.sync()
+        model_dataset.sync()
+
+        loader = build_mixed_replay_loader(
+            real_dataset,
+            model_dataset,
+            batch_size=4,
+            real_ratio=0.5,
+            num_batches=3,
+        )
+        batches = list(loader)
+
+        self.assertEqual(3, len(batches))
+        for batch in batches:
+            self.assertEqual(4, len(batch["actions"]))
+            self.assertEqual(2, int(torch.sum(batch["step_rewards"] == 0.0)))
+            self.assertEqual(2, int(torch.sum(batch["step_rewards"] == 10.0)))
+
+    def test_sac_accepts_a_dataloader_tensor_batch(self):
+        buffer = make_buffer(count=4, num_heads=10, n_actions=4)
+        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
+        dataset.sync()
+        batch = next(iter(build_replay_loader(dataset, batch_size=4)))
+        agent = SAC(
+            n_actions=4,
+            num_heads=10,
+            hoprate_min=10.0,
+            hoprate_max=1000.0,
+            actor_lr=1e-4,
+            critic_lr=1e-4,
+            alpha_lr=1e-4,
+            target_entropy=math.log(4) * 0.1,
+            tau=0.005,
+            gamma=0.95,
+            device="cpu",
+        )
+
+        stats = agent.update(batch)
+        self.assertTrue(np.isfinite(stats["actor_loss"]))
+
     def test_reward_replay_dataset_updates_append_and_fifo_without_repacking(self):
         buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
         for index in range(2):
