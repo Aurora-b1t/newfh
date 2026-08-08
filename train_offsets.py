@@ -394,7 +394,7 @@ def train(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
-    parser.add_argument("--output_dir", type=str, default="outputs/offsets/pre50000/comb/512_start")
+    parser.add_argument("--output_dir", type=str, default="outputs/offsets/comb/0")
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
     # Agent Params

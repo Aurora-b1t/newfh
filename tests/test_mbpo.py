@@ -375,62 +375,6 @@ class StepRewardEnsembleTests(unittest.TestCase):
         )
         self.assertTrue(np.all((predictions >= 0.0) & (predictions <= 1.0)))
 
-    def test_global_early_stopping_restores_best_epoch_state(self):
-        model = StepRewardEnsemble(
-            network_size=2,
-            elite_size=1,
-            num_heads=3,
-            n_actions=4,
-            reward_config=TEST_REWARD_CONFIG,
-            hidden_size=16,
-            device="cpu",
-        )
-        captured = {}
-        evaluation_count = 0
-
-        def fake_evaluate(_dataset, _indices, _batch_size):
-            nonlocal evaluation_count
-            evaluation_count += 1
-            if evaluation_count == 1:
-                return np.asarray([10.0, 10.0])
-            if evaluation_count == 2:
-                captured["member"] = copy.deepcopy(model.member.state_dict())
-                captured["optimizer"] = copy.deepcopy(model.optimizer.state_dict())
-                return np.asarray([5.0, 6.0])
-            if evaluation_count == 3:
-                return np.asarray([6.0, 6.0])
-            return np.asarray([5.0, 6.0])
-
-        with mock.patch.object(model, "_evaluate_ensemble", side_effect=fake_evaluate):
-            model.fit(
-                self.states,
-                self.hoprates,
-                self.actions,
-                np.full_like(self.rewards, 0.5),
-                batch_size=2,
-                holdout_ratio=0.25,
-                max_epochs=2,
-                patience=1,
-                min_improvement=0.0,
-            )
-
-        restored_member = model.member.state_dict()
-        for key, expected in captured["member"].items():
-            torch.testing.assert_close(restored_member[key], expected)
-
-        restored_optimizer = model.optimizer.state_dict()
-        self.assertEqual(
-            captured["optimizer"]["param_groups"],
-            restored_optimizer["param_groups"],
-        )
-        for parameter_id, expected_state in captured["optimizer"]["state"].items():
-            actual_state = restored_optimizer["state"][parameter_id]
-            for key, expected in expected_state.items():
-                if torch.is_tensor(expected):
-                    torch.testing.assert_close(actual_state[key], expected)
-                else:
-                    self.assertEqual(actual_state[key], expected)
-
     def test_fit_records_per_member_holdout_curves(self):
         model = self.make_model()
         stats = model.fit(

@@ -147,7 +147,7 @@ SAC_CONFIG = {
 BUFFER_CONFIG = {
     "capacity": 20000,
     # A800 training uses large batches to keep the convolutional encoders busy.
-    "batch_size": 2048,
+    "batch_size": 256,
 }
 
 # Offline real-environment replay configuration. Each transition represents one
@@ -176,12 +176,12 @@ MBPO_CONFIG = {
     "weight_decay": 1e-5,
     # Refit the full real replay periodically instead of blocking every env step.
     "model_train_freq": 10,
-    "model_train_batch_size": 2048,
+    "model_train_batch_size": 1024,
     "holdout_ratio": 0.2,
     "early_stop_patience": 5,
     "max_epochs": 100,
     "min_improvement": 0.01,
-    "rollout_batch_size": 2048,
+    "rollout_batch_size": 1024,
     "rollout_length": 1,
     "real_ratio": 0.2,
     "model_replay_size": 4000,

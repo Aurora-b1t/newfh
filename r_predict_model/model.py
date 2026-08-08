@@ -13,7 +13,6 @@ Only rewards are modelled.  The MBPO adapter is responsible for pairing these
 predictions with the exogenous next observation stored in real replay.
 """
 
-import copy
 import os
 import time
 from contextlib import nullcontext
@@ -1339,8 +1338,8 @@ class StepRewardEnsemble(nn.Module):
         Members share one train/holdout split and one data order per epoch and
         are updated by a single optimizer step.  Global early stopping is
         driven by the best member's holdout loss; when it stops improving for
-        ``patience`` epochs the whole ensemble stops and every member is
-        restored to its state at the global best epoch.
+        ``patience`` epochs the whole ensemble stops.  The weights used are
+        those from the final trained epoch, no best-epoch snapshot is kept.
         """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
@@ -1425,8 +1424,6 @@ class StepRewardEnsemble(nn.Module):
         if not np.all(np.isfinite(initial_holdout)):
             raise RuntimeError("Reward-model holdout loss became non-finite.")
         best_global_loss = float(np.min(initial_holdout))
-        best_state = copy.deepcopy(self.member.state_dict())
-        best_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
         stale_epochs = 0
         epochs_run = 0
         for member_idx, value in enumerate(initial_holdout):
@@ -1498,8 +1495,6 @@ class StepRewardEnsemble(nn.Module):
             )
             if relative_improvement > min_improvement:
                 best_global_loss = epoch_best_loss
-                best_state = copy.deepcopy(self.member.state_dict())
-                best_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
                 stale_epochs = 0
             else:
                 stale_epochs += 1
@@ -1509,8 +1504,6 @@ class StepRewardEnsemble(nn.Module):
             if stale_epochs >= patience:
                 break
 
-        self.member.load_state_dict(best_state)
-        self.optimizer.load_state_dict(best_optimizer_state)
         self.member.eval()
 
         holdout_losses = self._evaluate_ensemble(
