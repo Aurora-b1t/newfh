@@ -3,13 +3,26 @@
 import time
 
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 import settings
 from .model import (
     DEFAULT_BER_MAX,
     DEFAULT_BER_MIN,
-    RewardReplayDataset,
     reward_bounds_from_config,
+)
+
+
+REPLAY_FIELDS = (
+    "state_imgs",
+    "hoprates",
+    "actions",
+    "block_rewards",
+    "step_rewards",
+    "next_state_imgs",
+    "next_hoprates",
+    "dones",
 )
 
 
@@ -53,58 +66,86 @@ def _target_real_count(batch_size, real_ratio):
     return real_count
 
 
-def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
-    """Sample exactly ``batch_size`` step transitions from real/model replay."""
+def resolve_mixed_counts(real_size, model_size, batch_size, real_ratio):
+    """Return the exact real/model counts for one SAC batch."""
     batch_size = int(batch_size)
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     real_ratio = float(real_ratio)
-    total_available = real_buffer.size() + model_buffer.size()
+    real_size = int(real_size)
+    model_size = int(model_size)
+    total_available = real_size + model_size
     if total_available < batch_size:
         raise ValueError(
             f"Need {batch_size} total transitions, only {total_available} available."
         )
 
-    if model_buffer.size() == 0:
-        if real_buffer.size() < batch_size:
+    if model_size == 0:
+        if real_size < batch_size:
             raise ValueError("Real replay is too small for a fallback SAC batch.")
-        return real_buffer.sample(batch_size)
+        return batch_size, 0
 
-    real_count = min(
-        _target_real_count(batch_size, real_ratio), real_buffer.size()
-    )
-    model_count = min(batch_size - real_count, model_buffer.size())
+    real_count = min(_target_real_count(batch_size, real_ratio), real_size)
+    model_count = min(batch_size - real_count, model_size)
     deficit = batch_size - real_count - model_count
     if deficit:
-        additional_real = min(deficit, real_buffer.size() - real_count)
+        additional_real = min(deficit, real_size - real_count)
         real_count += additional_real
         deficit -= additional_real
     if deficit:
-        additional_model = min(deficit, model_buffer.size() - model_count)
+        additional_model = min(deficit, model_size - model_count)
         model_count += additional_model
         deficit -= additional_model
     if deficit:
         raise ValueError("Replay buffers cannot supply a complete mixed batch.")
 
+    return real_count, model_count
+
+
+def replay_tensor_dataset(replay_buffer):
+    """Create a standard TensorDataset snapshot from one replay buffer."""
+    replay = replay_buffer.get_all()
+    return TensorDataset(
+        *(
+            torch.as_tensor(replay[field])
+            for field in REPLAY_FIELDS
+        )
+    )
+
+
+def _batch_to_dict(batch):
+    return dict(zip(REPLAY_FIELDS, batch))
+
+
+def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
+    """Sample one exact-ratio batch through two standard DataLoaders."""
+    real_count, model_count = resolve_mixed_counts(
+        real_buffer.size(), model_buffer.size(), batch_size, real_ratio
+    )
+
     batches = []
     if real_count:
-        batches.append(real_buffer.sample(real_count))
+        real_loader = DataLoader(
+            replay_tensor_dataset(real_buffer),
+            batch_size=real_count,
+            shuffle=True,
+        )
+        batches.append(_batch_to_dict(next(iter(real_loader))))
     if model_count:
-        batches.append(model_buffer.sample(model_count))
-    # SAC uses GroupNorm rather than batch-statistics layers, so the two
-    # independently randomized samples do not need a second full-array shuffle.
+        model_loader = DataLoader(
+            replay_tensor_dataset(model_buffer),
+            batch_size=model_count,
+            shuffle=True,
+        )
+        batches.append(_batch_to_dict(next(iter(model_loader))))
+
+    # The two independently shuffled loaders already provide random samples;
+    # SAC does not require another full-array shuffle before the update.
     return concat_transition_batches(batches, shuffle=False)
 
 
-def train_reward_model_from_replay(
-    reward_model, replay_buffer, dataset_cache=None, **fit_kwargs
-):
+def train_reward_model_from_replay(reward_model, replay_buffer, **fit_kwargs):
     """Continue fitting the ensemble on the full current real replay."""
-    if dataset_cache is not None:
-        if not isinstance(dataset_cache, RewardReplayDataset):
-            raise TypeError("dataset_cache must be a RewardReplayDataset.")
-        dataset_cache.sync(replay_buffer)
-        return reward_model.fit(dataset=dataset_cache, **fit_kwargs)
     fields = replay_fields_for_reward_model(replay_buffer)
     return reward_model.fit(**fields, **fit_kwargs)
 

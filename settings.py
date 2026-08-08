@@ -189,10 +189,8 @@ MBPO_CONFIG = {
     # copies for every reward-model epoch. Use --no-cache_model_dataset when it
     # is not available.
     "cache_dataset_on_device": True,
-    # SAC replay is also mirrored on CUDA for DataLoader-driven updates.
-    "cache_replay_on_device": True,
-    # CUDA-resident datasets must use the main process. CPU fallback can opt in
-    # to workers and pinned batches through the CLI.
+    # Standard TensorDataset loaders use the main process for CUDA training.
+    # CPU snapshots can opt in to workers and pinned batches through the CLI.
     "data_loader_workers": 0,
     "data_loader_pin_memory": False,
     # Runtime-only acceleration knobs. These do not change the reward-model

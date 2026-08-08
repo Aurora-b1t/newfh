@@ -8,21 +8,19 @@ from unittest import mock
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from SAC import ReplayBuffer, SAC, SAC_POLICY_ARCHITECTURE
-from mbpo_dataloader import (
-    ReplayBufferDataset,
-    build_mixed_replay_loader,
-    build_replay_loader,
-)
 from r_predict_model import (
     REWARD_CHECKPOINT_FORMAT_VERSION,
     REWARD_MODEL_ARCHITECTURE,
-    RewardReplayDataset,
     StepRewardEnsemble,
 )
 from r_predict_model.mbpo_adapter import (
+    REPLAY_FIELDS,
     reward_bounds,
+    replay_tensor_dataset,
+    resolve_mixed_counts,
     rollout_reward_model,
     sample_mixed_batch,
     train_reward_model_from_replay,
@@ -484,16 +482,15 @@ class StepRewardEnsembleTests(unittest.TestCase):
 class AdapterTests(unittest.TestCase):
     def test_replay_dataloader_returns_vectorized_batches(self):
         buffer = make_buffer(count=4, num_heads=3, n_actions=4)
-        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
-        dataset.sync()
-
-        loader = build_replay_loader(dataset, batch_size=3)
+        loader = DataLoader(
+            replay_tensor_dataset(buffer), batch_size=3, shuffle=True
+        )
         batch = next(iter(loader))
 
-        self.assertIsInstance(batch["state_imgs"], torch.Tensor)
-        self.assertEqual((3, 1, 8, 8), tuple(batch["state_imgs"].shape))
-        self.assertEqual((3, 3), tuple(batch["actions"].shape))
-        self.assertEqual((3, 3), tuple(batch["block_rewards"].shape))
+        self.assertIsInstance(batch[0], torch.Tensor)
+        self.assertEqual((3, 8, 8), tuple(batch[0].shape))
+        self.assertEqual((3, 3), tuple(batch[2].shape))
+        self.assertEqual((3, 3), tuple(batch[3].shape))
 
     def test_replay_dataloader_tracks_fifo_eviction(self):
         buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
@@ -508,52 +505,49 @@ class AdapterTests(unittest.TestCase):
                 100.0,
                 False,
             )
-        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
-        dataset.sync()
-
         state = np.full((8, 8), 3, dtype=np.float32)
         buffer.add(state, 100.0, [0, 1, 2], [3, 3, 3], state, 100.0, False)
-        dataset.sync()
-        batch = dataset.__getitems__([0, 1, 2])
-
-        np.testing.assert_array_equal(
-            batch["state_imgs"][:, 0, 0, 0], [1.0, 2.0, 3.0]
+        batch = next(
+            iter(
+                DataLoader(
+                    replay_tensor_dataset(buffer), batch_size=3, shuffle=False
+                )
+            )
         )
+
+        np.testing.assert_array_equal(batch[0][:, 0, 0], [1.0, 2.0, 3.0])
 
     def test_mixed_replay_dataloader_preserves_ratio_and_batch_count(self):
         real_buffer = make_buffer(count=4, num_heads=3, n_actions=4)
         model_buffer = make_buffer(
             count=4, num_heads=3, n_actions=4, reward_value=10.0
         )
-        real_dataset = ReplayBufferDataset(
-            real_buffer, device="cpu", cache_on_device=False
+        real_count, model_count = resolve_mixed_counts(4, 4, 4, 0.5)
+        real_loader = DataLoader(
+            replay_tensor_dataset(real_buffer),
+            batch_size=real_count,
+            shuffle=True,
         )
-        model_dataset = ReplayBufferDataset(
-            model_buffer, device="cpu", cache_on_device=False
+        model_loader = DataLoader(
+            replay_tensor_dataset(model_buffer),
+            batch_size=model_count,
+            shuffle=True,
         )
-        real_dataset.sync()
-        model_dataset.sync()
 
-        loader = build_mixed_replay_loader(
-            real_dataset,
-            model_dataset,
-            batch_size=4,
-            real_ratio=0.5,
-            num_batches=3,
-        )
-        batches = list(loader)
-
-        self.assertEqual(3, len(batches))
-        for batch in batches:
-            self.assertEqual(4, len(batch["actions"]))
-            self.assertEqual(2, int(torch.sum(batch["step_rewards"] == 0.0)))
-            self.assertEqual(2, int(torch.sum(batch["step_rewards"] == 10.0)))
+        for _ in range(3):
+            real_batch = next(iter(real_loader))
+            model_batch = next(iter(model_loader))
+            batch = torch.cat((real_batch[4], model_batch[4]))
+            self.assertEqual(4, len(batch))
+            self.assertEqual(2, int(torch.sum(batch == 0.0)))
+            self.assertEqual(2, int(torch.sum(batch == 10.0)))
 
     def test_sac_accepts_a_dataloader_tensor_batch(self):
         buffer = make_buffer(count=4, num_heads=10, n_actions=4)
-        dataset = ReplayBufferDataset(buffer, device="cpu", cache_on_device=False)
-        dataset.sync()
-        batch = next(iter(build_replay_loader(dataset, batch_size=4)))
+        batch_values = next(
+            iter(DataLoader(replay_tensor_dataset(buffer), batch_size=4))
+        )
+        batch = dict(zip(REPLAY_FIELDS, batch_values))
         agent = SAC(
             n_actions=4,
             num_heads=10,
@@ -571,45 +565,9 @@ class AdapterTests(unittest.TestCase):
         stats = agent.update(batch)
         self.assertTrue(np.isfinite(stats["actor_loss"]))
 
-    def test_reward_replay_dataset_updates_append_and_fifo_without_repacking(self):
-        buffer = ReplayBuffer(3, num_heads=3, n_actions=4)
-        for index in range(2):
-            state = np.full((8, 8), index, dtype=np.float32)
-            buffer.add(
-                state,
-                100.0 + index,
-                [0, 1, 2],
-                [index, index, index],
-                state + 0.5,
-                100.0 + index,
-                False,
-            )
-
-        dataset = RewardReplayDataset(device="cpu", cache_on_device=False)
-        dataset.sync(buffer)
-        np.testing.assert_array_equal(
-            dataset.batch([0, 1])[0][:, 0, 0], [0.0, 1.0]
-        )
-
-        state = np.full((8, 8), 2, dtype=np.float32)
-        buffer.add(state, 102.0, [0, 1, 2], [2, 2, 2], state, 102.0, False)
-        dataset.sync(buffer)
-        np.testing.assert_array_equal(
-            dataset.batch([0, 1, 2])[0][:, 0, 0], [0.0, 1.0, 2.0]
-        )
-
-        state = np.full((8, 8), 3, dtype=np.float32)
-        buffer.add(state, 103.0, [0, 1, 2], [3, 3, 3], state, 103.0, False)
-        dataset.sync(buffer)
-        np.testing.assert_array_equal(
-            dataset.batch([0, 1, 2])[0][:, 0, 0], [1.0, 2.0, 3.0]
-        )
-        np.testing.assert_array_equal(dataset.first_state, np.full((8, 8), 1.0))
-
-    def test_reward_replay_dataset_can_drive_a_full_fit(self):
+    def test_tensor_dataset_can_drive_a_full_fit(self):
         buffer = make_buffer(count=4)
-        dataset = RewardReplayDataset(device="cpu", cache_on_device=False)
-        dataset.sync(buffer)
+        replay = buffer.get_all()
         model = StepRewardEnsemble(
             1,
             1,
@@ -620,7 +578,10 @@ class AdapterTests(unittest.TestCase):
             device="cpu",
         )
         stats = model.fit(
-            dataset=dataset,
+            replay["state_imgs"],
+            replay["hoprates"],
+            replay["actions"],
+            replay["block_rewards"],
             batch_size=2,
             max_epochs=1,
             patience=0,

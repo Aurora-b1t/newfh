@@ -1,7 +1,6 @@
 """Profile one step-level reward-model fit on a prepared replay archive."""
 
 import argparse
-from collections import deque
 import json
 import sys
 import time
@@ -16,27 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import settings  # noqa: E402
-from r_predict_model import RewardReplayDataset, StepRewardEnsemble  # noqa: E402
-
-
-class PreparedReplay:
-    def __init__(self, states, hoprates, actions, rewards, capacity=20000):
-        self.capacity = int(capacity)
-        self.n_actions = int(np.max(actions)) + 1
-        self.buffer = deque(maxlen=self.capacity)
-        for index in range(len(states)):
-            self.buffer.append(
-                (
-                    states[index],
-                    float(hoprates[index]),
-                    actions[index],
-                    rewards[index],
-                    float(np.mean(rewards[index])),
-                    states[index],
-                    float(hoprates[index]),
-                    False,
-                )
-            )
+from r_predict_model import StepRewardEnsemble  # noqa: E402
 
 
 def load_reward_fields(path):
@@ -63,7 +42,6 @@ def main():
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--persistent-cache", action="store_true")
     parser.add_argument(
         "--precision",
         choices=("float32", "bfloat16", "float16"),
@@ -108,20 +86,6 @@ def main():
         precision=args.precision,
         compile_model=args.compile,
     )
-    dataset_cache = None
-    if args.persistent_cache:
-        replay = PreparedReplay(
-            np.asarray(state_imgs),
-            np.asarray(hoprates),
-            np.asarray(actions),
-            np.asarray(block_rewards),
-        )
-        dataset_cache = RewardReplayDataset(
-            device="cuda",
-            cache_on_device=args.cache,
-        )
-        dataset_cache.sync(replay)
-
     if args.repeat <= 0:
         raise ValueError("--repeat must be positive.")
     if torch.cuda.is_available():
@@ -138,17 +102,13 @@ def main():
     }
     all_stats = []
     for _repeat in range(args.repeat):
-        if dataset_cache is None:
-            stats = model.fit(
-                state_imgs,
-                hoprates,
-                actions,
-                block_rewards,
-                **fit_kwargs,
-            )
-        else:
-            dataset_cache.sync(replay)
-            stats = model.fit(dataset=dataset_cache, **fit_kwargs)
+        stats = model.fit(
+            state_imgs,
+            hoprates,
+            actions,
+            block_rewards,
+            **fit_kwargs,
+        )
         all_stats.append(stats)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -161,7 +121,6 @@ def main():
         "max_epochs": max_epochs,
         "patience": patience,
         "cache": args.cache,
-        "persistent_cache": args.persistent_cache,
         "precision": args.precision,
         "fast_math": args.fast_math,
         "compile": args.compile,

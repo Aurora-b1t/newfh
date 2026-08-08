@@ -69,7 +69,7 @@ dones            [B]
 8. 按最终 holdout MSE 排序选择 elite。
 9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。传入 `--save_model_curve_figures` 时才额外为每次拟合保存独立 PNG（`holdout_curves/holdout_step_XXXX.png`）。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
 
-即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认每 10 个在线 step 对全部真实 replay 重训一次，可通过 `--model_train_freq` 调整。对 20,000 条 100×100 transition 而言仍有较高成本；GPU 训练路径会把 reward 字段放入持久化 ring cache，后续 fit 只更新新增或 FIFO 覆盖的 transition，避免重复构造和 CPU→GPU 拷贝；模型权重和 Adam 状态仍在每次 fit 开始时重新初始化。资源不足时可使用 `--no-cache_model_dataset`。
+即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认每 10 个在线 step 对全部真实 replay 重训一次，可通过 `--model_train_freq` 调整。对 20,000 条 100×100 transition 而言仍有较高成本；每次 fit 使用标准 `TensorDataset` 和 `DataLoader`，可选择在 fit 开始时把整批 reward-model 数据放到训练设备；模型权重和 Adam 状态仍在每次 fit 开始时重新初始化。资源不足时可使用 `--no-cache_model_dataset`。
 
 在 CUDA 服务器上，`train_mbpo.py` 支持不改变训练预算的运行时优化选项：
 
@@ -77,7 +77,7 @@ dones            [B]
 - `--model_precision bfloat16` 或 `float16`：启用 reward-model autocast；需要用 holdout 和最终策略结果验证数值容差。
 - `--model_fast_math`：启用 TF32 和 cuDNN autotuning；可能改变收敛轨迹，默认关闭。
 
-训练数据现在统一通过 PyTorch `DataLoader` 处理。reward-model 的 train/holdout split 使用可复用的 Dataset，SAC 的真实/模型 replay 使用 GPU 常驻 ring Dataset 和固定数量的混合 batch sampler；每个 batch 保持原有真实/模型比例和 batch 内无放回采样。A800 CUDA 路径默认 `num_workers=0`，因为 CUDA tensor 不应交给多进程 worker；关闭 GPU cache 时可使用 `--data_loader_workers` 和 `--data_loader_pin_memory` 启用 CPU streaming fallback。
+训练数据现在统一通过 PyTorch 标准 `TensorDataset` 和 `DataLoader` 处理。reward-model 使用标准 train/holdout 子集；SAC 为 real replay 和 model replay 分别创建 loader，再按两侧 batch size 拼接，因此每个 batch 仍保持目标真实样本比例。A800 CUDA 路径默认 `num_workers=0`；CPU snapshot 可使用 `--data_loader_workers` 和 `--data_loader_pin_memory`。
 
 ## 5. 一步合成 Rollout
 
@@ -150,10 +150,9 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `rollout_length` | 1 | 固定为一步 |
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
 | `model_replay_size` | 4000 | 合成 replay FIFO 容量 |
-| `cache_dataset_on_device` | true | 是否把当前 reward-model 数据集缓存到训练设备 |
-| `cache_replay_on_device` | true | 是否把 SAC real/model replay 缓存到训练设备 |
-| `data_loader_workers` | 0 | DataLoader worker 数；CUDA cache 时必须为 0 |
-| `data_loader_pin_memory` | false | CPU fallback 是否固定 DataLoader batch |
+| `cache_dataset_on_device` | true | 是否在 fit 开始时把 reward-model TensorDataset 放到训练设备 |
+| `data_loader_workers` | 0 | 标准 DataLoader worker 数；CUDA TensorDataset 时必须为 0 |
+| `data_loader_pin_memory` | false | CPU TensorDataset 是否固定 DataLoader batch |
 | `model_precision` | float32 | reward-model 运行精度，不改变训练预算 |
 | `model_compile` | false | 是否复用 `torch.compile` 图 |
 | `model_fast_math` | true | 是否启用 TF32/cuDNN autotuning |

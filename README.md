@@ -152,7 +152,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 
 [train_mbpo.py](train_mbpo.py) 使用与十头 SAC 完全相同的 step-level v3 transition。奖励模型输入当前 PSD、实际 hoprate 和完整 offsets 向量，为每个 block 输出 Logistic-Normal 潜变量的位置与方差；潜变量经 sigmoid 映射到由 `BER∈[0,0.5]`、hoprate 和奖励公式共同确定的 reward 区间。模型不预测下一 PSD，而是复用真实 replay 的外生 next state、next hoprate 和 done。
 
-默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每个成员复用与 SAC 相同的三层 CNN、两层 hoprate MLP 和两层 PSD-hoprate fusion 结构，再通过三层 SiLU state-action fusion 预测 reward 分布。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每 10 个真实环境 step 使用当前全部真实 replay 从头重新拟合（成员权重与 Adam 优化器均重新初始化），并记录每次拟合内逐 epoch 的 holdout MSE 曲线。独立 MBPO 入口使用 GPU 常驻 replay Dataset 和 PyTorch DataLoader 处理 reward-model 与 SAC batch，默认 batch size 为 2048，适合 A800 训练。
+默认模型包含 5 个参数完全独立的 CNN 成员，并选择 3 个 holdout MSE 最低的 elite。每个成员复用与 SAC 相同的三层 CNN、两层 hoprate MLP 和两层 PSD-hoprate fusion 结构，再通过三层 SiLU state-action fusion 预测 reward 分布。每条合成 transition 随机选择一个 elite，在潜变量空间采样完整 reward 向量并通过 sigmoid 得到天然有界的奖励，不再做输出后裁剪。观测 BER 对应的训练 reward 若超出该物理区间，只在奖励模型目标中饱和并记录比例，真实 replay 奖励保持不变。每次奖励模型更新后，新合成样本会持续追加到 model replay；容量满后按 FIFO 淘汰最旧样本，不再整体清空，因此缓冲区可能暂时混合多个奖励模型版本生成的经验。默认每 10 个真实环境 step 使用当前全部真实 replay 从头重新拟合（成员权重与 Adam 优化器均重新初始化），并记录每次拟合内逐 epoch 的 holdout MSE 曲线。独立 MBPO 入口使用标准 TensorDataset 和 PyTorch DataLoader 处理 reward-model 与 SAC batch，real/model replay 分别加载后再按目标比例拼接，默认 batch size 为 2048，适合 A800 训练。
 
 ```bash
 D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --help

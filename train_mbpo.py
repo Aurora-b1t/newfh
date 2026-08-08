@@ -8,6 +8,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from SAC import (
     ReplayBuffer,
@@ -17,13 +18,12 @@ from SAC import (
     save_sac_inference_checkpoint,
 )
 from fh_env import save_waterfall_figure
-from mbpo_dataloader import (
-    ReplayBufferDataset,
-    build_mixed_replay_loader,
-)
 from offline_replay import environment_metadata, load_replay_into_buffer
-from r_predict_model import RewardReplayDataset, StepRewardEnsemble
+from r_predict_model import StepRewardEnsemble
 from r_predict_model.mbpo_adapter import (
+    REPLAY_FIELDS,
+    replay_tensor_dataset,
+    resolve_mixed_counts,
     rollout_reward_model,
     train_reward_model_from_replay,
 )
@@ -168,16 +168,6 @@ def train(args):
         num_heads=env.num_blocks,
         n_actions=n_actions,
     )
-    real_replay_dataset = ReplayBufferDataset(
-        real_buffer,
-        device=device,
-        cache_on_device=args.cache_replay_on_device,
-    )
-    model_replay_dataset = ReplayBufferDataset(
-        model_buffer,
-        device=device,
-        cache_on_device=args.cache_replay_on_device,
-    )
     save_steps, figures_dir = _figure_steps(args, env, logger)
     state_img, _reset_info = env.reset()
     current_metadata = environment_metadata(
@@ -208,9 +198,6 @@ def train(args):
             args.offline_replay_path,
             replay_metadata.get("hoprate_mode", "unknown"),
         )
-    if real_buffer.size():
-        real_replay_dataset.sync()
-
     reward_model = StepRewardEnsemble(
         network_size=args.num_networks,
         elite_size=args.num_elites,
@@ -225,10 +212,6 @@ def train(args):
         device=device,
         precision=getattr(args, "model_precision", "float32"),
         compile_model=getattr(args, "model_compile", False),
-    )
-    reward_dataset_cache = RewardReplayDataset(
-        device=device,
-        cache_on_device=args.cache_model_dataset,
     )
     fixed_hoprate = float(
         int(
@@ -258,8 +241,7 @@ def train(args):
         getattr(args, "model_fast_math", False),
     )
     logger.info(
-        "Replay DataLoader: cache=%s workers=%d pin_memory=%s batch=%d",
-        args.cache_replay_on_device,
+        "Replay DataLoader: workers=%d pin_memory=%s batch=%d",
         args.data_loader_workers,
         args.data_loader_pin_memory,
         args.batch_size,
@@ -328,7 +310,6 @@ def train(args):
             fixed_hoprate,
             done,
         )
-        real_replay_dataset.sync()
         ep_block_rewards.extend(block_rewards.tolist())
         state_img = next_state_img
 
@@ -352,7 +333,6 @@ def train(args):
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
                 cache_dataset_on_device=args.cache_model_dataset,
-                dataset_cache=reward_dataset_cache,
                 data_loader_workers=args.data_loader_workers,
                 data_loader_pin_memory=args.data_loader_pin_memory,
             )
@@ -365,7 +345,6 @@ def train(args):
                 settings.REWARD_CONFIG,
                 deterministic_model=args.deterministic_model_rollout,
             )
-            model_replay_dataset.sync()
             model_fit_time = time.time() - model_start
             holdout_curve_steps.append(step_idx)
             holdout_curve_history.append(last_model_stats["holdout_curves"])
@@ -401,17 +380,60 @@ def train(args):
 
         train_stats = {}
         if replay_ready(real_buffer, args.batch_size):
-            sac_loader = build_mixed_replay_loader(
-                real_replay_dataset,
-                model_replay_dataset,
+            real_count, model_count = resolve_mixed_counts(
+                real_buffer.size(),
+                model_buffer.size(),
                 args.batch_size,
                 args.real_ratio,
-                args.update_iters_per_step,
-                num_workers=args.data_loader_workers,
-                pin_memory=args.data_loader_pin_memory,
             )
+            loader_kwargs = {
+                "shuffle": True,
+                "drop_last": True,
+                "num_workers": args.data_loader_workers,
+                "pin_memory": args.data_loader_pin_memory,
+                "persistent_workers": bool(args.data_loader_workers > 0),
+            }
+            real_loader = (
+                DataLoader(
+                    replay_tensor_dataset(real_buffer),
+                    batch_size=real_count,
+                    **loader_kwargs,
+                )
+                if real_count
+                else None
+            )
+            model_loader = (
+                DataLoader(
+                    replay_tensor_dataset(model_buffer),
+                    batch_size=model_count,
+                    **loader_kwargs,
+                )
+                if model_count
+                else None
+            )
+            real_iterator = iter(real_loader) if real_loader is not None else None
+            model_iterator = iter(model_loader) if model_loader is not None else None
             last_update_index = args.update_iters_per_step - 1
-            for update_index, batch in enumerate(sac_loader):
+            for update_index in range(args.update_iters_per_step):
+                batch_parts = []
+                if real_iterator is not None:
+                    try:
+                        batch_parts.append(next(real_iterator))
+                    except StopIteration:
+                        real_iterator = iter(real_loader)
+                        batch_parts.append(next(real_iterator))
+                if model_iterator is not None:
+                    try:
+                        batch_parts.append(next(model_iterator))
+                    except StopIteration:
+                        model_iterator = iter(model_loader)
+                        batch_parts.append(next(model_iterator))
+                batch = {
+                    field: torch.cat(
+                        [part[field_index] for part in batch_parts], dim=0
+                    )
+                    for field_index, field in enumerate(REPLAY_FIELDS)
+                }
                 train_stats = agent.update(
                     batch,
                     return_stats=update_index == last_update_index,
@@ -773,19 +795,13 @@ def parse_args():
         "--cache_model_dataset",
         action=argparse.BooleanOptionalAction,
         default=settings.MBPO_CONFIG["cache_dataset_on_device"],
-        help="Keep the reward-model replay tensors on the training device.",
-    )
-    parser.add_argument(
-        "--cache_replay_on_device",
-        action=argparse.BooleanOptionalAction,
-        default=settings.MBPO_CONFIG.get("cache_replay_on_device", True),
-        help="Keep SAC real/model replay tensors on the training device.",
+        help="Preload the reward-model TensorDataset on the training device.",
     )
     parser.add_argument(
         "--data_loader_workers",
         type=int,
         default=settings.MBPO_CONFIG.get("data_loader_workers", 0),
-        help="DataLoader workers; CUDA-resident datasets require zero.",
+        help="DataLoader workers for reward-model and SAC snapshots.",
     )
     parser.add_argument(
         "--data_loader_pin_memory",
