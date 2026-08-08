@@ -175,11 +175,11 @@ MBPO_CONFIG = {
     "learning_rate": 1e-3,
     "weight_decay": 1e-5,
     # Refit the full real replay periodically instead of blocking every env step.
-    "model_train_freq": 10,
-    "model_train_batch_size": 1024,
+    "model_train_freq": 1,
+    "model_train_batch_size": 512,
     "holdout_ratio": 0.2,
-    "early_stop_patience": 5,
-    "max_epochs": 100,
+    "early_stop_patience": 10,
+    "max_epochs": 150,
     "min_improvement": 0.01,
     "rollout_batch_size": 1024,
     "rollout_length": 1,
@@ -197,9 +197,9 @@ MBPO_CONFIG = {
     "data_loader_pin_memory": False,
     # Runtime-only acceleration knobs. These do not change the reward-model
     # architecture, optimizer budget, replay split, or early-stop settings.
-    "model_precision": "float32",
+    "model_precision": "bfloat16",
     "model_fast_math": True,
-    "model_compile": False,
+    "model_compile": True,
     # PNG generation is diagnostic I/O and is disabled during normal training.
     "save_curve_figures": True,
 }
