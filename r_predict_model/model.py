@@ -658,47 +658,17 @@ class StepRewardEnsemble(nn.Module):
         )
         return images_t, hoprates_t, actions_t, rewards_t
 
-    def _loader_batch_tensors(self, batch, validate=True):
-        """Validate and move one DataLoader batch without NumPy round-trips.
-
-        ``validate=False`` skips the per-batch value checks (finite hoprates,
-        in-range actions) that force a device-to-host sync on CUDA.  Callers
-        may pass False only when the arrays were already validated wholesale
-        before training (see ``StepRewardEnsemble.fit``).
-        """
-        if not isinstance(batch, (tuple, list)) or len(batch) != 4:
-            raise TypeError(
-                "Reward DataLoader batches must contain four TensorDataset fields."
-            )
+    def _prepare_training_batch(self, batch, source_device):
+        """Normalize a validated TensorDataset batch for the model device."""
         images, hoprates, actions, rewards = batch
-        images_t = self._images_tensor(images)
-        batch_size = images_t.shape[0]
-        hoprates_t = self._to_device_tensor(
-            hoprates, torch.float32
-        ).view(-1, 1)
-        if tuple(hoprates_t.shape) != (batch_size, 1):
-            raise ValueError(f"hoprates must have shape ({batch_size},).")
-        if validate and not torch.all(torch.isfinite(hoprates_t)):
-            raise ValueError("hoprates must contain only finite values.")
-
-        actions_t = self._to_device_tensor(actions, torch.long)
-        expected_shape = (batch_size, self.num_heads)
-        if tuple(actions_t.shape) != expected_shape:
-            raise ValueError(
-                f"actions must have shape {expected_shape}, got {tuple(actions_t.shape)}."
-            )
-        if validate and (
-            torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions)
-        ):
-            raise ValueError("actions are outside the configured action range.")
-
-        rewards_t = self._to_device_tensor(rewards, torch.float32)
-        if tuple(rewards_t.shape) != expected_shape:
-            raise ValueError(
-                f"block_rewards must have shape {expected_shape}, "
-                f"got {tuple(rewards_t.shape)}."
-            )
-        return images_t, hoprates_t, actions_t, rewards_t, None, None
+        if source_device != self.device:
+            images = images.to(self.device, non_blocking=True)
+            hoprates = hoprates.to(self.device, non_blocking=True)
+            actions = actions.to(self.device, non_blocking=True)
+            rewards = rewards.to(self.device, non_blocking=True)
+        if images.ndim == 3:
+            images = images.unsqueeze(1)
+        return images, hoprates.view(-1, 1), actions, rewards
 
     @staticmethod
     def _probabilistic_loss(mean, logvar, targets):
@@ -706,7 +676,7 @@ class StepRewardEnsemble(nn.Module):
             torch.square(mean - targets.unsqueeze(0)) * torch.exp(-logvar) + logvar
         )
 
-    def _evaluate_ensemble(self, loader):
+    def _evaluate_ensemble(self, loader, source_device):
         """Return the per-member holdout MSE with a single parallel pass."""
         self.member.eval()
         squared_error = torch.zeros(
@@ -715,8 +685,9 @@ class StepRewardEnsemble(nn.Module):
         value_count = 0
         with torch.inference_mode():
             for batch in loader:
-                tensors = self._loader_batch_tensors(batch, validate=False)
-                images_t, hoprates_t, actions_t, rewards_t, _, _ = tensors
+                images_t, hoprates_t, actions_t, rewards_t = (
+                    self._prepare_training_batch(batch, source_device)
+                )
                 with self._autocast_context():
                     latent_mean = self._compute_member()(
                         images_t,
@@ -868,14 +839,9 @@ class StepRewardEnsemble(nn.Module):
             epoch_loss_total = None
             epoch_batch_count = 0
             for batch in train_loader:
-                (
-                    images_t,
-                    hoprates_t,
-                    actions_t,
-                    rewards_t,
-                    latent_targets,
-                    _bounded_targets,
-                ) = self._loader_batch_tensors(batch, validate=False)
+                images_t, hoprates_t, actions_t, rewards_t = (
+                    self._prepare_training_batch(batch, loader_device)
+                )
                 with self._autocast_context():
                     mean, logvar = self._compute_member()(
                         images_t,
@@ -884,10 +850,7 @@ class StepRewardEnsemble(nn.Module):
                         return_logvar=True,
                         validate_actions=False,
                     )
-                if latent_targets is None:
-                    latent_targets = self._targets_to_latent(
-                        rewards_t, hoprates_t
-                    )[0]
+                latent_targets = self._targets_to_latent(rewards_t, hoprates_t)[0]
                 loss = self._probabilistic_loss(
                     mean.float(), logvar.float(), latent_targets.float()
                 )
@@ -912,7 +875,7 @@ class StepRewardEnsemble(nn.Module):
             for member_idx in range(self.network_size):
                 train_curves[member_idx].append(mean_train_loss)
 
-            epoch_holdout = self._evaluate_ensemble(holdout_loader)
+            epoch_holdout = self._evaluate_ensemble(holdout_loader, loader_device)
             if not np.all(np.isfinite(epoch_holdout)):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
             for member_idx, value in enumerate(epoch_holdout):
