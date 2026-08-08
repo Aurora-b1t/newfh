@@ -390,7 +390,7 @@ class StepRewardEnsembleTests(unittest.TestCase):
         self.assertEqual(2, len(stats["holdout_curves"]))
         self.assertEqual([3, 3], stats["epochs"])
         for curve, epochs_run in zip(stats["holdout_curves"], stats["epochs"]):
-            self.assertEqual(epochs_run + 1, len(curve))
+            self.assertEqual(epochs_run, len(curve))
             self.assertTrue(all(np.isfinite(curve)))
 
     def test_fit_records_per_member_train_curves(self):
@@ -425,21 +425,20 @@ class StepRewardEnsembleTests(unittest.TestCase):
         trained_state = copy.deepcopy(model.member.state_dict())
 
         captured = {}
-        real_evaluate = model._evaluate_ensemble
+        real_rebuild = model._rebuild_member_and_optimizer
 
-        def capture_first_eval(dataset, indices, batch_size):
-            result = real_evaluate(dataset, indices, batch_size)
-            if "weights" not in captured:
-                # Capture after the first forward pass so the freshly rebuilt
-                # matrix member has materialized its lazy convolution weights.
-                captured["weights"] = copy.deepcopy(model.member.state_dict())
-                captured["optimizer_state"] = copy.deepcopy(
-                    model.optimizer.state_dict()
-                )
-            return result
+        def capture_after_rebuild(observation_shape):
+            real_rebuild(observation_shape)
+            # Capture immediately after re-initialization: the matrix member
+            # has materialized its lazy convolution weights but no optimizer
+            # step has run yet.
+            captured["weights"] = copy.deepcopy(model.member.state_dict())
+            captured["optimizer_state"] = copy.deepcopy(
+                model.optimizer.state_dict()
+            )
 
         with mock.patch.object(
-            model, "_evaluate_ensemble", side_effect=capture_first_eval
+            model, "_rebuild_member_and_optimizer", side_effect=capture_after_rebuild
         ):
             stats = model.fit(
                 self.states,
@@ -464,7 +463,7 @@ class StepRewardEnsembleTests(unittest.TestCase):
             len(captured["optimizer_state"]["state"]),
             "Second fit must start from a fresh Adam optimizer state.",
         )
-        self.assertEqual(2, len(stats["holdout_curves"][0]))
+        self.assertEqual(1, len(stats["holdout_curves"][0]))
 
     def test_fit_can_cache_dataset_on_training_device(self):
         model = self.make_model()

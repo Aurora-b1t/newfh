@@ -81,6 +81,10 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        # set_random_seeds() enables deterministic cuDNN, which disables
+        # benchmark mode entirely; clear it so the benchmark measures real
+        # fast-math kernel speed.
+        torch.backends.cudnn.deterministic = False
         torch.set_float32_matmul_precision("high")
     batch_size = args.batch_size or settings.MBPO_CONFIG["model_train_batch_size"]
     max_epochs = args.epochs or settings.MBPO_CONFIG["max_epochs"]

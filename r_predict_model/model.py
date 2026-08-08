@@ -1182,8 +1182,14 @@ class StepRewardEnsemble(nn.Module):
         )
         return images_t, hoprates_t, actions_t, rewards_t
 
-    def _loader_batch_tensors(self, batch):
-        """Validate and move one DataLoader batch without NumPy round-trips."""
+    def _loader_batch_tensors(self, batch, validate=True):
+        """Validate and move one DataLoader batch without NumPy round-trips.
+
+        ``validate=False`` skips the per-batch value checks (finite hoprates,
+        in-range actions) that force a device-to-host sync on CUDA.  Callers
+        may pass False only when the underlying dataset was already validated
+        wholesale before training (see ``StepRewardEnsemble.fit``).
+        """
         if not isinstance(batch, dict):
             raise TypeError("Reward DataLoader batches must be dictionaries.")
         images_t = self._images_tensor(batch["state_imgs"])
@@ -1193,7 +1199,7 @@ class StepRewardEnsemble(nn.Module):
         ).view(-1, 1)
         if tuple(hoprates_t.shape) != (batch_size, 1):
             raise ValueError(f"hoprates must have shape ({batch_size},).")
-        if not torch.all(torch.isfinite(hoprates_t)):
+        if validate and not torch.all(torch.isfinite(hoprates_t)):
             raise ValueError("hoprates must contain only finite values.")
 
         actions_t = self._to_device_tensor(batch["actions"], torch.long)
@@ -1202,7 +1208,9 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError(
                 f"actions must have shape {expected_shape}, got {tuple(actions_t.shape)}."
             )
-        if torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions):
+        if validate and (
+            torch.any(actions_t < 0) or torch.any(actions_t >= self.n_actions)
+        ):
             raise ValueError("actions are outside the configured action range.")
 
         rewards_t = self._to_device_tensor(batch["block_rewards"], torch.float32)
@@ -1280,7 +1288,7 @@ class StepRewardEnsemble(nn.Module):
         value_count = 0
         with torch.inference_mode():
             for batch in loader:
-                tensors = self._loader_batch_tensors(batch)
+                tensors = self._loader_batch_tensors(batch, validate=False)
                 images_t, hoprates_t, actions_t, rewards_t, _, bounded_targets = tensors
                 with self._autocast_context():
                     latent_mean = self._compute_member()(
@@ -1340,6 +1348,8 @@ class StepRewardEnsemble(nn.Module):
         driven by the best member's holdout loss; when it stops improving for
         ``patience`` epochs the whole ensemble stops.  The weights used are
         those from the final trained epoch, no best-epoch snapshot is kept.
+        ``holdout_curves`` contain one entry per trained epoch (no pre-fit
+        evaluation of the untrained weights is performed).
         """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
@@ -1411,23 +1421,16 @@ class StepRewardEnsemble(nn.Module):
             num_workers=data_loader_workers,
             pin_memory=data_loader_pin_memory,
         )
-        holdout_curves = []
+        holdout_curves = [[] for _ in range(self.network_size)]
         train_curves = []
         timing_enabled = bool(settings.TIMING_ENABLED)
         epoch_times = []
         fit_start = time.time()
         grad_scaler = self._new_grad_scaler()
 
-        initial_holdout = self._evaluate_ensemble(
-            dataset, holdout_loader, batch_size
-        )
-        if not np.all(np.isfinite(initial_holdout)):
-            raise RuntimeError("Reward-model holdout loss became non-finite.")
-        best_global_loss = float(np.min(initial_holdout))
+        best_global_loss = None
         stale_epochs = 0
         epochs_run = 0
-        for member_idx, value in enumerate(initial_holdout):
-            holdout_curves.append([float(value)])
         train_curves = [[] for _ in range(self.network_size)]
 
         for epoch in range(max_epochs):
@@ -1443,7 +1446,7 @@ class StepRewardEnsemble(nn.Module):
                     rewards_t,
                     latent_targets,
                     _bounded_targets,
-                ) = self._loader_batch_tensors(batch)
+                ) = self._loader_batch_tensors(batch, validate=False)
                 with self._autocast_context():
                     mean, logvar = self._compute_member()(
                         images_t,
@@ -1489,15 +1492,21 @@ class StepRewardEnsemble(nn.Module):
                 holdout_curves[member_idx].append(float(value))
 
             epoch_best_loss = float(np.min(epoch_holdout))
-            relative_improvement = (
-                (best_global_loss - epoch_best_loss)
-                / max(abs(best_global_loss), 1e-12)
-            )
-            if relative_improvement > min_improvement:
+            if best_global_loss is None:
+                # The first trained epoch establishes the early-stop baseline;
+                # there is no untrained pre-fit holdout evaluation.
                 best_global_loss = epoch_best_loss
                 stale_epochs = 0
             else:
-                stale_epochs += 1
+                relative_improvement = (
+                    (best_global_loss - epoch_best_loss)
+                    / max(abs(best_global_loss), 1e-12)
+                )
+                if relative_improvement > min_improvement:
+                    best_global_loss = epoch_best_loss
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
             epochs_run = epoch + 1
             if timing_enabled:
                 epoch_times.append(time.time() - epoch_start)
@@ -1506,9 +1515,9 @@ class StepRewardEnsemble(nn.Module):
 
         self.member.eval()
 
-        holdout_losses = self._evaluate_ensemble(
-            dataset, holdout_loader, batch_size
-        )
+        # The final per-epoch holdout evaluation was already computed with the
+        # same weights and eval mode; reuse it instead of a redundant pass.
+        holdout_losses = epoch_holdout
         self.elite_model_idxes = np.argsort(holdout_losses)[
             : self.elite_size
         ].tolist()
