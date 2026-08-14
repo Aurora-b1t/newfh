@@ -21,10 +21,10 @@ TIMING_ENABLED = True
 
 # Per-Batch Backward-Pass Timing Switch (MBPO reward-model training only)
 # When True, the MBPO reward-model fit measures the REAL GPU time of every
-# batch's backward pass (CUDA events on GPU, wall clock on CPU) and prints one
-# line per batch to the console with the [MBPO-BWD] tag. The measurement
-# requires one per-batch stream synchronization, which slightly slows
-# training; set to False to remove the per-batch prints and syncs.
+# batch's backward pass with CUDA events and prints one line per batch to the
+# console with the [MBPO-BWD] tag. The measurement requires one per-batch
+# stream synchronization, which slightly slows training; set to False to
+# remove the per-batch prints and syncs.
 BACKWARD_TIMING_ENABLED = True
 
 

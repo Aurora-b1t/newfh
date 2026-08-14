@@ -781,8 +781,8 @@ class StepRewardEnsemble(nn.Module):
         evaluation of the untrained weights is performed).
 
         When ``settings.BACKWARD_TIMING_ENABLED`` is True, every batch prints
-        its true backward-pass GPU time (CUDA events, wall clock on CPU) to
-        the console with the ``[MBPO-BWD]`` tag.
+        its true backward-pass GPU time (CUDA events) to the console with the
+        ``[MBPO-BWD]`` tag.
         """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
@@ -867,9 +867,10 @@ class StepRewardEnsemble(nn.Module):
         fit_start = time.time()
         grad_scaler = self._new_grad_scaler()
         backward_timing_enabled = bool(settings.BACKWARD_TIMING_ENABLED)
-        if backward_timing_enabled and self.device.type == "cuda":
-            # Pre-allocate the timing events once per fit; they are re-recorded
-            # on the current stream for every batch.
+        if backward_timing_enabled:
+            # Pre-allocate one timing-event pair per fit; they are re-recorded
+            # on the current CUDA stream for every batch. Training always runs
+            # on CUDA (A800), so no CPU timing fallback is used.
             backward_start_event = torch.cuda.Event(enable_timing=True)
             backward_end_event = torch.cuda.Event(enable_timing=True)
         num_train_batches = len(train_loader)
@@ -906,26 +907,18 @@ class StepRewardEnsemble(nn.Module):
                 # launch time alone; CUDA events on the stream bracket exactly
                 # the backward kernels and report the true GPU time.
                 if backward_timing_enabled:
-                    if self.device.type == "cuda":
-                        backward_start_event.record()
-                    else:
-                        backward_start_time = time.time()
+                    backward_start_event.record()
                 if grad_scaler.is_enabled():
                     grad_scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 if backward_timing_enabled:
-                    if self.device.type == "cuda":
-                        backward_end_event.record()
-                        backward_end_event.synchronize()
-                        backward_sec = (
-                            backward_start_event.elapsed_time(
-                                backward_end_event
-                            )
-                            / 1000.0
-                        )
-                    else:
-                        backward_sec = time.time() - backward_start_time
+                    backward_end_event.record()
+                    backward_end_event.synchronize()
+                    backward_sec = (
+                        backward_start_event.elapsed_time(backward_end_event)
+                        / 1000.0
+                    )
                     print(
                         f"[MBPO-BWD] epoch={epoch + 1}/{max_epochs} "
                         f"batch={epoch_batch_count + 1}/{num_train_batches} "
