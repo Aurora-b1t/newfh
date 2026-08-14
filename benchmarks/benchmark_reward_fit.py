@@ -41,7 +41,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--precision",
         choices=("float32", "bfloat16", "float16"),
@@ -98,7 +97,6 @@ def main():
         "patience": patience,
         "max_epochs": max_epochs,
         "min_improvement": settings.MBPO_CONFIG["min_improvement"],
-        "cache_dataset_on_device": args.cache,
     }
     all_stats = []
     for _repeat in range(args.repeat):
@@ -120,7 +118,6 @@ def main():
         "batch_size": batch_size,
         "max_epochs": max_epochs,
         "patience": patience,
-        "cache": args.cache,
         "precision": args.precision,
         "fast_math": args.fast_math,
         "compile": args.compile,

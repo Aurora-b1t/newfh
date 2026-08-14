@@ -287,7 +287,6 @@ def parse_args(argv=None):
         help="Allow replay generated under different environment metadata.",
     )
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
-    parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
     add_environment_override_args(parser)
     add_derivative_nbs_args(parser)
     return parser.parse_args(argv)

@@ -63,14 +63,10 @@ def log_active_comb_channels(env, logger=None):
 
 def build_agent_and_env(args, env_config=None, jammer_config=None):
     # -------------------------------------------------------------------------
-    # 1. Device Configuration (GPU/CPU)
+    # 1. Device Configuration (CUDA only)
     # -------------------------------------------------------------------------
-    if torch.cuda.is_available() and not args.cpu_only:
-        device = torch.device("cuda")
-        logging.info(f"Training Device: GPU ({torch.cuda.get_device_name(0)})")
-    else:
-        device = torch.device("cpu")
-        logging.info("Training Device: CPU")
+    device = torch.device("cuda")
+    logging.info(f"Training Device: GPU ({torch.cuda.get_device_name(0)})")
 
     # -------------------------------------------------------------------------
     # 2. Environment Initialization
@@ -415,8 +411,6 @@ def parse_args():
         default=settings.OFFLINE_REPLAY_CONFIG["default_path"],
         help="Offline v3 replay path, or 'none' for online-only warm-up.",
     )
-
-    parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
     return parser.parse_args()
 
 

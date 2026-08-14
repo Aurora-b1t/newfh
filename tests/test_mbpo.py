@@ -473,7 +473,6 @@ class StepRewardEnsembleTests(unittest.TestCase):
             batch_size=2,
             max_epochs=1,
             patience=0,
-            cache_dataset_on_device=True,
         )
         self.assertTrue(model.is_fitted)
         self.assertEqual(1, stats["epochs"][0])

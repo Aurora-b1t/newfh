@@ -429,7 +429,7 @@ def save_sac_inference_checkpoint(
 
 def load_sac_inference_checkpoint(
     path,
-    device="cpu",
+    device="cuda",
     expected_num_heads=None,
     expected_n_actions=None,
     expected_observation_shape=None,

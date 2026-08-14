@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 import settings
 from SAC import (
@@ -30,6 +30,56 @@ from SAC import (
     STATE_FEATURE_DIM,
     normalize_hoprate,
 )
+
+
+REWARD_FIELD_NAMES = ("state_imgs", "hoprates", "actions", "block_rewards",
+                      "latent_targets")
+
+
+def _collate_reward_batch(batch):
+    """Pass vectorized device batches through without an extra stack/copy."""
+    if isinstance(batch, dict):
+        return {
+            key: value if torch.is_tensor(value) else torch.as_tensor(value)
+            for key, value in batch.items()
+        }
+    return default_collate(batch)
+
+
+class _DeviceBatchDataset(Dataset):
+    """Device-resident dataset whose batches are gathered with one index_select
+    per field instead of one tiny GPU indexing kernel per transition.
+
+    ``torch.utils.data.DataLoader`` calls ``__getitems__`` for each batch when
+    the dataset defines it, so a batch of 512 transitions enqueues a handful of
+    kernels rather than thousands, which keeps the CUDA launch queue shallow.
+    """
+
+    def __init__(self, tensors, indices):
+        self.tensors = tensors
+        self.indices = torch.as_tensor(
+            np.asarray(indices, dtype=np.int64), dtype=torch.long,
+            device=tensors[0].device,
+        )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return {
+            name: tensor[index] for name, tensor in zip(REWARD_FIELD_NAMES, self.tensors)
+        }
+
+    def __getitems__(self, indices):
+        index_tensor = torch.as_tensor(
+            np.asarray(indices, dtype=np.int64), dtype=torch.long,
+            device=self.tensors[0].device,
+        )
+        index_tensor = self.indices.index_select(0, index_tensor)
+        return {
+            name: tensor.index_select(0, index_tensor)
+            for name, tensor in zip(REWARD_FIELD_NAMES, self.tensors)
+        }
 
 
 REWARD_CHECKPOINT_FORMAT_VERSION = 3
@@ -215,6 +265,7 @@ class MatrixStepRewardMember(nn.Module):
         hoprate_min,
         hoprate_max,
         hidden_size=200,
+        extra_pool=False,
     ):
         super().__init__()
         self.num_members = int(num_members)
@@ -229,6 +280,10 @@ class MatrixStepRewardMember(nn.Module):
         self.conv2 = _MatrixConv2d(self.num_members, 32)
         self.norm2 = _MatrixGroupNorm(self.num_members, 8, 32)
         self.pool = nn.MaxPool2d(kernel_size=2)
+        # Optional second 2x2 pool before the flatten: shrinks the conv_fc
+        # input 4x (80000 -> 20000 per member) and the layer's parameter
+        # count from ~205M to ~51M at the cost of model capacity.
+        self.extra_pool = nn.MaxPool2d(kernel_size=2) if extra_pool else None
         self.conv_fc = None
         self.hoprate_embedding = _MatrixLinear(
             self.num_members, 1, HOPRATE_FEATURE_DIM
@@ -290,6 +345,8 @@ class MatrixStepRewardMember(nn.Module):
             batch_size * members, channels, height, width
         )
         image_features = self.pool(image_features)
+        if self.extra_pool is not None:
+            image_features = self.extra_pool(image_features)
         image_features = image_features.reshape(batch_size, members, -1)
         self._ensure_conv_fc(image_features.shape[-1], images.device)
         image_features = F.relu(
@@ -405,6 +462,7 @@ class StepRewardEnsemble(nn.Module):
         device=None,
         precision="float32",
         compile_model=False,
+        extra_pool=False,
     ):
         super().__init__()
         if network_size <= 0:
@@ -435,9 +493,7 @@ class StepRewardEnsemble(nn.Module):
         self.hidden_size = int(hidden_size)
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(weight_decay)
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = torch.device(device or "cuda")
         precision = str(precision).lower()
         if precision not in {"float32", "bfloat16", "float16"}:
             raise ValueError(
@@ -447,6 +503,7 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("Mixed precision reward training requires CUDA.")
         self.precision = precision
         self.compile_model = bool(compile_model)
+        self.extra_pool = bool(extra_pool)
         if self.compile_model and not hasattr(torch, "compile"):
             raise RuntimeError("This PyTorch build does not provide torch.compile.")
         self.member = None
@@ -503,6 +560,7 @@ class StepRewardEnsemble(nn.Module):
                 self.hoprate_min,
                 self.hoprate_max,
                 self.hidden_size,
+                extra_pool=self.extra_pool,
             ).to(self.device)
             with torch.no_grad():
                 self.member(*self._dummy_tensors(observation_shape))
@@ -658,25 +716,13 @@ class StepRewardEnsemble(nn.Module):
         )
         return images_t, hoprates_t, actions_t, rewards_t
 
-    def _prepare_training_batch(self, batch, source_device):
-        """Normalize a validated TensorDataset batch for the model device."""
-        images, hoprates, actions, rewards = batch
-        if source_device != self.device:
-            images = images.to(self.device, non_blocking=True)
-            hoprates = hoprates.to(self.device, non_blocking=True)
-            actions = actions.to(self.device, non_blocking=True)
-            rewards = rewards.to(self.device, non_blocking=True)
-        if images.ndim == 3:
-            images = images.unsqueeze(1)
-        return images, hoprates.view(-1, 1), actions, rewards
-
     @staticmethod
     def _probabilistic_loss(mean, logvar, targets):
         return torch.mean(
             torch.square(mean - targets.unsqueeze(0)) * torch.exp(-logvar) + logvar
         )
 
-    def _evaluate_ensemble(self, loader, source_device):
+    def _evaluate_ensemble(self, loader):
         """Return the per-member holdout MSE with a single parallel pass."""
         self.member.eval()
         squared_error = torch.zeros(
@@ -685,9 +731,10 @@ class StepRewardEnsemble(nn.Module):
         value_count = 0
         with torch.inference_mode():
             for batch in loader:
-                images_t, hoprates_t, actions_t, rewards_t = (
-                    self._prepare_training_batch(batch, source_device)
-                )
+                images_t = batch["state_imgs"]
+                hoprates_t = batch["hoprates"]
+                actions_t = batch["actions"]
+                rewards_t = batch["block_rewards"]
                 with self._autocast_context():
                     latent_mean = self._compute_member()(
                         images_t,
@@ -718,12 +765,11 @@ class StepRewardEnsemble(nn.Module):
         patience=5,
         max_epochs=100,
         min_improvement=0.01,
-        cache_dataset_on_device=None,
-        data_loader_workers=0,
-        data_loader_pin_memory=None,
     ):
         """Retrain every member in parallel on the current real-replay split.
 
+        The replay tensors are cached on the training device (always CUDA) and
+        streamed through a main-process DataLoader with no per-batch copies.
         All matrix weights and the shared Adam optimizer are re-initialized at
         the start of every call; training never continues from a previous fit.
         Members share one train/holdout split and one data order per epoch and
@@ -733,6 +779,10 @@ class StepRewardEnsemble(nn.Module):
         those from the final trained epoch, no best-epoch snapshot is kept.
         ``holdout_curves`` contain one entry per trained epoch (no pre-fit
         evaluation of the untrained weights is performed).
+
+        When ``settings.BACKWARD_TIMING_ENABLED`` is True, every batch prints
+        its true backward-pass GPU time (CUDA events, wall clock on CPU) to
+        the console with the ``[MBPO-BWD]`` tag.
         """
         if batch_size <= 0 or patience < 0 or max_epochs <= 0:
             raise ValueError("Invalid ensemble training limits.")
@@ -740,8 +790,6 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("holdout_ratio must be between zero and one.")
         if min_improvement < 0.0:
             raise ValueError("min_improvement must be non-negative.")
-        if int(data_loader_workers) < 0:
-            raise ValueError("data_loader_workers cannot be negative.")
 
         if any(
             value is None
@@ -771,54 +819,45 @@ class StepRewardEnsemble(nn.Module):
             hoprates, block_rewards
         )
 
-        if cache_dataset_on_device is None:
-            cache_dataset_on_device = (
-                self.device.type == "cuda"
-                and bool(settings.MBPO_CONFIG.get("cache_dataset_on_device", True))
-            )
-        data_loader_workers = int(data_loader_workers)
-        if data_loader_workers < 0:
-            raise ValueError("data_loader_workers cannot be negative.")
-        loader_device = self.device if cache_dataset_on_device else torch.device("cpu")
-        if loader_device.type == "cuda" and data_loader_workers:
-            raise ValueError("CUDA TensorDataset loaders require data_loader_workers=0.")
-        if data_loader_pin_memory is None:
-            data_loader_pin_memory = (
-                self.device.type == "cuda" and loader_device.type != "cuda"
-            )
-        if loader_device.type == "cuda":
-            data_loader_pin_memory = False
-
-        tensor_dataset = TensorDataset(
-            torch.as_tensor(state_imgs, dtype=torch.float32, device=loader_device),
-            torch.as_tensor(hoprates, dtype=torch.float32, device=loader_device),
-            torch.as_tensor(actions, dtype=torch.long, device=loader_device),
-            torch.as_tensor(block_rewards, dtype=torch.float32, device=loader_device),
+        images_t = torch.as_tensor(state_imgs, dtype=torch.float32, device=self.device)
+        if images_t.ndim == 3:
+            images_t = images_t.unsqueeze(1)
+        hoprates_t = torch.as_tensor(
+            hoprates, dtype=torch.float32, device=self.device
+        ).view(-1, 1)
+        actions_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.as_tensor(
+            block_rewards, dtype=torch.float32, device=self.device
         )
-        dataset_size = len(tensor_dataset)
+        # Deterministic reward targets depend only on the data, so they are
+        # computed once per fit instead of once per batch.
+        latent_all = self._targets_to_latent(rewards_t, hoprates_t)[0]
+        tensors = (images_t, hoprates_t, actions_t, rewards_t, latent_all)
+        dataset_size = images_t.shape[0]
         permutation = np.random.permutation(dataset_size)
         holdout_size = min(
             max(1, int(dataset_size * holdout_ratio)), dataset_size - 1
         )
-        holdout_indices = permutation[:holdout_size].tolist()
-        train_indices = permutation[holdout_size:].tolist()
-        train_dataset = Subset(tensor_dataset, train_indices)
-        holdout_dataset = Subset(tensor_dataset, holdout_indices)
-        loader_kwargs = {
-            "batch_size": int(batch_size),
-            "num_workers": data_loader_workers,
-            "pin_memory": bool(data_loader_pin_memory),
-            "persistent_workers": bool(data_loader_workers > 0),
-        }
+        holdout_indices = permutation[:holdout_size].astype(np.int64)
+        train_indices = permutation[holdout_size:].astype(np.int64)
+        batch_size = int(batch_size)
+        train_dataset = _DeviceBatchDataset(tensors, train_indices)
+        holdout_dataset = _DeviceBatchDataset(tensors, holdout_indices)
+        # Drop the ragged tail batch once the split fills the batch size; it
+        # only costs a torch.compile recompilation for a new shape and does
+        # not change the optimization budget meaningfully.
         train_loader = DataLoader(
             train_dataset,
+            batch_size=batch_size,
             shuffle=True,
-            **loader_kwargs,
+            drop_last=len(train_indices) >= batch_size,
+            collate_fn=_collate_reward_batch,
         )
         holdout_loader = DataLoader(
             holdout_dataset,
+            batch_size=batch_size,
             shuffle=False,
-            **loader_kwargs,
+            collate_fn=_collate_reward_batch,
         )
         self._rebuild_member_and_optimizer(observation_shape)
         holdout_curves = [[] for _ in range(self.network_size)]
@@ -827,6 +866,13 @@ class StepRewardEnsemble(nn.Module):
         epoch_times = []
         fit_start = time.time()
         grad_scaler = self._new_grad_scaler()
+        backward_timing_enabled = bool(settings.BACKWARD_TIMING_ENABLED)
+        if backward_timing_enabled and self.device.type == "cuda":
+            # Pre-allocate the timing events once per fit; they are re-recorded
+            # on the current stream for every batch.
+            backward_start_event = torch.cuda.Event(enable_timing=True)
+            backward_end_event = torch.cuda.Event(enable_timing=True)
+        num_train_batches = len(train_loader)
 
         best_global_loss = None
         stale_epochs = 0
@@ -839,28 +885,58 @@ class StepRewardEnsemble(nn.Module):
             epoch_loss_total = None
             epoch_batch_count = 0
             for batch in train_loader:
-                images_t, hoprates_t, actions_t, rewards_t = (
-                    self._prepare_training_batch(batch, loader_device)
-                )
+                images_b = batch["state_imgs"]
+                hoprates_b = batch["hoprates"]
+                actions_b = batch["actions"]
+                latent_targets = batch["latent_targets"]
                 with self._autocast_context():
                     mean, logvar = self._compute_member()(
-                        images_t,
-                        hoprates_t,
-                        actions_t,
+                        images_b,
+                        hoprates_b,
+                        actions_b,
                         return_logvar=True,
                         validate_actions=False,
                     )
-                latent_targets = self._targets_to_latent(rewards_t, hoprates_t)[0]
                 loss = self._probabilistic_loss(
                     mean.float(), logvar.float(), latent_targets.float()
                 )
                 self.optimizer.zero_grad(set_to_none=True)
+                # Time ONLY the backward pass of this batch. CUDA kernels are
+                # asynchronous, so wall clock around backward() would capture
+                # launch time alone; CUDA events on the stream bracket exactly
+                # the backward kernels and report the true GPU time.
+                if backward_timing_enabled:
+                    if self.device.type == "cuda":
+                        backward_start_event.record()
+                    else:
+                        backward_start_time = time.time()
                 if grad_scaler.is_enabled():
                     grad_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                if backward_timing_enabled:
+                    if self.device.type == "cuda":
+                        backward_end_event.record()
+                        backward_end_event.synchronize()
+                        backward_sec = (
+                            backward_start_event.elapsed_time(
+                                backward_end_event
+                            )
+                            / 1000.0
+                        )
+                    else:
+                        backward_sec = time.time() - backward_start_time
+                    print(
+                        f"[MBPO-BWD] epoch={epoch + 1}/{max_epochs} "
+                        f"batch={epoch_batch_count + 1}/{num_train_batches} "
+                        f"loss={loss.detach().item():.6f} "
+                        f"backward={backward_sec * 1000.0:.3f} ms",
+                        flush=True,
+                    )
+                if grad_scaler.is_enabled():
                     grad_scaler.step(self.optimizer)
                     grad_scaler.update()
                 else:
-                    loss.backward()
                     self.optimizer.step()
                 detached_loss = loss.detach()
                 epoch_loss_total = (
@@ -875,7 +951,7 @@ class StepRewardEnsemble(nn.Module):
             for member_idx in range(self.network_size):
                 train_curves[member_idx].append(mean_train_loss)
 
-            epoch_holdout = self._evaluate_ensemble(holdout_loader, loader_device)
+            epoch_holdout = self._evaluate_ensemble(holdout_loader)
             if not np.all(np.isfinite(epoch_holdout)):
                 raise RuntimeError("Reward-model holdout loss became non-finite.")
             for member_idx, value in enumerate(epoch_holdout):
@@ -1046,6 +1122,9 @@ class StepRewardEnsemble(nn.Module):
             "disagreement": disagreement.astype(np.float32, copy=False),
         }
 
+    def _architecture_tag(self):
+        return REWARD_MODEL_ARCHITECTURE + ("_pool2" if self.extra_pool else "")
+
     def _config(self):
         return {
             "network_size": self.network_size,
@@ -1061,6 +1140,7 @@ class StepRewardEnsemble(nn.Module):
             "hidden_size": self.hidden_size,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
+            "extra_pool": self.extra_pool,
         }
 
     def save_checkpoint(self, path, metadata=None):
@@ -1073,7 +1153,7 @@ class StepRewardEnsemble(nn.Module):
             {
                 "format_version": REWARD_CHECKPOINT_FORMAT_VERSION,
                 "model_type": "StepRewardEnsemble",
-                "architecture": REWARD_MODEL_ARCHITECTURE,
+                "architecture": self._architecture_tag(),
                 "config": self._config(),
                 "observation_shape": list(self.observation_shape),
                 "elite_model_idxes": list(self.elite_model_idxes),
@@ -1094,6 +1174,7 @@ class StepRewardEnsemble(nn.Module):
                 self.hoprate_min,
                 self.hoprate_max,
                 self.hidden_size,
+                extra_pool=self.extra_pool,
             ).to(self.device)
         with torch.no_grad():
             self.member(images, hoprates, actions)
@@ -1103,7 +1184,7 @@ class StepRewardEnsemble(nn.Module):
     def load_checkpoint(
         cls,
         path,
-        device="cpu",
+        device="cuda",
         expected_num_heads=None,
         expected_n_actions=None,
         expected_observation_shape=None,
@@ -1126,12 +1207,15 @@ class StepRewardEnsemble(nn.Module):
             raise ValueError("Unsupported reward-model checkpoint format.")
         if payload.get("model_type") != "StepRewardEnsemble":
             raise ValueError("Checkpoint does not contain a StepRewardEnsemble.")
-        if payload.get("architecture") != REWARD_MODEL_ARCHITECTURE:
+        config = dict(payload["config"])
+        expected_architecture = REWARD_MODEL_ARCHITECTURE + (
+            "_pool2" if config.get("extra_pool") else ""
+        )
+        if payload.get("architecture") != expected_architecture:
             raise ValueError(
                 "Reward-model checkpoint architecture does not match "
-                f"{REWARD_MODEL_ARCHITECTURE!r}; retrain with the current architecture."
+                f"{expected_architecture!r}; retrain with the current architecture."
             )
-        config = dict(payload["config"])
         if expected_num_heads is not None and int(expected_num_heads) != int(
             config["num_heads"]
         ):

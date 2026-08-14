@@ -95,7 +95,7 @@ def _validate_args(args):
 
 def _configure_torch_runtime(args):
     """Enable opt-in GPU math choices without changing training budgets."""
-    if not bool(getattr(args, "model_fast_math", False)) or not torch.cuda.is_available():
+    if not bool(getattr(args, "model_fast_math", False)):
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -212,6 +212,7 @@ def train(args):
         device=device,
         precision=getattr(args, "model_precision", "float32"),
         compile_model=getattr(args, "model_compile", False),
+        extra_pool=getattr(args, "model_extra_pool", False),
     )
     fixed_hoprate = float(
         int(
@@ -234,14 +235,13 @@ def train(args):
         args.model_train_freq,
     )
     logger.info(
-        "Reward runtime: cache=%s precision=%s compile=%s fast_math=%s",
-        args.cache_model_dataset,
+        "Reward runtime: precision=%s compile=%s fast_math=%s",
         getattr(args, "model_precision", "float32"),
         getattr(args, "model_compile", False),
         getattr(args, "model_fast_math", False),
     )
     logger.info(
-        "Replay DataLoader: workers=%d pin_memory=%s batch=%d",
+        "SAC Replay DataLoader: workers=%d pin_memory=%s batch=%d",
         args.data_loader_workers,
         args.data_loader_pin_memory,
         args.batch_size,
@@ -332,9 +332,6 @@ def train(args):
                 patience=args.model_patience,
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
-                cache_dataset_on_device=args.cache_model_dataset,
-                data_loader_workers=args.data_loader_workers,
-                data_loader_pin_memory=args.data_loader_pin_memory,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -792,16 +789,10 @@ def parse_args():
         default=settings.MBPO_CONFIG["min_improvement"],
     )
     parser.add_argument(
-        "--cache_model_dataset",
-        action=argparse.BooleanOptionalAction,
-        default=settings.MBPO_CONFIG["cache_dataset_on_device"],
-        help="Preload the reward-model TensorDataset on the training device.",
-    )
-    parser.add_argument(
         "--data_loader_workers",
         type=int,
         default=settings.MBPO_CONFIG.get("data_loader_workers", 0),
-        help="DataLoader workers for reward-model and SAC snapshots.",
+        help="DataLoader workers for SAC replay snapshots.",
     )
     parser.add_argument(
         "--data_loader_pin_memory",
@@ -828,6 +819,12 @@ def parse_args():
         help="Compile the persistent reward-model graph with torch.compile.",
     )
     parser.add_argument(
+        "--model_extra_pool",
+        action=argparse.BooleanOptionalAction,
+        default=settings.MBPO_CONFIG.get("model_extra_pool", False),
+        help="Add a second 2x2 pool before conv_fc (4x fewer parameters, faster epochs).",
+    )
+    parser.add_argument(
         "--save_model_curve_figures",
         action=argparse.BooleanOptionalAction,
         default=settings.MBPO_CONFIG["save_curve_figures"],
@@ -836,7 +833,6 @@ def parse_args():
     parser.add_argument(
         "--deterministic_model_rollout", action="store_true"
     )
-    parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
     return parser.parse_args()
 
 

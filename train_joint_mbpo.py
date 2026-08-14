@@ -197,7 +197,6 @@ def train(args):
                 patience=args.model_patience,
                 max_epochs=args.model_max_epochs,
                 min_improvement=args.model_min_improvement,
-                cache_dataset_on_device=args.cache_model_dataset,
             )
             last_rollout_stats = rollout_reward_model(
                 reward_model,
@@ -445,14 +444,9 @@ def parse_args(argv=None):
         default=settings.MBPO_CONFIG["min_improvement"],
     )
     parser.add_argument(
-        "--cache_model_dataset",
-        action=argparse.BooleanOptionalAction,
-        default=settings.MBPO_CONFIG["cache_dataset_on_device"],
-        help="Keep the reward-model replay tensors on the training device.",
+        "--deterministic_model_rollout", action="store_true"
     )
-    parser.add_argument("--deterministic_model_rollout", action="store_true")
     parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED)
-    parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
     add_environment_override_args(parser)
     add_derivative_nbs_args(parser)
     return parser.parse_args(argv)

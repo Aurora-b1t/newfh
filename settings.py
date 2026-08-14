@@ -10,9 +10,6 @@ per-script via each training entry point's ``--output_dir`` argument.
 import random
 import numpy as np
 
-# Device Configuration
-CPU_ONLY = False # Set to True to force CPU usage
-
 # Global Random Seed for full reproducibility
 RANDOM_SEED = 42
 
@@ -21,6 +18,14 @@ RANDOM_SEED = 42
 # and rollout (experience generation) per-stage times, and the training logs
 # include them. Set to False to disable all timing measurements.
 TIMING_ENABLED = True
+
+# Per-Batch Backward-Pass Timing Switch (MBPO reward-model training only)
+# When True, the MBPO reward-model fit measures the REAL GPU time of every
+# batch's backward pass (CUDA events on GPU, wall clock on CPU) and prints one
+# line per batch to the console with the [MBPO-BWD] tag. The measurement
+# requires one per-batch stream synchronization, which slightly slows
+# training; set to False to remove the per-batch prints and syncs.
+BACKWARD_TIMING_ENABLED = True
 
 
 def set_random_seeds(seed=None):
@@ -185,12 +190,9 @@ MBPO_CONFIG = {
     "rollout_length": 1,
     "real_ratio": 0.2,
     "model_replay_size": 4000,
-    # The server training path has enough device memory to avoid repeated H2D
-    # copies for every reward-model epoch. Use --no-cache_model_dataset when it
-    # is not available.
-    "cache_dataset_on_device": True,
-    # Standard TensorDataset loaders use the main process for CUDA training.
-    # CPU snapshots can opt in to workers and pinned batches through the CLI.
+    # The reward model always trains on CUDA with the replay cached on the
+    # training device; no per-epoch H2D copies are made.
+    # SAC replay snapshots can opt in to worker processes and pinned batches.
     "data_loader_workers": 0,
     "data_loader_pin_memory": False,
     # Runtime-only acceleration knobs. These do not change the reward-model
@@ -200,6 +202,11 @@ MBPO_CONFIG = {
     "model_compile": True,
     # PNG generation is diagnostic I/O and is disabled during normal training.
     "save_curve_figures": True,
+    # Optional second 2x2 pool before the conv_fc layer. This CHANGES the
+    # reward-model architecture: conv_fc input drops from 80000 to 20000 per
+    # member, cutting parameters from ~205M to ~51M and per-batch time by
+    # ~30%. Disabled by default to preserve the existing model.
+    "model_extra_pool": False,
 }
 
 # Noisy Binary Search Configuration
