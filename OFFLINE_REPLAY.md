@@ -10,14 +10,16 @@ The fixed-hoprate baseline keeps its existing default dataset:
 outputs/offline_replay/replay_5000_100_hoprate_v3.npz
 ```
 
-The derivative-NBS joint trainers use a separate 5,000-step random-hoprate
-dataset by default:
+A separate 5,000-step random-hoprate dataset was prepared for the derivative-NBS
+joint trainers, which have since been removed from the repository (see git
+history). Its config block (`JOINT_OFFLINE_REPLAY_CONFIG`) is kept in
+`settings.py` in case those entries are restored:
 
 ```text
 outputs/offline_replay/replay_5000_random_hoprate_v3.npz
 ```
 
-Generate the joint reactive+comb dataset with uniformly random valid 10 Hz
+Generate the reactive+comb dataset with uniformly random valid 10 Hz
 hoprates and independently uniform ten-offset actions:
 
 ```bash
@@ -55,11 +57,11 @@ input is causally consistent. `step_rewards[n]` must equal
 `mean(block_rewards[n])`.
 
 The loader validates observation shape, action range, block count, finite
-values, metadata count and replay capacity. Both joint trainers reject
-environment, jammer or reward metadata mismatches by default. Use
+values, metadata count and replay capacity. `train_mbpo.py` rejects
+environment, jammer or reward metadata mismatches by default; use
 `--allow_replay_config_mismatch` only for an explicit cross-configuration
-experiment. The original baseline keeps its warning-only compatibility
-behavior, while the original MBPO entry remains strict by default.
+experiment. `train_offsets.py` (baseline) keeps its warning-only
+compatibility behavior.
 
 Any change to jammer timing, comb channel groups, jammer mode,
 `baseband_variant_count`, environment parameters or reward coefficients
@@ -68,10 +70,21 @@ invalidates the normal-use replay dataset and requires regeneration.
 Select or disable replay explicitly when training:
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe train_joint_sac.py --offline_replay_path outputs/offline_replay/replay_5000_random_hoprate_v3.npz
-D:\Anaconda\envs\rl_fhss\python.exe train_joint_mbpo.py --offline_replay_path outputs/offline_replay/replay_5000_random_hoprate_v3.npz
-D:\Anaconda\envs\rl_fhss\python.exe train_joint_sac.py --offline_replay_path none
+D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path outputs/offline_replay/replay_5000_100_hoprate_v3.npz
+D:\Anaconda\envs\rl_fhss\python.exe train_mbpo.py --offline_replay_path outputs/offline_replay/replay_5000_100_hoprate_v3.npz
+D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --offline_replay_path none
 ```
+
+For small-scale experiments, derive a subset of an existing archive instead of
+regenerating from the environment:
+
+```bash
+D:\Anaconda\envs\rl_fhss\python.exe subset_offline_replay.py outputs/offline_replay/replay_5000_100_hoprate_v3.npz --count 1000 --output outputs/offline_replay/replay_1000.npz
+D:\Anaconda\envs\rl_fhss\python.exe subset_offline_replay.py <input.npz> --count 1000 --shuffle --seed 0 --output <output.npz>
+```
+
+The subset tool preserves the source metadata and appends `subset_source` and
+`subset_indices` fields, so provenance of a derived archive stays traceable.
 
 Formats v1 and v2 modeled each block as a separate transition with a
 `block_idx`. They cannot represent the ten-head step transition and are

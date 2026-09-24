@@ -1,47 +1,83 @@
 """
-Derivative-based Noisy Binary Search for Hoprate Adjustment
-============================================================
+基于导数指标的噪声二分搜索（Derivative NBS）——跳速搜索核心算法
+================================================================
 
-A variation of the Multiplicative Weights Update (MWU) noisy binary search
-algorithm that uses the *derivative* (rate of change) metric based on BER
-and hoprate, instead of simple BER increase/decrease, to make directional decisions.
+实现 DerivativeNoisyBinarySearch：基于 MWU（乘性权重更新，Multiplicative
+Weights Update）的噪声二分搜索算法的"导数"变体。与已删除的基础版 NBS
+（noisy_binary_search.py）用"BER 升/降"这一二元信号做方向决策不同，
+本变体改用基于 BER 与 hoprate 的*导数*（变化率）指标决定移动方向。
 
-Core idea: instead of using a binary "BER went up/down" signal, we calculate:
+研究背景
+--------
+FHSS 对抗反应式干扰机时，干扰机需要时间锁定当前跳频信道：跳频太慢
+（低 hoprate）时干扰机能跟上并压制通信（高 BER）；跳得足够快（高
+hoprate）时干扰机跟不上（低 BER）。BER–hoprate 关系因此近似阈值型
+单调下降，"找跳速阈值"可建模为一维有序候选集上的带噪搜索——正是
+noisy binary search 的适用场景，MWU 权重分布扮演"阈值在哪"的后验
+信念。
+
+MWU 框架
+--------
+维护候选 hoprate 网格上的权重 w（初始均匀、和为 1）。每轮：
+  1. 以加权中位数（带随机化，论文 Algorithm 3.1）选择查询 hoprate；
+  2. 环境执行后返回该 hoprate 下的 BER 观测；
+  3. 由观测推导方向答案（目标在查询点左侧 / 右侧）；
+  4. 与答案兼容的候选权重 ×2(1−p)，不兼容的 ×2p（p 为假定的答案噪声
+     概率，0 ≤ p < 0.5；只要答案以 > 1/2 的概率正确，兼容侧的期望乘子
+     就占优，权重质量向真值附近指数级集中）；
+  5. 权重归一化回 1。
+收敛判据：max(w) ≥ 1 − δ。收敛后可用 MAP（最大权重网格点）或加权平均
+两种方式给出阈值估计。
+
+导数指标与参考点选择的原因
+--------------------------
+核心想法：不用"BER 升了/降了"的二元信号，而是计算
 
     metric = ΔBER_percent / Δhoprate
 
-Where the deltas are taken between the *current* observation and the most recent
-*prior* observation whose hoprate was **different** from the current one:
+其中 Δ 的参考点不是"上一步"，而是最近一次与当前 hoprate **不同**的
+先验观测：
 
-  - ΔBER_percent = (current_BER - reference_BER) × 100
-    (BER change in percentage points, e.g., 0.1 → 0.02 gives ΔBER_percent = -8)
-  - Δhoprate = current_hoprate - reference_hoprate
+  - ΔBER_percent = (BER_curr − BER_ref) × 100
+    （BER 变化的百分点数，例如 0.1 → 0.02 对应 ΔBER_percent = −8）
+  - Δhoprate = hoprate_curr − hoprate_ref
 
-Comparing against the immediately previous step is meaningless when the hoprate
-has not changed (Δhoprate = 0).  Instead we keep a small history and always
-compute the gradient against the last observation taken at a *different* hoprate.
-For example, given (500 Hz, 0.20), (520 Hz, 0.15), (520 Hz, 0.16), the third step
-uses the first step as its reference: ΔBER% = (0.16 − 0.20)×100, Δhoprate = 20.
+与紧邻的上一步作差在 hoprate 未变化时无意义（Δhoprate = 0，梯度不
+存在），因此保留一小段历史，始终相对"上一个不同 hoprate"的观测计算
+梯度。例如观测序列 (500 Hz, 0.20), (520 Hz, 0.15), (520 Hz, 0.16)，
+第三步以第一步为参考：ΔBER% = (0.16 − 0.20)×100，Δhoprate = 20。
 
-History is pruned to at most two records — the latest observation and the most
-recent different-hoprate observation — because once a different-hoprate reference
-exists, any earlier (and even earlier same-hoprate) records are unnecessary.
+历史最多裁剪为两条记录——最新观测 + 最近一个不同 hoprate 的观测——
+因为一旦存在不同 hoprate 的参考点，更早的记录（含更早的同 hoprate
+记录）都不再需要。
 
-Decision rule (configurable threshold, default -0.002):
+方向决策规则（阈值可配置：类默认 -0.002，settings.NBS_CONFIG 与入口
+脚本 CLI 默认 -0.005）：
 
-  metric > threshold   →  answer = "target is to the LEFT"
-                          → h ≤ h_curr compatible  →  w × 2(1−p)
-                          → h > h_curr incompatible →  w × 2p
+    metric > threshold → 答案 = "目标在左侧（LEFT）"
+                          → h < h_curr 兼容    → w × 2(1−p)
+                          → h ≥ h_curr 不兼容  → w × 2p
+    metric ≤ threshold → 答案 = "目标在右侧（RIGHT）"
+                          → h ≥ h_curr 兼容    → w × 2(1−p)
+                          → h < h_curr 不兼容  → w × 2p
 
-  metric ≤ threshold   →  answer = "target is to the RIGHT"
-                          → h ≥ h_curr compatible  →  w × 2(1−p)
-                          → h < h_curr incompatible →  w × 2p
+  （分裂点 h_curr 的归属：LEFT 答案下查询点自身划为不兼容、RIGHT 答案
+   下划为兼容，与 _apply_metric 的 favoured 掩码一致。）
 
-Because the reference always has a different hoprate than the current
-observation, Δhoprate is never 0 and no division-by-zero fallback is needed.
+由于参考点的 hoprate 恒与当前观测不同，Δhoprate 永不为 0，无需任何
+除零兜底（基础版曾需为 Δhoprate == 0 设计兜底，本变体从参考点机制上
+结构性避免了该情形）。
 
-The rest of the algorithm (weight normalisation, weighted-median query
-selection, convergence criterion) is identical to the original implementation.
+其余部分（权重归一化、加权中位数查询选择、收敛判据）与原始实现完全
+一致。
+
+参考论文
+--------
+Dereniowski et al., "Noisy (Binary) Searching: Simple, Fast and Correct"
+(STACS 2025)。查询选择与 MWU 更新对应论文中的 Algorithm 3.1。
+
+配置入口：settings.NBS_CONFIG（p / delta / hoprate_step /
+derivative_threshold 的项目级默认值）。
 """
 
 import numpy as np
@@ -52,32 +88,68 @@ import settings
 
 class DerivativeNoisyBinarySearch:
     """
-    Derivative-based noisy binary search over a hoprate range [hoprate_min, hoprate_max].
+    在区间 [hoprate_min, hoprate_max] 上做基于导数指标的噪声二分搜索，
+    用于定位反应式干扰机的跳速跟踪阈值。
 
-    Uses Δhoprate / ΔBER derivative instead of simple BER comparison to make
-    directional decisions.  The derivative is always computed against the most
-    recent prior observation taken at a *different* hoprate (not necessarily the
-    immediately previous step).
+    设计意图
+    --------
+    把"寻找跳速阈值"建模为带噪一维搜索：候选 hoprate 构成有序网格，
+    MWU 维护网格上的权重分布（对"阈值位置"的信念）；每轮用加权中位数
+    选查询点，用 ΔBER%/Δhoprate 导数指标（而非单纯 BER 升降）推导方向
+    答案并更新权重，使分布逐步集中到阈值附近。导数恒相对最近一次
+    *不同* hoprate 的观测计算（不一定是紧邻的上一步）。
+
+    与已删除的基础版 NBS 的区别：方向答案来自导数指标，且梯度参考点
+    取"最近一次不同 hoprate"的观测（基础版直接比较相邻观测的 BER），
+    因此 Δhoprate 恒非零，无需 Δhoprate == 0 的兜底逻辑。
+
+    关键状态
+    --------
+    weights:
+        候选 hoprate 上的权重分布（长度 n_candidates，和为 1）。
+    _current_idx / _current_hoprate:
+        下一个（或刚完成的）环境 step 的查询点，由 _select_hoprate 设置。
+    _obs_hoprate / _obs_ber:
+        最新完成的观测（实际测试的 hoprate 及其 BER）。
+    _ref_hoprate / _ref_ber:
+        最近一次 hoprate 不同于 _obs_hoprate 的观测，即梯度参考点。
+
+    不变量
+    ------
+    1. 对外可见状态中 sum(weights) == 1（step() 末尾必经 _normalize；
+       数值退化全零时回退均匀分布）。
+    2. _ref_hoprate 非 None 时必有 _ref_hoprate != _obs_hoprate，因此
+       _update_weights 中 Δhoprate ≠ 0 恒成立（无需除零保护）。
+    3. 观测历史至多保留两条有效记录——最新观测 + 一个不同 hoprate
+       参考；更早记录在状态转移时被丢弃（见 step 的裁剪逻辑）。
+    4. 所有观测的 hoprate 都是网格点（形如 hoprate_min + k·hoprate_step）；
+       外部传入值由 seed_observation 吸附到最近网格点。
 
     Parameters
     ----------
     hoprate_min : float
-        Minimum candidate hoprate (Hz).
+        候选 hoprate 下限（Hz）。
     hoprate_max : float
-        Maximum candidate hoprate (Hz).
+        候选 hoprate 上限（Hz）。
     hoprate_step : float
-        Discretisation step (Hz).  Default 10 — matches ``_apply_hoprate``.
+        离散步长（Hz）。默认 10，与环境 _apply_hoprate 的 10 Hz 量化
+        一致——NBS 提议的网格点不会被环境侧二次取整。
     p : float
-        Assumed noise probability, 0 ≤ p < 0.5.  Smaller p → faster convergence
-        but less tolerance to noisy BER readings.
+        假定的答案噪声概率，0 ≤ p < 0.5。p 越小收敛越快，但对 BER
+        读数噪声的容忍度越低。
     delta : float
-        Confidence / convergence threshold, 0 < δ ≤ 1.  When the maximum weight
-        reaches 1 − δ the algorithm reports convergence.
+        置信 / 收敛阈值，0 < δ ≤ 1。最大权重达到 1 − δ 即报告收敛。
     derivative_threshold : float
-        Decision threshold for the derivative metric.  Default -0.002.
-        metric > threshold → LEFT move; metric ≤ threshold → RIGHT move.
+        导数指标的方向决策阈值。类默认 -0.002（settings.NBS_CONFIG
+        与入口脚本 CLI 默认 -0.005）。metric > threshold → 向左移动；
+        metric ≤ threshold → 向右移动。
     seed : int or None
-        RNG seed for reproducible query randomisation.
+        查询随机化 RNG 的种子，用于复现；None 时查询序列不可复现。
+
+    Raises
+    ------
+    ValueError
+        p 不在 [0, 0.5) 或 delta 不在 (0, 1] 时抛出。
     """
 
     def __init__(
@@ -142,12 +214,12 @@ class DerivativeNoisyBinarySearch:
 
     def reset(self) -> float:
         """
-        Reset all internal state and return the initial hoprate to test.
+        重置全部内部状态，并返回初始待测 hoprate。
 
         Returns
         -------
         float
-            The first hoprate selected by the (uniform) weighted median.
+            由（均匀权重的）加权中位数选出的第一个 hoprate。
         """
         self.weights = np.ones(self.n_candidates, dtype=np.float64) / self.n_candidates
         self._current_idx = None
@@ -164,19 +236,18 @@ class DerivativeNoisyBinarySearch:
 
     def seed_observation(self, hoprate: float, ber: float) -> None:
         """
-        Seed the algorithm with an initial (hoprate, BER) observation.
+        用一组初始 (hoprate, BER) 观测为算法播种。
 
-        Use this when the first tested hoprate is chosen externally (not via
-        ``reset()``).  The seeded pair is recorded as the latest observation; if
-        a previous observation exists at a different hoprate it is kept as the
-        reference, so the next ``step()`` can immediately compute a gradient.
+        适用于第一个测试 hoprate 由外部（而非 ``reset()``）选定的场景。
+        播种的观测记录为最新观测；若此前已存在不同 hoprate 的观测，则保留
+        为参考点，使下一次 ``step()`` 能立即计算导数。
 
         Parameters
         ----------
         hoprate : float
-            The hoprate that was actually tested.
+            实际测试过的 hoprate。
         ber : float
-            The mean BER observed at that hoprate.
+            在该 hoprate 上观测到的平均 BER。
         """
         idx = int(np.argmin(np.abs(self.candidates - float(hoprate))))
         h_new = float(self.candidates[idx])
@@ -196,27 +267,24 @@ class DerivativeNoisyBinarySearch:
 
     def step(self, ber: float) -> float:
         """
-        Update weights using the observed BER and return the next hoprate.
+        用观测到的 BER 更新权重，并返回下一个待测 hoprate。
 
-        The BER is compared against the most recent *prior observation at a
-        different hoprate* (the reference) via the derivative metric.  If the
-        hoprate just tested matches the latest stored observation, only that
-        observation's BER is refreshed (the reference is reused).  If the hoprate
-        changed, the previous latest observation becomes the new reference.
+        BER 通过与"最近一次 hoprate 不同的观测"（参考点）比较得到导数指标。
+        若本次测试的 hoprate 与已存最新观测相同，则只刷新该观测的 BER
+        （参考点沿用）；若 hoprate 发生变化，则原最新观测转为新的参考点。
 
-        On the very first call (no prior observation exists) the weights stay
-        uniform and only a new hoprate is selected.  No update is performed until
-        two observations at *different* hoprates have been seen.
+        首次调用（尚无任何历史观测）时权重保持均匀，只选出新 hoprate；
+        在拿到两个 *不同* hoprate 的观测之前不做任何权重更新。
 
         Parameters
         ----------
         ber : float
-            Mean BER observed during the environment step that just finished.
+            刚结束的环境 step 中观测到的平均 BER。
 
         Returns
         -------
         float
-            The hoprate to use for the next environment step.
+            下一个环境 step 使用的 hoprate。
         """
         self._step_count += 1
         ber = float(ber)
@@ -259,23 +327,23 @@ class DerivativeNoisyBinarySearch:
         return self._select_hoprate()
 
     def get_best_hoprate(self) -> float:
-        """Return the hoprate with the highest current weight (MAP estimate)."""
+        """返回当前权重最大的候选 hoprate（MAP 估计）。"""
         return self.candidates[np.argmax(self.weights)]
 
     def get_weighted_average(self) -> float:
-        """Return the weighted-average hoprate (soft estimate)."""
+        """返回按权重加权的平均 hoprate（软估计，对噪声更平滑）。"""
         return float(np.average(self.candidates, weights=self.weights))
 
     def is_converged(self) -> bool:
-        """Return True when max(weight) ≥ 1 − δ."""
+        """最大权重是否 ≥ 1−δ，即是否达到收敛判据。"""
         return bool(np.max(self.weights) >= 1.0 - self.delta)
 
     def get_distribution(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return ``(candidates, weights)`` for diagnostics / plotting."""
+        """返回 ``(candidates, weights)`` 副本，用于诊断输出与绘图。"""
         return self.candidates.copy(), self.weights.copy()
 
     def get_last_derivative(self) -> Optional[float]:
-        """Return the derivative value from the last weight update."""
+        """返回最近一次权重更新使用的导数值（未更新过则为 None）。"""
         return self._last_derivative
 
     # ------------------------------------------------------------------
@@ -300,11 +368,11 @@ class DerivativeNoisyBinarySearch:
 
     def _select_hoprate(self) -> float:
         """
-        Weighted-median query selection with randomisation (paper Algorithm 3.1).
+        带随机化的加权中位数查询选择（论文 Algorithm 3.1）。
 
-        1. Find index *k* s.t. cumulative weight crosses W/2.
-        2. Randomise between *k* and *k+1* with probability α proportional to
-           the weight imbalance around the median.
+        1. 找到累计权重跨过 W/2 的下标 *k*；
+        2. 在中位数两侧权重不平衡时，按概率 α 在 *k* 与 *k+1* 之间随机选择，
+           以保留噪声二分搜索所需的不确定性。
         """
         total = np.sum(self.weights)
         cumulative = np.cumsum(self.weights)
@@ -336,25 +404,22 @@ class DerivativeNoisyBinarySearch:
     def _update_weights(self, ber_curr: float, ber_ref: float,
                         h_curr: float, h_ref: float) -> None:
         """
-        Apply the MWU weight update using the derivative metric.
+        用导数指标执行一次 MWU 权重更新。
 
-        The gradient is taken between the current observation (``h_curr``,
-        ``ber_curr``) and the most recent prior observation at a *different*
-        hoprate (``h_ref``, ``ber_ref``).  The current hoprate *h_curr* is the
-        query element (split point).  The directional answer is derived from:
+        导数在"当前观测（``h_curr``, ``ber_curr``）"与"最近一次不同 hoprate
+        的观测（``h_ref``, ``ber_ref``）"之间计算；当前 hoprate *h_curr*
+        即查询元素（分裂点）。方向答案由下式导出：
 
             delta_ber_percent = (ber_curr - ber_ref) * 100
-            delta_hoprate     = h_curr - h_ref          (guaranteed != 0)
+            delta_hoprate     = h_curr - h_ref          （保证 != 0）
             metric            = delta_ber_percent / delta_hoprate
 
-            metric > threshold   →  answer = LEFT   →  h ≤ h_curr compatible
-            metric ≤ threshold   →  answer = RIGHT  →  h ≥ h_curr compatible
+            metric > threshold   →  answer = LEFT   →  兼容 h ≤ h_curr
+            metric ≤ threshold   →  answer = RIGHT  →  兼容 h ≥ h_curr
 
-        Because ``h_ref`` is always a different hoprate than ``h_curr``,
-        ``delta_hoprate`` is never zero and no clamp is required.
-
-        Compatible weights are multiplied by 2(1−p), incompatible by 2p.
-        The split point is always the current hoprate index.
+        由于 ``h_ref`` 恒为与 ``h_curr`` 不同的 hoprate，``delta_hoprate``
+        不会为零，无需任何 clamp。兼容侧权重乘以 2(1−p)，不兼容侧乘以 2p；
+        分裂点始终取当前 hoprate 的下标。
         """
         curr_idx = self._current_idx
         if curr_idx is None:
@@ -374,12 +439,11 @@ class DerivativeNoisyBinarySearch:
 
     def _force_move(self) -> None:
         """
-        Bootstrap fallback used before any different-hoprate reference exists.
+        在尚无"不同 hoprate 参考点"时的引导性回退。
 
-        With only one hoprate observed so far, no real gradient can be formed.
-        Force a RIGHT move (metric just below the threshold) so the weighted
-        median shifts and a different hoprate is sampled on the next step —
-        matching the original algorithm's behaviour for the Δhoprate == 0 case.
+        此时只观测过一个 hoprate，无法形成真实导数。强制一次 RIGHT 移动
+        （令 metric 略低于阈值），使加权中位数偏移、下一步采样到不同的
+        hoprate——与原算法对 Δhoprate == 0 情形的处理保持一致。
         """
         curr_idx = self._current_idx
         if curr_idx is None:
@@ -392,17 +456,20 @@ class DerivativeNoisyBinarySearch:
         self._apply_metric(self._last_derivative, curr_idx)
 
     def _apply_metric(self, metric: float, curr_idx: int) -> None:
-        """Apply the MWU weight update for a given metric and split point."""
+        """对给定导数 metric 与分裂点执行一次 MWU 权重更新。
+
+        方向决策：``metric > threshold`` 视为"左侧更优"（支持更小 hoprate），
+        否则视为"当前点及右侧更优"；被支持的一半权重乘以 2(1-p)，
+        另一半乘以 2p（p 为假设噪声概率），随后由调用方归一化。
+        """
         indices = np.arange(self.n_candidates)
 
-        # Decision based on threshold
+        # 基于阈值的方向决策
         if metric > self.derivative_threshold:
-            # metric > threshold → answer = LEFT
-            # → left side favoured
+            # metric > threshold → answer = LEFT → 偏向左半区
             favoured = indices < curr_idx
         else:
-            # metric ≤ threshold → answer = RIGHT
-            # → current + right side favoured
+            # metric ≤ threshold → answer = RIGHT → 偏向左半区
             favoured = indices >= curr_idx
 
         n_fav = np.sum(favoured)
@@ -413,12 +480,12 @@ class DerivativeNoisyBinarySearch:
         self.weights[~favoured] *= 2.0 * self.p
 
     def _normalize(self) -> None:
-        """Renormalise weights to sum to 1."""
+        """把权重重新归一化到和为 1；退化时重置为均匀分布。"""
         s = np.sum(self.weights)
         if s > 0:
             self.weights /= s
         else:
-            # Degenerate fallback — reset to uniform
+            # 退化兜底：重置为均匀分布
             self.weights = np.ones(self.n_candidates, dtype=np.float64) / self.n_candidates
 
 
@@ -429,7 +496,7 @@ if __name__ == "__main__":
     def _sim_ber(hoprate: float, optimal: float, max_hr: float,
                  baseline: float = 0.1, scale: float = 0.3,
                  rng: np.random.RandomState = None) -> float:
-        """Simulated noisy BER: lower near *optimal* hoprate."""
+        """模拟含噪 BER：越接近 *optimal* hoprate 越低，并叠加高斯噪声。"""
         dist = abs(hoprate - optimal) / max_hr
         noise = rng.normal(0, 0.02) if rng else 0.0
         return max(0.0, min(1.0, baseline + scale * dist + noise))

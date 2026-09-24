@@ -1,4 +1,47 @@
-"""Baseline training entry point for multi-head offset SAC."""
+"""
+Baseline 训练入口：十头离散 SAC 直接在真实 FHSS 环境上学习 10 维 offsets。
+
+【baseline 语义】
+    本脚本是 offsets-only baseline：与 FHSSQPSKEnv 直接交互，一次 env.step()
+    在环境内部执行 10 个 100 ms 通信 block；动作是 10 维 offset，每维取
+    [0, num_channels-1] 的离散信道索引（叠加在 m-sequence 基础跳频序列上，
+    实际信道 = (基础信道 + offset) % num_channels）；奖励逐 block 计算：
+    base_reward - ber_penalty*BER - hoprate_penalty*hoprate（系数见
+    settings.REWARD_CONFIG）；观测为 100×100 的 PSD waterfall。SAC 的
+    actor/critic 均为十头结构（num_heads = num_blocks = 10），ReplayBuffer
+    以 step 为单位存完整转移（一条 = 10 个 offsets + 10 个 block rewards），
+    梯度更新只用真实交互数据。hoprate 固定为
+    settings.TRAIN_CONFIG["fixed_hoprate"]，不是被学习的动作维。
+
+【与 MBPO 入口（train_mbpo.py）的差异】
+    - 不训练 r_predict_model.StepRewardEnsemble 奖励模型、不做 model
+      rollout，也不维护 model replay；
+    - 离线 replay 的 metadata 校验策略不同：baseline 调用
+      load_replay_into_buffer 时保持 strict_environment_metadata=False
+      （该函数默认值），档案里记录的环境/干扰/奖励配置与当前 settings
+      不一致时只打 warning、不拒绝加载；MBPO 入口显式开启严格模式，
+      不匹配直接抛 ValueError。
+
+【离线 replay 加载行为】
+    在训练循环开始（即首次梯度更新可能发生）之前，从
+    args.offline_replay_path 加载 v3 格式的 .npz 档案（由
+    generate_offline_replay.py 生成，metadata 记录生成时的
+    env/jammer/reward 配置与 observation 形状、block 数等）。加载成功后
+    buffer 立即可采样，第 1 个 step 起就能做梯度更新；传入
+    --offline_replay_path none（或 null/空串，见 parse_optional_replay_path）
+    则跳过加载，纯在线收集，直到 buffer 攒够 batch_size 条才开始更新
+    （日志中显示为 Warmup）。
+
+【输出产物】（均在 --output_dir 下）
+    - <log_file>（默认 training_log.txt）：完整训练日志，含逐 step 的完整
+      hop sequences（仅写文件，不刷控制台）；
+    - figures/：settings.PLOT_CONFIG["figure_save_steps"] 指定的 step 处，
+      保存动作前观测 waterfall（step_XXX_obs.png）与环境逐 block 的 PSD
+      图（step_XXX_block_YY.png）；
+    - reward.png / ber.png / loss.png：训练曲线；
+    - sac_inference.pt：仅含推理权重（actor）的 checkpoint，附带
+      environment metadata，供脱离训练环境的部署/评估加载。
+"""
 
 import argparse
 import os
@@ -17,10 +60,13 @@ from offline_replay import (
 import settings
 
 def setup_logger(log_file):
-    """
-    Configure the root logger (console + file) and a file-only logger for
-    verbose per-step records. Both share a single FileHandler so the full
-    hop sequences land in the same training_log.txt without console spam.
+    """配置日志系统：根 logger 同时输出控制台与文件，hop 序列只写文件。
+
+    返回 ``(logger, hop_logger)``：
+    - ``logger``：根 logger，控制台 + 文件双 handler，用于常规训练日志；
+    - ``hop_logger``（名称 ``fh.hop_sequences``）：关闭 propagate、只挂文件
+      handler，用于逐 step 的完整 10 block × 10 hop 信道序列——避免刷屏，
+      但完整数据仍落在同一个 training_log.txt 里。
     """
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
@@ -44,7 +90,11 @@ def setup_logger(log_file):
 
 
 def log_active_comb_channels(env, logger=None):
-    """Log the two configured comb channel groups once when comb is active."""
+    """comb 干扰激活时，把两组相位信道配置各记录一次（控制台+日志文件）。
+
+    逐 step 日志不重复输出该配置，因此在启动时打印一次便于实验溯源。
+    返回是否实际打印。
+    """
     if not (
         env.enable_sweep
         and env.sweep is not None
@@ -62,21 +112,35 @@ def log_active_comb_channels(env, logger=None):
     return True
 
 def build_agent_and_env(args, env_config=None, jammer_config=None):
+    """构建环境、SAC agent 与 replay buffer（baseline 训练的全部组件）。
+
+    Args:
+        args: 命令行参数（读取 actor_lr/critic_lr/alpha_lr/tau/gamma/replay_size）。
+        env_config: 环境配置；None 时使用 ``settings.ENV_CONFIG``。
+        jammer_config: 干扰机配置；None 时由 FHSSQPSKEnv 使用 settings 默认值。
+
+    Returns:
+        ``(env, agent, buffer, device, n_actions)``；device 固定为 CUDA，
+        n_actions = 信道数（每个 offset 头的离散动作数）。
+
+    说明：目标熵取 ``log(n_actions) * target_entropy_ratio``——离散动作空间
+    用 log(|A|) 作参考尺度，ratio 控制探索强度；num_heads = 环境 block 数。
+    """
     # -------------------------------------------------------------------------
-    # 1. Device Configuration (CUDA only)
+    # 1. 设备配置（仅 CUDA：本入口不做 CPU 回退）
     # -------------------------------------------------------------------------
     device = torch.device("cuda")
     logging.info(f"Training Device: GPU ({torch.cuda.get_device_name(0)})")
 
     # -------------------------------------------------------------------------
-    # 2. Environment Initialization
+    # 2. 环境初始化
     # -------------------------------------------------------------------------
-    # Pass configuration from settings
+    # 配置来自 settings（或调用方显式传入的覆盖副本）
     env_config = settings.ENV_CONFIG if env_config is None else env_config
     env = FHSSQPSKEnv(**env_config, jammer_config=jammer_config)
     log_active_comb_channels(env)
 
-    # Number of discrete actions matches number of channels
+    # 离散动作数 = 信道数
     n_actions = env.num_channels
     num_blocks = env.num_blocks
     logging.info(
@@ -86,9 +150,9 @@ def build_agent_and_env(args, env_config=None, jammer_config=None):
     )
 
     # -------------------------------------------------------------------------
-    # 3. Build SAC Agent
+    # 3. 构建 SAC agent
     # -------------------------------------------------------------------------
-    # Target entropy is typically -dim(A) for continuous, or relative to log(|A|) for discrete
+    # 目标熵：连续动作空间通常取 -dim(A)，离散空间取 log(|A|) 的比例
     target_entropy = np.log(n_actions) * settings.SAC_CONFIG["target_entropy_ratio"]
     
     agent = SAC(
@@ -106,7 +170,7 @@ def build_agent_and_env(args, env_config=None, jammer_config=None):
     )
 
     # -------------------------------------------------------------------------
-    # 4. Replay Buffer
+    # 4. Replay buffer（step-level：一条 = 10 offsets + 10 block rewards）
     # -------------------------------------------------------------------------
     buffer = ReplayBuffer(
         capacity=args.replay_size,
@@ -118,22 +182,31 @@ def build_agent_and_env(args, env_config=None, jammer_config=None):
 
 
 def replay_ready(buffer, batch_size):
-    """Return whether replay contains enough complete steps for one update."""
+    """replay 中的完整 step 数量是否够采样一个 batch（够则开始梯度更新）。"""
     return buffer.size() >= int(batch_size)
 
 
 def train(args):
+    """baseline 训练主流程。
+
+    顺序：建 logger → 建环境/agent/replay → 配置 figure capture →
+    （可选）加载离线 replay → 逐步交互训练 → 落盘曲线与推理 checkpoint。
+
+    每个 step：actor 一次前向采样 10 个 offset → env.step 执行 10 个 block →
+    校验 block reward 一致性并写入 replay → 若 replay 够 batch 则做
+    ``update_iters_per_step`` 次梯度更新 → 记录日志/曲线。
+    """
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = os.path.join(args.output_dir, args.log_file)
     logger, hop_logger = setup_logger(log_path)
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Log file: {log_path}")
 
-    # Build components
+    # 构建训练组件
     env, agent, buffer, device, n_actions = build_agent_and_env(args)
 
     # -------------------------------------------------------------------------
-    # Step-triggered figure saving (obs + per-block PSD)
+    # step 触发的图片保存（动作前观测 + 逐 block PSD）
     # -------------------------------------------------------------------------
     figures_dir = os.path.join(args.output_dir, "figures")
     save_steps = set()
@@ -162,6 +235,8 @@ def train(args):
             args.batch_size,
         )
     else:
+        # baseline 保持 warn-only 兼容行为：metadata 不一致只警告不拒绝
+        # （strict_environment_metadata 使用默认 False）。
         loaded_count, replay_metadata = load_replay_into_buffer(
             args.offline_replay_path,
             buffer,
@@ -182,7 +257,7 @@ def train(args):
             replay_metadata.get("hoprate_mode", "unknown"),
         )
 
-    # Use fixed hoprate for online training, matching the existing experiment.
+    # 在线训练使用固定跳速（与既有实验保持一致），hoprate 不是被学习的动作
     fixed_hoprate = settings.TRAIN_CONFIG["fixed_hoprate"]
 
     logger.info(f"Start Training for 1 episode with {args.steps_per_episode} steps...")
@@ -204,15 +279,15 @@ def train(args):
     
     logger.info(f"--- Episode {episode} Start ---")
 
-    # Main Loop
+    # 主循环
     for step_idx in range(1, args.steps_per_episode + 1):
         step_start_time = time.time()
         
-        # One policy pass samples all ten categorical offset heads.
+        # 一次策略前向同时采样全部十个 categorical offset 头
         offsets = agent.take_action(state_img, fixed_hoprate)
 
-        # Save the pre-action observation (the agent's input state) at
-        # configured steps, before state_img is replaced by env.step().
+        # 在配置的 step 保存"动作前"观测（agent 决策所见的输入状态），
+        # 必须赶在 state_img 被 env.step() 的返回值覆盖之前。
         if step_idx in save_steps:
             save_waterfall_figure(
                 np.asarray(state_img),
@@ -221,20 +296,21 @@ def train(args):
             )
 
         # -------------------------------------------------------
-        # 2. Environment Step
+        # 2. 环境 step
         # -------------------------------------------------------
-        # Execute the sequence of 10 offsets
+        # 一次性执行这 10 个 offset（环境内部对应 10 个 100 ms block）
         next_state_img, reward_total, terminated, truncated, info = env.step(
             {"hoprate": fixed_hoprate, "offsets": offsets}
         )
 
         # -------------------------------------------------------
-        # 3. Reward Calculation & Storage
+        # 3. 奖励校验与写入 replay
         # -------------------------------------------------------
         ber_blocks = info.get("ber_blocks", [])
         block_rewards = np.asarray(info.get("block_rewards", []), dtype=np.float32)
         if block_rewards.shape != (env.num_blocks,):
             raise RuntimeError("Environment returned an invalid block reward vector.")
+        # step reward 必须等于 block reward 均值，否则数据契约被破坏
         if not np.isclose(
             float(reward_total),
             float(np.mean(block_rewards)),
@@ -247,6 +323,8 @@ def train(args):
         mean_step_ber = np.mean(ber_blocks) if len(ber_blocks) > 0 else 0.0
         mean_step_reward = float(reward_total)
         done = bool(terminated or truncated)
+        # 一条 transition = 完整环境 step：10 offsets + 10 block rewards；
+        # next_hoprate 与当前相同（固定跳速），供 critic 构造下一状态输入。
         buffer.add(
             state_img,
             info.get("hoprate_used", fixed_hoprate),
@@ -257,12 +335,12 @@ def train(args):
             done,
         )
 
-        # Move to next state
+        # 推进到下一状态
         state_img = next_state_img
         total_steps += 1
 
         # -------------------------------------------------------
-        # 4. Training Update
+        # 4. 梯度更新
         # -------------------------------------------------------
         train_stats = {}
         if replay_ready(buffer, args.batch_size):
@@ -272,16 +350,16 @@ def train(args):
 
         step_duration = time.time() - step_start_time
         
-        # Logging Data
+        # 曲线记录
         plot_rewards.append(mean_step_reward)
         plot_bers.append(mean_step_ber)
         plot_losses_actor.append(train_stats.get('actor_loss', 0) if train_stats else 0)
         plot_losses_critic.append(train_stats.get('critic1_loss', 0) if train_stats else 0)
 
-        # Actual channels used per block: (base m-sequence + offset) % num_channels
+        # 每个 block 实际使用的首个跳频信道：(基础 m 序列 + offset) % 信道数
         hop_sequences = info.get("hop_sequences", [])
         first_channels = [seq[0] for seq in hop_sequences if len(seq) > 0]
-        # Full hop sequences go to the log file only (10 blocks x 10 hops).
+        # 完整 hop 序列只写日志文件（10 blocks × 10 hops），不刷控制台
         hop_logger.info("Step %d HopSequences: %s", step_idx, hop_sequences)
 
         log_msg = (f"Step {step_idx}/{args.steps_per_episode} | "
@@ -296,6 +374,7 @@ def train(args):
                          f"C={train_stats.get('critic1_loss', 0):.3f}, "
                          f"Alpha={train_stats.get('alpha', 0):.5f}")
         else:
+             # replay 尚未攒够一个 batch，本 step 只采集不更新
              log_msg += f" | Warmup: {buffer.size()}/{args.batch_size}"
         
         log_msg += f" | T: {step_duration:.2f}s"
@@ -306,14 +385,14 @@ def train(args):
             break
 
     # -------------------------------------------------------
-    # End of Episode
+    # Episode 结束
     # -------------------------------------------------------
     ep_duration = time.time() - ep_start_time
     mean_ep_reward = float(np.mean(ep_block_rewards)) if len(ep_block_rewards) > 0 else 0.0
     
     logger.info(f"--- Episode {episode} Finished ---")
 
-    # Plotting
+    # 曲线绘制
     try:
         # 1. Reward
         plt.figure()
@@ -335,7 +414,7 @@ def train(args):
         plt.savefig(os.path.join(args.output_dir, "ber.png"))
         plt.close()
 
-        # 3. Loss (Auto-scaled)
+        # 3. Loss（自动缩放 Y 轴）
         plt.figure()
         plt.plot(plot_losses_actor, label="Actor Loss", alpha=0.7)
         plt.plot(plot_losses_critic, label="Critic Loss", alpha=0.7)
@@ -344,7 +423,7 @@ def train(args):
         plt.legend()
         plt.grid(True)
 
-        # Scale Y-axis to ignore initial spikes
+        # 用 1%~99% 分位数缩放 Y 轴，忽略最初的 loss 尖峰
         skip = max(5, int(len(plot_losses_critic) * 0.05))
         if len(plot_losses_critic) > skip:
             valid_vals = plot_losses_actor[skip:] + plot_losses_critic[skip:]
@@ -360,6 +439,8 @@ def train(args):
     except Exception as e:
         logger.error(f"Plotting failed: {e}")
 
+    # 推理 checkpoint：只存 actor 权重 + 环境维度 + 配置 metadata，
+    # 不含 optimizer/replay/RNG 状态，便于脱离训练环境加载评估。
     checkpoint_metadata = environment_metadata(
         settings.ENV_CONFIG,
         settings.JAMMER_CONFIG,
@@ -388,19 +469,24 @@ def train(args):
 
 
 def parse_args():
+    """解析命令行参数；默认值全部取自 settings.py，便于集中调参。
+
+    ``--offline_replay_path`` 使用 ``parse_optional_replay_path`` 做类型转换，
+    因此可传 ``none``/``null``/空串表示纯在线 warm-up。
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
     parser.add_argument("--output_dir", type=str, default="outputs/offsets/comb/0")
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
-    # Agent Params
+    # Agent 超参
     parser.add_argument("--actor_lr", type=float, default=settings.SAC_CONFIG["actor_lr"])
     parser.add_argument("--critic_lr", type=float, default=settings.SAC_CONFIG["critic_lr"])
     parser.add_argument("--alpha_lr", type=float, default=settings.SAC_CONFIG["alpha_lr"])
     parser.add_argument("--tau", type=float, default=settings.SAC_CONFIG["tau"])
     parser.add_argument("--gamma", type=float, default=settings.SAC_CONFIG["gamma"])
 
-    # Buffer Params
+    # Replay buffer 参数
     parser.add_argument("--replay_size", type=int, default=settings.BUFFER_CONFIG["capacity"])
     parser.add_argument("--batch_size", type=int, default=settings.BUFFER_CONFIG["batch_size"])
     parser.add_argument("--update_iters_per_step", type=int, default=settings.TRAIN_CONFIG["update_iters_per_step"])
@@ -415,6 +501,11 @@ def parse_args():
 
 
 def parse_optional_replay_path(value):
+    """把 ``--offline_replay_path`` 的值转为路径或 None。
+
+    ``none``/``null``/空串（不区分大小写、允许空白）统一解析为 None，
+    表示跳过离线 replay、纯在线收集。
+    """
     if value is None:
         return None
     value = str(value).strip()

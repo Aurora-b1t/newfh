@@ -1,3 +1,21 @@
+"""训练入口辅助逻辑与 FHSS 环境接口的测试。
+
+覆盖内容：
+- 训练入口辅助：纯在线 warm-up 路径、MBPO 入口的 online-only 模式参数、
+  baseline 保存的推理 checkpoint 是否携带完整 metadata；
+- 环境接口：逐 block 奖励公式、预生成路径每个 block 使用全新 AWGN、
+  Rayleigh 衰落逐 hop 独立生成、动态/预生成路径共享同一 block 组装器、
+  comb 信道组仅在激活时记录日志、offset 动作空间为 MultiDiscrete、
+  一次环境 step 恰好对应一条 replay transition；
+- 真实 RF 环境单步冒烟（由 ``FHSS_RUN_ENV_SMOKE=1`` 门控，默认跳过）。
+
+测试策略：CPU 可跑；部分用例用 unittest.mock 与临时目录隔离 I/O。
+
+单独运行（在项目根目录）：
+    python -m pytest tests/test_training_and_env.py -q
+    FHSS_RUN_ENV_SMOKE=1 python -m pytest tests/test_training_and_env.py -q
+"""
+
 import os
 import sys
 import tempfile
@@ -21,6 +39,7 @@ from train_offsets import (
 
 
 class TrainingHelperTests(unittest.TestCase):
+    """训练入口的辅助函数：在线 warm-up、MBPO 参数校验、推理 checkpoint metadata。"""
     def test_online_only_path_and_warmup(self):
         self.assertIsNone(parse_optional_replay_path("none"))
         self.assertIsNone(parse_optional_replay_path(" NULL "))
@@ -129,6 +148,7 @@ class TrainingHelperTests(unittest.TestCase):
 
 
 class EnvironmentInterfaceTests(unittest.TestCase):
+    """环境接口契约：奖励公式、噪声/衰落随机性边界、动作空间与 step↔transition 对应。"""
     @staticmethod
     def make_small_environment(use_pregen, enable_rayleigh):
         return FHSSQPSKEnv(

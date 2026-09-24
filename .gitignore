@@ -1,7 +1,18 @@
-/.vscode
-/__pycache__
+# Python 运行产物
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 训练输出目录（各脚本自带默认 --output_dir，均位于 outputs/ 下）
 /outputs/
+
+# 生成的图片与日志文件
 *.png
 *.txt
-*.pyc
-/.claude/
+
+# 依赖清单例外（requirements.txt 必须入库）
+!requirements.txt
+
+# 本地编辑器 / 工具目录（含机器相关路径，不随仓库移交）
+/.vscode
+/.claude

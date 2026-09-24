@@ -1,3 +1,19 @@
+"""SAC ReplayBuffer 与 v3 离线 replay 序列化/校验的单元测试。
+
+覆盖内容：
+- ``SAC.ReplayBuffer`` 的 step-level 契约与输入校验：一条 add 存一个完整
+  step；非法动作/奖励形状、观测形状漂移、非有限值均被拒绝；
+- ``offline_replay`` 的 v3 往返（save→load 数值一致）、v2 旧格式拒绝、
+  step_reward 与 block_rewards 均值不一致的拒绝、动作越界与 head 形状
+  校验、以及 ``strict_environment_metadata`` 的三种行为（默认拒绝不匹配、
+  匹配快照放行、显式允许覆盖）。
+
+测试策略：纯 CPU 单元测试，用 tempfile 写临时 .npz，无 GPU/环境变量门控。
+
+单独运行（在项目根目录）：
+    python -m pytest tests/test_offline_replay.py -q
+"""
+
 import json
 import os
 import tempfile
@@ -31,6 +47,7 @@ def make_buffer(count=2, capacity=8):
 
 
 class ReplayBufferTests(unittest.TestCase):
+    """``SAC.ReplayBuffer`` 的 step-level 存储契约与输入校验。"""
     def test_one_add_stores_one_complete_step(self):
         buffer = make_buffer(count=1)
         sample = buffer.sample(1)
@@ -52,7 +69,7 @@ class ReplayBufferTests(unittest.TestCase):
             buffer.add(state, 100, np.zeros(9), np.zeros(10), state, 100, False)
         with self.assertRaisesRegex(ValueError, "block_rewards must have shape"):
             buffer.add(state, 100, np.zeros(10), np.zeros(9), state, 100, False)
-        with self.assertRaisesRegex(ValueError, "\[0, 19\]"):
+        with self.assertRaisesRegex(ValueError, r"\[0, 19\]"):
             buffer.add(
                 state,
                 100,
@@ -93,6 +110,7 @@ class ReplayBufferTests(unittest.TestCase):
 
 
 class OfflineReplayTests(unittest.TestCase):
+    """v3 replay 的序列化往返、格式/形状校验与 metadata 严格性策略。"""
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tempdir.name, "replay_v3.npz")
@@ -132,7 +150,7 @@ class OfflineReplayTests(unittest.TestCase):
         contents["step_rewards"] = contents["step_rewards"] + 1.0
         np.savez_compressed(self.path, **contents)
 
-        with self.assertRaisesRegex(ValueError, "mean\(block_rewards\)"):
+        with self.assertRaisesRegex(ValueError, r"mean\(block_rewards\)"):
             load_replay_into_buffer(self.path, ReplayBuffer(8, 10, 20))
 
     def test_rejects_invalid_offline_action_range(self):

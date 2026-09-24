@@ -1,3 +1,28 @@
+"""MBPO 奖励模型、replay 适配层与 checkpoint 的测试（本套件最大的一组）。
+
+覆盖内容：
+- ``StepRewardEnsemble``：矩阵成员参数相互独立且共用一个优化器、两层 CNN
+  + 单层 fusion 的结构约定、任意 batch size 的拟合、动态 head 数的
+  fit/predict/sample、动作越界拒绝、checkpoint 往返与旧版本（v1/v2/错误
+  架构）拒绝、每条合成向量只用一个 elite、极端潜变量采样仍落在 reward
+  边界内、目标饱和只发生在奖励模型侧、逐成员 holdout/train 曲线记录、
+  每次 fit 从头重训、数据集缓存到训练设备；
+- ``mbpo_adapter``：DataLoader 向量化批、FIFO 淘汰跟踪、混合采样比例与
+  批数、SAC 接受 DataLoader 张量批、TensorDataset 驱动完整 fit、混合批
+  的完整性/回退到真实 replay、rollout 的有界奖励与真实后继复制、越界
+  奖励拒绝、model replay 的 FIFO 累积与淘汰、reward 边界对惩罚符号与
+  动态 hoprate 惩罚的支持、零 ber_penalty 的拒绝；
+- 曲线输出：每次 fit 的 PNG 与 npz 产物；
+- 训练调度与 checkpoint：奖励模型训练计划基于 step 后计数、SAC policy
+  checkpoint 往返与 BatchNorm v1 / v2 及错误架构的拒绝。
+
+测试策略：以 CPU 小尺寸模型为主，使用 FixedAgent/FixedRewardModel 替身
+与 tempfile 隔离 I/O，无环境变量门控。
+
+单独运行（在项目根目录）：
+    python -m pytest tests/test_mbpo.py -q
+"""
+
 import copy
 import logging
 import math
@@ -63,6 +88,7 @@ def make_buffer(count=4, num_heads=3, n_actions=4, reward_value=0.0):
 
 
 class FixedAgent:
+    """输出固定动作的 SAC agent 替身，用于训练循环与调度测试。"""
     def __init__(self, actions):
         self.actions = np.asarray(actions, dtype=np.int64)
 
@@ -71,6 +97,7 @@ class FixedAgent:
 
 
 class FixedRewardModel:
+    """返回固定有界奖励的奖励模型替身，用于混合采样与 rollout 测试。"""
     def __init__(self, rewards, n_actions=4):
         self.rewards = np.asarray(rewards, dtype=np.float32)
         self.num_heads = len(self.rewards)
@@ -87,6 +114,7 @@ class FixedRewardModel:
 
 
 class StepRewardEnsembleTests(unittest.TestCase):
+    """矩阵式奖励 ensemble：结构约定、拟合/采样、reward 边界与 checkpoint 版本。"""
     def setUp(self):
         self.rng = np.random.default_rng(12)
         self.states = self.rng.normal(size=(8, 8, 8)).astype(np.float32)
@@ -479,6 +507,7 @@ class StepRewardEnsembleTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    """mbpo_adapter：DataLoader 批适配、real_ratio 混合、rollout 构造与 FIFO 淘汰。"""
     def test_replay_dataloader_returns_vectorized_batches(self):
         buffer = make_buffer(count=4, num_heads=3, n_actions=4)
         loader = DataLoader(
@@ -757,6 +786,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(4, stats["train_size"] + stats["holdout_size"])
 
 class HoldoutCurveOutputTests(unittest.TestCase):
+    """每次奖励模型拟合的 holdout 曲线产物：单次 PNG 与汇总 NPZ 的字段/形状。"""
     def test_per_fit_figure_and_npz_outputs(self):
         logger = logging.getLogger("test_holdout_curve_outputs")
         curves = [[0.5, 0.4, 0.3], [0.6, 0.55]]
@@ -781,6 +811,7 @@ class HoldoutCurveOutputTests(unittest.TestCase):
 
 
 class TrainCurveOutputTests(unittest.TestCase):
+    """每次奖励模型拟合的训练曲线产物：单次 PNG 与汇总 NPZ 的字段/形状。"""
     def test_per_fit_figure_and_npz_outputs(self):
         logger = logging.getLogger("test_train_curve_outputs")
         curves = [[0.5, 0.4, 0.3], [0.6, 0.55]]
@@ -805,6 +836,7 @@ class TrainCurveOutputTests(unittest.TestCase):
 
 
 class TrainingAndCheckpointTests(unittest.TestCase):
+    """奖励模型训练调度（step 后计数）与 SAC policy checkpoint 的往返/旧版拒绝。"""
     def test_reward_model_schedule_uses_post_step_count(self):
         buffer = ReplayBuffer(4, num_heads=3, n_actions=4)
         self.assertFalse(reward_model_ready(buffer, 2))

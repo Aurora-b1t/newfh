@@ -1,3 +1,20 @@
+"""环境加速路径的正确性与可复现性测试。
+
+覆盖内容：
+- 批量 PSD 计算与逐帧循环结果一致，且复用同一 plan；
+- FHSS 载波缓存（carrier cache）在所有 hoprate 下与直接公式一致、无内存上限配置；
+- 干扰机载波缓存：comb/sweep 跨周期与直接公式一致、both 模式的取样顺序
+  （先 comb 后 sweep）、动态噪声切片可复现且统计上相互独立；
+- 并行路径：串行与线程池执行结果与调度无关、Rayleigh/反应式开关保持
+  确定性、worker 参数校验与 pickle 生命周期；
+- 随机子流：bits/AWGN/Rayleigh 子流相互独立且尺度正确。
+
+测试策略：纯 CPU 单元测试；部分用例用 mock 替换噪声源以固定随机性。
+
+单独运行（在项目根目录）：
+    python -m pytest tests/test_env_acceleration.py -q
+"""
+
 import pickle
 import unittest
 from unittest import mock
@@ -196,6 +213,7 @@ def direct_sweep(jammer, baseband, start_sample_idx, start_frequency, end_freque
 
 
 class BatchedPsdTests(unittest.TestCase):
+    """批量 PSD waterfall 计算与逐帧循环的数值一致性及 plan 复用。"""
     def test_batched_psd_matches_frame_loop_and_reuses_plan(self):
         signal = np.random.RandomState(91).standard_normal(1_234)
         kwargs = dict(
@@ -217,6 +235,7 @@ class BatchedPsdTests(unittest.TestCase):
 
 
 class CarrierCacheTests(unittest.TestCase):
+    """FHSS 载波模板缓存：全 hoprate 范围与直接公式一致，且不受内存上限限制。"""
     def test_cached_fhss_carriers_match_direct_formula_at_all_hoprates(self):
         env = make_acceleration_env(
             use_pregen=False,
@@ -296,6 +315,7 @@ class CarrierCacheTests(unittest.TestCase):
 
 
 class JammerCarrierCacheTests(unittest.TestCase):
+    """干扰机载波缓存：comb/sweep 跨周期一致性、both 取样顺序与动态噪声切片随机性。"""
     def make_jammer(self, mode="both", noise_source=None):
         config = acceleration_jammer_config(mode)
         return IndiscriminateJammer(
@@ -388,6 +408,7 @@ class JammerCarrierCacheTests(unittest.TestCase):
 
 
 class ParallelEnvironmentTests(unittest.TestCase):
+    """block 并行执行：串行/线程池结果与调度无关、确定性开关、worker 与 pickle 生命周期。"""
     def assert_step_equal(self, serial_result, threaded_result):
         np.testing.assert_array_equal(serial_result[0], threaded_result[0])
         self.assertEqual(serial_result[1:], threaded_result[1:])
@@ -509,6 +530,7 @@ class ParallelEnvironmentTests(unittest.TestCase):
 
 
 class RandomSubstreamTests(unittest.TestCase):
+    """随机子流独立性：bits/AWGN/Rayleigh 子流互不相关且统计尺度正确。"""
     def test_bits_awgn_and_rayleigh_substreams_are_independent_and_well_scaled(self):
         env = make_acceleration_env(
             use_pregen=False,

@@ -1,4 +1,20 @@
-"""Profile one step-level reward-model fit on a prepared replay archive."""
+"""奖励模型单次拟合的性能剖析基准（在准备好的 replay 档案上）。
+
+用途：用 `StepRewardEnsemble.fit()` 对一份 v3 replay 做完整拟合，输出
+墙钟耗时、逐 epoch 数、holdout 损失与 CUDA 峰值显存（JSON 一行），
+用于对比不同精度（float32/bfloat16）、fast-math、torch.compile、
+batch size 等运行时开关的性能收益。
+
+说明：
+- 需要 CUDA（模型 device 固定 "cuda"）；
+- `--repeat` 可重复拟合多次（每次都从头重拟合），耗时统计取整体墙钟，
+  单次统计取最后一次的返回值；
+- 档案需包含 state_imgs / hoprates / actions / block_rewards 四个键。
+
+用法（项目根目录或 benchmarks/ 下均可）::
+
+    python benchmarks/benchmark_reward_fit.py --replay outputs/offline_replay/replay_5000_100_hoprate_v3.npz --precision bfloat16 --fast-math --compile
+"""
 
 import argparse
 import json
@@ -19,6 +35,13 @@ from r_predict_model import StepRewardEnsemble  # noqa: E402
 
 
 def load_reward_fields(path):
+    """从 v3 replay ``.npz`` 读出奖励模型需要的四个字段。
+
+    Returns:
+        ``(state_imgs, hoprates, actions, block_rewards, state_shape, action_shape)``；
+        前四项转为逐条 Python 列表（fit 接口按样本序列消费），后两项为
+        原始数组形状（用于回填 num_heads / n_actions 与结果记录）。
+    """
     with np.load(path) as payload:
         state_imgs = np.asarray(payload["state_imgs"], dtype=np.float32)
         hoprates = np.asarray(payload["hoprates"], dtype=np.float32)
@@ -35,6 +58,7 @@ def load_reward_fields(path):
 
 
 def main():
+    """解析参数 → 构建奖励模型 → 计时拟合 → 打印 JSON 性能报告。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay", required=True)
     parser.add_argument("--epochs", type=int, default=None)
@@ -58,11 +82,11 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        # set_random_seeds() enables deterministic cuDNN, which disables
-        # benchmark mode entirely; clear it so the benchmark measures real
-        # fast-math kernel speed.
+        # set_random_seeds() 打开了 deterministic cuDNN，这会禁用 benchmark
+        # 模式；此处显式清除，让基准测到真实的 fast-math 内核速度。
         torch.backends.cudnn.deterministic = False
         torch.set_float32_matmul_precision("high")
+    # 未显式指定的参数回落到 settings.MBPO_CONFIG，保证与训练配置同源
     batch_size = args.batch_size or settings.MBPO_CONFIG["model_train_batch_size"]
     max_epochs = args.epochs or settings.MBPO_CONFIG["max_epochs"]
     patience = (
@@ -109,6 +133,7 @@ def main():
         )
         all_stats.append(stats)
     if torch.cuda.is_available():
+        # 同步后再读墙钟，避免把异步 kernel 的时间漏算
         torch.cuda.synchronize()
     stats = all_stats[-1]
     wall_end = time.perf_counter()

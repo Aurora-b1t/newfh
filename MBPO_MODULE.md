@@ -51,7 +51,7 @@ dones            [B]
 - state fusion 与 state-action fusion（各一层）；
 - 十维 Logistic-Normal latent mean/log-variance 输出。
 
-共享 state encoder 的固定结构为：PSD 分支 `Conv 1→16 + GN4 + ReLU → Conv 16→32 + GN8 + ReLU → Pool → FC512 + ReLU`；连续 hoprate 归一化后经过一层 `1→64` ReLU MLP；两者拼接后经过一层 `576→256` ReLU fusion。随后完整 offsets one-hot 先编码到 `hidden_size`，再与 256 维 state 特征进入一层同宽 SiLU state-action fusion，最后接 latent mean/log-variance 输出头。100×100 PSD 下单个成员约 2097 万参数（五成员矩阵共约 1.05 亿参数）。
+共享 state encoder 的固定结构为：PSD 分支 `Conv 1→16 + GN4 + ReLU → Conv 16→32 + GN8 + ReLU → Pool → FC512 + ReLU`；连续 hoprate 归一化后经过一层 `1→64` ReLU MLP；两者拼接后经过一层 `576→256` ReLU fusion。随后完整 offsets one-hot 先编码到 `hidden_size`，再与 256 维 state 特征进入一层同宽 SiLU state-action fusion，最后接 latent mean/log-variance 输出头。100×100 PSD 下单个成员约 4125 万参数（五成员矩阵共约 2.06 亿参数）；开启 `model_extra_pool` 后每成员约 1053 万、总计约 5260 万。
 
 训练和推理都按成员维整体并行，不再逐成员循环。每个成员在潜变量空间输出对角高斯分布。训练 reward 先按每条样本的 hoprate 和 `BER∈[0,0.5]` 推导边界，超界目标仅在奖励模型内部饱和，再归一化、避开 sigmoid 端点并做 logit 变换。训练损失为全体成员的 latent Gaussian NLL 均值；holdout 排名则在真实 reward 单位下比较 sigmoid 有界预测与有界目标的平均 MSE。
 
@@ -69,13 +69,13 @@ dones            [B]
 8. 按最终 holdout MSE 排序选择 elite。
 9. 记录每个成员在本次拟合内逐 epoch 的 holdout MSE 曲线（含训练前的初始评估作为 epoch 0）；全部曲线以 NaN 填充对齐后汇总到 `holdout_curves.npz`。传入 `--save_model_curve_figures` 时才额外为每次拟合保存独立 PNG（`holdout_curves/holdout_step_XXXX.png`）。不再生成跨 step 的 holdout 汇总曲线。全体成员的 `epochs` 相同。
 
-即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认每 10 个在线 step 对全部真实 replay 重训一次，可通过 `--model_train_freq` 调整。对 20,000 条 100×100 transition 而言仍有较高成本；每次 fit 使用标准 `TensorDataset` 和 `DataLoader`，可选择在 fit 开始时把整批 reward-model 数据放到训练设备；模型权重和 Adam 状态仍在每次 fit 开始时重新初始化。资源不足时可使用 `--no-cache_model_dataset`。
+即使预载了离线 replay，也不会在第一个在线 step 前单独初训。默认每 1 个在线 step（`model_train_freq=1`）对全部真实 replay 重训一次，可通过 `--model_train_freq` 调大以降低频率。对 20,000 条 100×100 transition 而言仍有较高成本；每次 fit 使用标准 `TensorDataset` 和 `DataLoader`，并在 fit 开始时把整批 reward-model 数据放到训练设备；模型权重和 Adam 状态仍在每次 fit 开始时重新初始化。
 
 在 CUDA 服务器上，`train_mbpo.py` 支持不改变训练预算的运行时优化选项：
 
 - `--model_compile`：复用 `torch.compile` 的矩阵 ensemble 图；首次 fit 有编译开销，后续 fit 更快。
 - `--model_precision bfloat16` 或 `float16`：启用 reward-model autocast；需要用 holdout 和最终策略结果验证数值容差。
-- `--model_fast_math`：启用 TF32 和 cuDNN autotuning；可能改变收敛轨迹，默认关闭。
+- `--model_fast_math`：启用 TF32 和 cuDNN autotuning；可能改变收敛轨迹，默认开启。
 
 训练数据现在统一通过 PyTorch 标准 `TensorDataset` 和 `DataLoader` 处理。reward-model 使用标准 train/holdout 子集；SAC 为 real replay 和 model replay 分别创建 loader，再按两侧 batch size 拼接，因此每个 batch 仍保持目标真实样本比例。A800 CUDA 路径默认 `num_workers=0`；CPU snapshot 可使用 `--data_loader_workers` 和 `--data_loader_pin_memory`。
 
@@ -139,22 +139,21 @@ MBPO 只接受 v3 step-level replay。默认严格比较以下 metadata：
 | `hidden_size` | 200 | action/fusion MLP 宽度 |
 | `learning_rate` | 1e-3 | 奖励模型学习率 |
 | `weight_decay` | 1e-5 | 奖励模型权重衰减 |
-| `batch_size` | 2048 | SAC 混合 replay batch |
-| `model_train_freq` | 10 | 每隔多少真实环境 step 全量继续拟合 |
-| `model_train_batch_size` | 2048 | 模型训练 batch 及在线 warm-up 门槛 |
+| `batch_size` | 256 | SAC 混合 replay batch |
+| `model_train_freq` | 1 | 每隔多少真实环境 step 全量继续拟合 |
+| `model_train_batch_size` | 512 | 模型训练 batch 及在线 warm-up 门槛 |
 | `holdout_ratio` | 0.2 | holdout 比例 |
-| `early_stop_patience` | 5 | 全局早停 patience（以最优成员为准） |
-| `max_epochs` | 100 | 单次全量拟合最大 epoch |
+| `early_stop_patience` | 10 | 全局早停 patience（以最优成员为准） |
+| `max_epochs` | 150 | 单次全量拟合最大 epoch |
 | `min_improvement` | 0.01 | 最优成员 holdout 相对改善阈值 |
-| `rollout_batch_size` | 2048 | 每次生成的最大合成 step 数 |
+| `rollout_batch_size` | 1024 | 每次生成的最大合成 step 数 |
 | `rollout_length` | 1 | 固定为一步 |
 | `real_ratio` | 0.2 | SAC batch 中真实样本目标比例 |
 | `model_replay_size` | 4000 | 合成 replay FIFO 容量 |
-| `cache_dataset_on_device` | true | 是否在 fit 开始时把 reward-model TensorDataset 放到训练设备 |
 | `data_loader_workers` | 0 | 标准 DataLoader worker 数；CUDA TensorDataset 时必须为 0 |
 | `data_loader_pin_memory` | false | CPU TensorDataset 是否固定 DataLoader batch |
-| `model_precision` | float32 | reward-model 运行精度，不改变训练预算 |
-| `model_compile` | false | 是否复用 `torch.compile` 图 |
+| `model_precision` | bfloat16 | reward-model 运行精度，不改变训练预算 |
+| `model_compile` | true | 是否复用 `torch.compile` 图 |
 | `model_fast_math` | true | 是否启用 TF32/cuDNN autotuning |
 | `save_curve_figures` | true | 是否每次拟合额外写入两张 PNG 曲线图 |
 
@@ -208,9 +207,9 @@ figures/
 
 1. 这不是完整 dynamics MBPO，无法在模型内部递推 PSD 状态。
 2. 合成 next state 来自真实 replay，依赖 observation transition 与 action 无关的环境假设。
-3. 每次 reward-model fit 仍然从头全量训练矩阵 ensemble，单次计算成本很高；默认每 10 个环境 step fit 一次，并行更新会同时持有全部成员的激活，峰值显存约为逐成员训练的 `num_networks` 倍。
+3. 每次 reward-model fit 仍然从头全量训练矩阵 ensemble，单次计算成本很高；默认每 1 个环境 step fit 一次（`--model_train_freq` 可调大），并行更新会同时持有全部成员的激活，峰值显存约为逐成员训练的 `num_networks` 倍。
 4. ensemble 继续使用每次拟合时重新随机划分的公共 holdout，且全体成员遍历同一训练集和同一批序；holdout 与分歧可能偏乐观，成员多样性仅来自随机初始化。
 5. 低 `real_ratio` 会放大奖励模型偏差；需结合 holdout、disagreement 和目标饱和率诊断。
 6. 当前完整动作编码保留跨 block 表达能力，但 factorized SAC 在 reactive 模式下无法完整表示任意跨 block action 耦合。
-7. v1/v2 block-level replay、SAC inference v1/v2 与 reward-model v1 checkpoint 均不兼容；旧模型必须重新训练，但现有 step-level v3 replay 可继续使用。
+7. v1/v2 block-level replay、SAC inference v1/v2/v3 与 reward-model v1/v2 checkpoint 均不兼容；旧模型必须重新训练，但现有 step-level v3 replay 可继续使用。
 8. 持续 FIFO 会在奖励模型版本切换后保留一段旧合成经验；若模型非平稳性很强，需要结合容量、rollout 频率和 `real_ratio` 调节其滞后程度。

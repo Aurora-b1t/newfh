@@ -1,3 +1,24 @@
+"""干扰机时序语义测试：comb 相位切换、sweep 周期与反应式时隙。
+
+覆盖内容：
+- comb ``switch_interval`` 必须为 1 ms 的正整数倍（含 73 ms 在生产采样率
+  下的精确性），非法值被拒绝；
+- 预生成只缓存激活的自然周期；comb 切片在毫秒边界硬切换并可跨多个周期
+  回绕；sweep 切片支持多次回绕；both 模式叠加两路独立周期信号；
+- 变体池/选择器语义：变体数量校验、独立 float32 行、reset 后选择流可重放、
+  sweep 每完整周期选一个变体、comb 两个相位共用同一变体且基带连续、
+  reactive 每个压制时隙抽取一个变体；
+- 环境级行为：1 ms 量化、相同带宽共享变体池、不同带宽独立池、非法变体
+  数量报错、预生成观测用全新噪声重算、reset 重放变体选择、动态/预生成
+  路径的 comb phase 槽位一致、comb 未激活时 ``comb_phases`` 为空。
+
+测试策略：纯 CPU；用轻量替身（ConstantNoise/ArrayVariantPool/
+MappingSelector）替代真实噪声与变体池，聚焦时序逻辑本身。
+
+单独运行（在项目根目录）：
+    python -m pytest tests/test_jammer_timing.py -q
+"""
+
 import unittest
 from unittest import mock
 
@@ -14,11 +35,13 @@ from jammers import (
 
 
 class ConstantNoise:
+    """恒定噪声源替身：让干扰机时序断言可以解析地预期。"""
     def get_noise(self, num_samples):
         return np.ones(num_samples, dtype=np.float32)
 
 
 class ArrayVariantPool:
+    """用固定数组行充当变体池的替身，便于断言实际选中了哪个变体。"""
     def __init__(self, bandwidth, variants):
         self.bandwidth = float(bandwidth)
         self.variants = np.asarray(variants, dtype=np.float32)
@@ -35,6 +58,7 @@ class ArrayVariantPool:
 
 
 class MappingSelector:
+    """按预设映射返回变体索引的选择器替身，用于验证选择流与 reset 语义。"""
     def __init__(self, num_variants, cycle_choices=None, draws=None):
         self.num_variants = int(num_variants)
         self.cycle_choices = dict(cycle_choices or {})
@@ -134,6 +158,7 @@ def make_environment(
 
 
 class IndiscriminateJammerTimingTests(unittest.TestCase):
+    """无差别干扰机本体：间隔校验、预生成周期、切片切换/回绕与变体选择规则。"""
     def test_accepts_1ms_comb_switch_intervals(self):
         for interval, expected_samples in (
             (0.001, 1),
@@ -419,6 +444,7 @@ class IndiscriminateJammerTimingTests(unittest.TestCase):
 
 
 class EnvironmentJammerTimingTests(unittest.TestCase):
+    """环境集成层：1 ms 量化、带宽共享变体池、reset 重放与两条路径的 phase 一致性。"""
     def test_environment_uses_1ms_comb_interval_quantum(self):
         config = jammer_config("comb")
         config["comb"]["switch_interval"] = 0.007

@@ -1,0 +1,26 @@
+# FHSS 抗干扰强化学习项目 —— Python 依赖清单
+#
+# 已验证版本环境：Windows + Python 3.11（Anaconda），torch 2.9.1+cu130（CUDA 13.0）。
+# 与 environment.yml 保持一致，任选其一安装：
+#   conda env create -f environment.yml        # 推荐，版本完全一致
+#   pip install -r requirements.txt             # 纯 pip 环境
+#
+# ⚠ Torch 安装分两种情况（先装 torch，再装其余依赖）：
+#
+# 【GPU 版（推荐，训练入口默认使用 CUDA）】
+#   需先确认本机 NVIDIA 驱动支持 CUDA 13.0（nvidia-smi 查看），
+#   不支持时可把下面命令里的 cu130 换成官方支持的版本号（如 cu126）：
+#     pip install torch==2.9.1+cu130 --index-url https://download.pytorch.org/whl/cu130
+#
+# 【CPU 版（只跑测试/短冒烟时够用，训练很慢）】
+#     pip install torch==2.9.1
+#
+# torchvision 未被本项目使用，无需安装。
+
+numpy==1.26.4
+scipy==1.16.3
+matplotlib==3.10.8
+gymnasium==1.2.3
+scikit-commpy==0.8.0
+# torch 请按上面的说明选择 GPU/CPU 版本后手动安装
+# torch==2.9.1

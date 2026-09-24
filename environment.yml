@@ -1,3 +1,15 @@
+# FHSS 抗干扰强化学习项目 —— conda 环境定义
+#
+# 创建并激活：
+#   conda env create -f environment.yml
+#   conda activate rl_fhss
+#
+# 版本与本机已验证环境完全一致（Windows + Python 3.11.14 + torch 2.9.1+cu130）。
+# 注意：pip 段里的 torch==2.9.1 来自 PyPI，Windows 上为 CPU 版。
+# 需要 GPU 时，先创建环境，再用 PyTorch 官方源覆盖安装 CUDA 版：
+#   pip install torch==2.9.1+cu130 --index-url https://download.pytorch.org/whl/cu130
+# （驱动不支持 CUDA 13.0 时可换 cu126 等官方支持的版本，详见 requirements.txt）
+# torchvision 本项目未使用，无需安装。
 name: rl_fhss
 channels:
   - conda-forge

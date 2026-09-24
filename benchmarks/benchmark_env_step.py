@@ -1,4 +1,17 @@
-"""Warm FHSS environment step benchmark for serial and automatic workers."""
+"""FHSS 环境 step 耗时基准：预生成/动态路径 × 串行/自动并行。
+
+用途：量化 `FHSSQPSKEnv` 单步耗时，验证两条加速手段的效果：
+- `use_pregen=True`（复用 QPSK 基带与干扰波形）对比动态生成路径；
+- `block_workers=None`（自动按 CPU 核数并行 10 个 block）对比串行执行。
+
+`HISTORICAL_BASELINES` 记录开发机上的历史单步中位耗时（秒），用于打印
+"相对历史基线的加速比"；`TARGET_MEDIANS`/`TARGET_SPEEDUPS` 是自动并行
+路径的验收目标，`--check` 时未达标会以非零码退出（可接入 CI）。
+
+用法（项目根目录或 benchmarks/ 下均可，脚本自带根目录路径注入）::
+
+    python benchmarks/benchmark_env_step.py --steps 20 --check
+"""
 
 import argparse
 import statistics
@@ -17,14 +30,17 @@ import settings  # noqa: E402
 from fh_env import FHSSQPSKEnv  # noqa: E402
 
 
+# 开发机历史基线：单步中位耗时（秒），按 use_pregen 区分
 HISTORICAL_BASELINES = {
     True: 0.79,
     False: 1.73,
 }
+# 自动并行路径的单步中位耗时验收目标（秒）
 TARGET_MEDIANS = {
     True: 0.35,
     False: 0.45,
 }
+# 相对历史基线的加速比验收目标
 TARGET_SPEEDUPS = {
     True: 2.0,
     False: 3.0,
@@ -32,6 +48,20 @@ TARGET_SPEEDUPS = {
 
 
 def run_case(use_pregen, block_workers, steps, warmup, seed, hoprate):
+    """跑一组基准：固定 offset（全零）下测 ``steps`` 次环境 step 的耗时。
+
+    Args:
+        use_pregen: 是否使用预生成加速路径。
+        block_workers: 1 表示串行；None 表示按 CPU 核数自动并行。
+        steps: 计时步数（正式测量段）。
+        warmup: 预热步数（不计时，避免首步建缓存/线程池的偏差）。
+        seed: 随机种子。
+        hoprate: 固定跳速 (Hz)。
+
+    Returns:
+        dict：median/minimum/maximum 单步耗时与 env.block_workers（实际
+        生效的 worker 数）。环境在 finally 中关闭，保证线程池释放。
+    """
     settings.set_random_seeds(seed)
     config = dict(settings.ENV_CONFIG)
     config.update(
@@ -66,6 +96,7 @@ def run_case(use_pregen, block_workers, steps, warmup, seed, hoprate):
 
 
 def parse_args():
+    """解析基准参数；--steps 下限 20 保证中位数统计的稳定性。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=2)
@@ -85,6 +116,7 @@ def parse_args():
 
 
 def main():
+    """遍历 2×2 组合（pregen/dynamic × serial/auto）打印耗时并做验收判定。"""
     args = parse_args()
     failures = []
     print(
@@ -114,6 +146,7 @@ def main():
                 f"{result['maximum']:>6.3f}  {historical_speedup:>8.2f}x"
             )
 
+        # 自动并行相对串行、以及相对历史基线的加速比与验收目标
         auto = results["auto"]
         serial_speedup = results["serial"]["median"] / auto["median"]
         historical_speedup = HISTORICAL_BASELINES[use_pregen] / auto["median"]
